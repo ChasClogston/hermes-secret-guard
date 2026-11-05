@@ -1,8 +1,9 @@
 name: secret-guard
-version: 0.1.0
+version: 0.2.0
 description: "Safe key entry and leak prevention for Hermes. Keys go into the OS keychain through a native hidden dialog, never through chat; tool calls that would read secret files are blocked; registered secret values are scrubbed from everything the model sees."
 author: Charles Clogston, with Claude
 kind: standalone
+requires_hermes: ">=0.22.7"
 platforms:
   - macos
 provides_tools:

@@ -69,7 +69,8 @@ def intake(env: str, *, scope: Optional[str] = None, service: Optional[str] = No
 
 
 def verify(env: str) -> dict:
-    """Recompute the stored fingerprint and compare it with the registry. Never returns the value."""
+    """Compare the keychain item (this plugin's own) and the value Hermes resolved for this profile
+    against the registry's fingerprint. Runs only from the `hermes secret` CLI. Never returns a value."""
     entry = registry.load()["secrets"].get(env)
     if not entry:
         return {"env": env, "status": "not registered"}
@@ -77,6 +78,11 @@ def verify(env: str) -> dict:
     if got is None:
         return {"env": env, "status": "missing from keychain"}
     fp, length = got
-    ok = fp == entry.get("fingerprint")
-    return {"env": env, "status": "ok" if ok else "fingerprint differs from registry",
-            "fingerprint": fp, "length": length}
+    if fp != entry.get("fingerprint"):
+        return {"env": env, "status": "keychain differs from registry", "fingerprint": fp, "length": length}
+    from .guard import _get_secret
+    v = _get_secret(env)
+    resolved = "not resolved in this profile" if not v else (
+        "resolved" if keychain.fingerprint(v) == fp else "RESOLVED VALUE DIFFERS (stale .env line?)")
+    del v
+    return {"env": env, "status": "ok", "fingerprint": fp, "length": length, "hermes": resolved}

@@ -22,7 +22,6 @@ def register(ctx) -> None:
         description="Secret Guard: enter keys through a hidden dialog, never through chat.")
     ctx.register_tool(name="secret_request", toolset="secret_guard", schema=SECRET_REQUEST_SCHEMA,
                       handler=handle_secret_request, emoji="🔐")
-    guard.set_context(ctx)
     ctx.register_hook("on_session_start", guard.on_session_start)
     ctx.register_hook("pre_llm_call", guard.on_pre_llm_call)
     ctx.register_hook("pre_tool_call", guard.on_pre_tool_call)

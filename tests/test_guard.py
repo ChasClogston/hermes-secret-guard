@@ -27,6 +27,7 @@ CANARY = secrets.token_hex(20)              # prefix-less: core regexes alone wo
 res = keychain.write_value("hermes-sg-test-key", ACCT, CANARY, keychain=KC)
 registry.upsert("SG_TEST_KEY", service="hermes-sg-test-key", account=ACCT, scope="all",
                 fingerprint=res["fingerprint"], length=res["length"], keychain=KC)
+os.environ["SG_TEST_KEY"] = CANARY   # what Hermes's secrets.command would have resolved
 
 fails = 0
 def check(label, got, want):
@@ -107,6 +108,13 @@ try:
     guard.scrub = lambda t: (_ for _ in ()).throw(RuntimeError("boom"))
     check("transform withholds on internal error", guard.on_transform_tool_result(result=CANARY), guard.WITHHELD)
     guard.scrub = orig
+
+    del os.environ["SG_TEST_KEY"]
+    check("unresolved secret is not scrubbed from memory it never had", "SG_TEST_KEY" in guard._load_values(), False)
+    os.environ["SG_TEST_KEY"] = CANARY
+    os.environ["SG_TEST_KEY"] = "a-different-value-xyz"
+    check("resolved value with wrong fingerprint is ignored", "SG_TEST_KEY" in guard._load_values(), False)
+    os.environ["SG_TEST_KEY"] = CANARY
 
     print("== layer 3: inbound")
     blk = guard.on_pre_llm_call(user_message=f"my key {CANARY}") or {}

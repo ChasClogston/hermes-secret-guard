@@ -17,7 +17,6 @@ import logging
 import os
 import re
 import shlex
-import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -27,64 +26,43 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------- values (memory only)
 
-_lock = threading.Lock()
-_cache: dict = {"mtime": None, "values": {}}   # values: env -> value
+def _get_secret(name: str):
+    """Hermes's own credential route (catalog rule 11): the value Hermes resolved for the active
+    profile, normally via the generated secrets.command helper. Never reads the keychain."""
+    try:
+        from agent.secret_scope import get_secret
+    except Exception:
+        return None
+    try:
+        return get_secret(name)
+    except Exception:  # UnscopedSecretError under multiplex with no scope: fail closed (no value)
+        return None
 
 
 def _load_values() -> dict[str, str]:
-    """env -> value for every registered secret, read once per registry change."""
-    p = registry.registry_path()
-    try:
-        mtime = p.stat().st_mtime if p.exists() else None
-    except OSError:
-        mtime = None
-    with _lock:
-        if _cache["mtime"] == mtime and mtime is not None:
-            return _cache["values"]
+    """env -> value for every registered secret this profile can resolve. Fresh each call: under a
+    multiplex gateway the active profile can change between turns."""
     values: dict[str, str] = {}
     for env, e in registry.load().get("secrets", {}).items():
-        v = os.environ.get(env)
-        if not (v and keychain.fingerprint(v) == e.get("fingerprint")):
-            v = keychain.read_value(e["service"], e["account"], e.get("keychain"))
-        if v and len(v) >= 8:  # never scrub trivially short strings
+        v = _get_secret(env)
+        if v and len(v) >= 8 and keychain.fingerprint(v) == e.get("fingerprint"):
             values[env] = v
-    with _lock:
-        _cache.update(mtime=mtime, values=values)
     return values
 
 
-_ctx = None                 # plugin context, kept for the public-API fallback
-_pattern_registered: set = set()   # fingerprints already sent to ctx.register_redaction_patterns
-
-
-def set_context(ctx) -> None:
-    global _ctx
-    _ctx = ctx
-
-
 def register_values() -> int:
-    """Push every guarded value into Hermes's model-egress scrub.
-
-    Preferred: agent.redact's vault registry, a hard boundary that applies even when
-    security.redact_secrets is off. Re-run each turn: it keeps 64 values per profile and evicts the
-    oldest, and re-registering refreshes ours. It is a private module function, so if a Hermes update
-    removes it, fall back to the public ctx.register_redaction_patterns with each value escaped as a
-    literal (that path honours security.redact_secrets). The plugin's own transform hooks scrub too.
-    """
+    """Push every guarded value into Hermes's exact-value model-egress scrub (the vault registry
+    Hermes uses for browser-vault passwords; it applies even when security.redact_secrets is off).
+    Re-run each turn: it keeps 64 values per profile and evicts the oldest. It is an undocumented
+    module function, so if an update removes it the plugin's transform hooks still scrub tool
+    results, terminal output and replies, and `hermes secret doctor` reports the change."""
     values = _load_values()
     try:
         from agent.redact import register_vault_redaction_value
     except Exception:
-        register_vault_redaction_value = None
-    if register_vault_redaction_value is not None:
-        for v in values.values():
-            register_vault_redaction_value(v)
-        return len(values)
-    if _ctx is not None:
-        new = [v for v in values.values() if keychain.fingerprint(v) not in _pattern_registered]
-        if new:
-            _ctx.register_redaction_patterns([re.escape(v) for v in new])
-            _pattern_registered.update(keychain.fingerprint(v) for v in new)
+        return 0
+    for v in values.values():
+        register_vault_redaction_value(v)
     return len(values)
 
 

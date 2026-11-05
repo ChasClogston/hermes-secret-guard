@@ -95,6 +95,33 @@ Each secret has a scope:
    key (`sk-`, `ghp_`, `xoxb-`, `AKIA`, `AIza`, Telegram bot tokens, …), stops the turn before any
    inference.
 
+## Disclosures
+
+What Secret Guard does on your machine, so you can decide before installing:
+
+- **No network calls.** Nothing leaves the machine. No telemetry.
+- **Shell commands.** `/usr/bin/security` (create, update and read keychain items this plugin
+  manages) and `/usr/bin/osascript` (the hidden-input dialog). Both run only from
+  `hermes secret` commands you type or from the `secret_request` tool when you ask Hermes to add
+  a key.
+- **Stored credentials.** Keys you enter are stored in your login keychain as generic passwords
+  named `hermes-<env-var>`. The plugin's own registry
+  (`<hermes home>/secret_guard/registry.json`, mode 600) holds names, scopes and SHA-256
+  fingerprints, never values.
+- **Reads outside its own data.** Inside the agent, values come only through Hermes's
+  `get_secret()`, i.e. what Hermes already resolved for the active profile; the agent process
+  never reads the keychain. The `hermes secret` CLI reads the keychain items this plugin created,
+  to confirm a write and for `verify` / `doctor` / `import` (fingerprints only). `import` reads the
+  service and variable names in a helper script you point it at; it never runs the script.
+- **Writes outside its own data.** `hermes secret wire` edits a profile's `config.yaml` to set
+  `secrets.command`, after saving a timestamped backup next to it. The generated helper lives at
+  `<hermes root>/secret_guard/emit-secrets.sh` and is run by Hermes at startup.
+- **Blocking.** The `pre_tool_call` hook refuses some terminal and file-tool calls (see *The three
+  layers*). It fails closed: if the check errors, the tool call is refused.
+- **Unattended runs.** The dialog gives up after 5 minutes and the tool returns a plain error, so
+  cron and gateway runs never hang on it.
+- **No background processes.**
+
 ## Honest limits
 
 Secret Guard reduces exposure. It is not a sandbox and it does not certify anything.
@@ -111,8 +138,9 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
 - **macOS only** in this version (Keychain + `osascript`). Values with whitespace, quotes or
   backslashes, or longer than about 3,900 characters, are refused; `security -i` can't carry them.
 - Value redaction uses `agent.redact.register_vault_redaction_value`, a module function rather
-  than a documented plugin API. If an update removes it, the plugin falls back to the public
-  `ctx.register_redaction_patterns`, and `doctor` says so.
+  than a documented plugin API (`hermes plugins validate` warns on it). If an update removes it,
+  the plugin's own `transform_*` hooks still scrub tool results, terminal output and replies, and
+  `doctor` reports the change.
 
 ## Tests
 
