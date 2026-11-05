@@ -130,3 +130,7 @@ Built for the Hermes Agent Plugin Hackathon (November 2026) from a working setup
 Macs: a hidden-dialog keychain intake tool, keychain-backed `secrets.command` helpers, and a shell
 guard written after real key exposures. Secret Guard moves those into Hermes, where the hook system
 closes gaps a shell guard can't reach.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
