@@ -117,7 +117,8 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
 ## Tests
 
 ```
-PYTHONPATH=~/.hermes/hermes-agent:<parent of this folder> ~/.hermes/hermes-agent/venv/bin/python tests/test_guard.py
+cd <plugin folder>
+PYTHONPATH=~/.hermes/hermes-agent ~/.hermes/hermes-agent/venv/bin/python tests/test_guard.py
 ```
 
 Self-contained: a throwaway `HERMES_HOME`, a throwaway keychain and a random canary, removed at

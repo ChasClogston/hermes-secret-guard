@@ -4,8 +4,7 @@ Creates a throwaway HERMES_HOME and a throwaway keychain, stores a random canary
 plugin's own write path, runs every check, then removes the keychain. Never touches ~/.hermes or
 the login keychain.
 
-    HERMES_AGENT=~/.hermes/hermes-agent
-    PYTHONPATH=$HERMES_AGENT:<dir containing secret_guard> $HERMES_AGENT/venv/bin/python tests/test_guard.py
+    PYTHONPATH=~/.hermes/hermes-agent ~/.hermes/hermes-agent/venv/bin/python tests/test_guard.py
 """
 import os, secrets, subprocess, sys, tempfile
 
@@ -15,11 +14,13 @@ KC = os.path.join(TMP, "test.keychain-db")
 subprocess.run(["/usr/bin/security", "create-keychain", "-p", "throwaway", KC], check=True)
 subprocess.run(["/usr/bin/security", "set-keychain-settings", KC], check=True)
 
-try:
-    from secret_guard import guard, keychain, registry
-except ImportError:  # running from inside the repo checkout
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/..")
-    from secret_guard import guard, keychain, registry
+# Load the plugin by path: Hermes installs it as "secret-guard", which is not an importable name.
+import importlib.util
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_spec = importlib.util.spec_from_file_location("secret_guard", os.path.join(_root, "__init__.py"),
+                                               submodule_search_locations=[_root])
+_pkg = importlib.util.module_from_spec(_spec); sys.modules["secret_guard"] = _pkg; _spec.loader.exec_module(_pkg)
+from secret_guard import guard, keychain, registry
 
 ACCT = os.environ.get("USER", "test")
 CANARY = secrets.token_hex(20)              # prefix-less: core regexes alone would miss it
