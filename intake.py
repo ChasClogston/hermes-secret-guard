@@ -58,12 +58,14 @@ def intake(env: str, *, scope: Optional[str] = None, service: Optional[str] = No
 
     try:
         result = keychain.write_value(service, account, value, keychain=kc, replace=replace)
+        registry.upsert(env, service=service, account=account, scope=scope,
+                        fingerprint=result["fingerprint"], length=result["length"], keychain=kc)
+        from . import guard
+        guard.remember_entered(env, value.strip())  # protected from this turn on, not next restart
     except keychain.KeychainError as exc:
         raise IntakeError(str(exc)) from None
     finally:
         del value
-    registry.upsert(env, service=service, account=account, scope=scope,
-                    fingerprint=result["fingerprint"], length=result["length"], keychain=kc)
     return {"env": env, "service": service, "scope": scope, "fingerprint": result["fingerprint"],
             "length": result["length"], "replaced": result["replaced"]}
 

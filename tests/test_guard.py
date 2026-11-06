@@ -122,6 +122,12 @@ try:
     check("resolved value with wrong fingerprint is ignored", "SG_TEST_KEY" in guard._load_values(), False)
     os.environ["SG_TEST_KEY"] = CANARY
 
+    del os.environ["SG_TEST_KEY"]
+    guard.remember_entered("SG_TEST_KEY", CANARY)
+    check("value entered this session is scrubbed before any restart", guard.scrub("x " + CANARY)[1], 1)
+    guard._entered.clear()
+    os.environ["SG_TEST_KEY"] = CANARY
+
     print("== layer 3: inbound")
     blk = guard.on_pre_llm_call(user_message=f"my key {CANARY}") or {}
     check("block  pasted registered value", blk.get("action"), "block")

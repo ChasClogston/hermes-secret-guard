@@ -39,14 +39,30 @@ def _get_secret(name: str):
         return None
 
 
+# Values entered through this process's own dialog during this session. Hermes resolves secrets
+# at startup, so without this a key added mid-session would go unprotected until a restart. Memory
+# only; matched against the registry fingerprint like everything else.
+_entered: dict[str, str] = {}
+
+
+def remember_entered(env: str, value: str) -> None:
+    if value and len(value) >= 8:
+        _entered[env] = value
+        try:
+            register_values()
+        except Exception:
+            pass
+
+
 def _load_values() -> dict[str, str]:
     """env -> value for every registered secret this profile can resolve. Fresh each call: under a
     multiplex gateway the active profile can change between turns."""
     values: dict[str, str] = {}
     for env, e in registry.load().get("secrets", {}).items():
-        v = _get_secret(env)
-        if v and len(v) >= 8 and keychain.fingerprint(v) == e.get("fingerprint"):
-            values[env] = v
+        for v in (_get_secret(env), _entered.get(env)):
+            if v and len(v) >= 8 and keychain.fingerprint(v) == e.get("fingerprint"):
+                values[env] = v
+                break
     return values
 
 
