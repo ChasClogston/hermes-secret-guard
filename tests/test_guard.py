@@ -135,6 +135,10 @@ try:
     check("block  sk- key", (guard.on_pre_llm_call(user_message="sk-proj-" + "a1B2" * 8) or {}).get("action"), "block")
     check("block  telegram token", (guard.on_pre_llm_call(user_message="123456789:AA" + "x" * 33) or {}).get("action"), "block")
     check("block  multimodal parts", (guard.on_pre_llm_call(user_message=[{"type": "text", "text": "ghp_" + "A" * 36}]) or {}).get("action"), "block")
+    m_cli = (guard.on_pre_llm_call(user_message=CANARY, platform="cli") or {}).get("message", "")
+    m_tg = (guard.on_pre_llm_call(user_message=CANARY, platform="telegram") or {}).get("message", "")
+    check("cli wording: never left this machine", "never left this machine" in m_cli, True)
+    check("telegram wording: rotate it", "Telegram" in m_tg and "rotate" in m_tg, True)
     check("allow  ordinary message", guard.on_pre_llm_call(user_message="add my Groq key please"), None)
     check("allow  mentions sk- prefix", guard.on_pre_llm_call(user_message="OpenAI keys start with sk-"), None)
 finally:

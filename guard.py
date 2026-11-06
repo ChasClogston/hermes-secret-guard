@@ -285,7 +285,10 @@ def find_key_in(text: str) -> Optional[str]:
     return None
 
 
-def on_pre_llm_call(user_message: Any = None, **_kw) -> Optional[dict]:
+LOCAL_PLATFORMS = frozenset({"", "cli", "local", "tui", "desktop", "dashboard", "api"})
+
+
+def on_pre_llm_call(user_message: Any = None, platform: str = "", **_kw) -> Optional[dict]:
     try:
         register_values()
     except Exception:
@@ -297,11 +300,15 @@ def on_pre_llm_call(user_message: Any = None, **_kw) -> Optional[dict]:
         return None
     if not found:
         return None
+    if (platform or "").lower() in LOCAL_PLATFORMS:
+        where = "It never left this machine."
+    else:
+        where = (f"It has already passed through {platform.title()}, though, so treat the key as "
+                 "exposed and rotate it at the provider.")
     return {"action": "block", "message": (
         f"🔐 Secret Guard stopped that message: it contains {found}. No model saw it, and it is not "
-        "stored in this session. It has already passed through the chat app, though, so treat the key "
-        "as exposed and rotate it at the provider. To store a key safely, ask me to add it — a hidden "
-        "dialog will take the value instead of chat.")}
+        f"stored in this session. {where} To store a key safely, ask me to add it — a hidden dialog "
+        "will take the value instead of chat.")}
 
 
 def on_session_start(**_kw) -> None:
