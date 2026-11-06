@@ -8,7 +8,9 @@ the login keychain.
 """
 import os, secrets, subprocess, sys, tempfile
 
-TMP = tempfile.mkdtemp(prefix="secret-guard-test-")
+ROOT = tempfile.mkdtemp(prefix="secret-guard-test-")
+TMP = os.path.join(ROOT, "profiles", "work")   # run as a NON-default profile on purpose
+os.makedirs(TMP)
 os.environ["HERMES_HOME"] = TMP            # before any Hermes import
 KC = os.path.join(TMP, "test.keychain-db")
 subprocess.run(["/usr/bin/security", "create-keychain", "-p", "throwaway", KC], check=True)
@@ -39,6 +41,10 @@ def check(label, got, want):
 B = lambda c: guard.check_command(c, cwd="/tmp") is not None
 H = "~/.hermes"
 try:
+    print("== registry is per root, not per profile")
+    from secret_guard import helper
+    check("registry lives at the root", str(registry.registry_path()).startswith(os.path.realpath(ROOT) + "/secret_guard") or str(registry.registry_path()).startswith(ROOT + "/secret_guard"), True)
+    check("helper and registry share the root", registry.registry_path().parent == helper.helper_path().parent, True)
     print("== keychain write path")
     check("fingerprint round-trips", keychain.stored_fingerprint("hermes-sg-test-key", ACCT, KC)[0], res["fingerprint"])
     for bad in ["has space", 'quo"te', "back\\slash", "x" * 3950]:

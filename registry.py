@@ -1,6 +1,6 @@
 """Registry of guarded secrets: names, env vars, scope. Never holds a value.
 
-Stored at <HERMES_HOME>/secret_guard/registry.json, mode 600.
+Stored at <hermes root>/secret_guard/registry.json, mode 600 (one per root, shared by all profiles).
 scope: "all"          every profile resolves it
        "default-only" only the root profile (messaging bot tokens: a shared bot credential in a
                       non-default profile blocks the multiplex gateway; ISSUE-168)
@@ -22,9 +22,13 @@ PLATFORM_BOT_ENVS = frozenset({"TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK
 
 
 def _home() -> Path:
+    """The Hermes ROOT, not the active profile's home: there is one registry and one generated
+    helper per root, and each entry's scope decides which profiles resolve it. A per-profile
+    registry would let `hermes -p X secret add` regenerate the shared helper from X's entries
+    alone and silently drop every other secret from every profile."""
     try:
-        from hermes_constants import get_hermes_home
-        return Path(get_hermes_home())
+        from hermes_constants import get_default_hermes_root
+        return Path(get_default_hermes_root())
     except Exception:
         return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 
