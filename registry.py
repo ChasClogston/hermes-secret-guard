@@ -8,6 +8,8 @@ scope: "all"          every profile resolves it
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -74,10 +76,31 @@ def save(data: dict) -> None:
             os.unlink(tmp)
 
 
+@contextlib.contextmanager
+def _locked():
+    """Exclusive lock for a whole read-modify-write, across processes (gateway, CLI, Desktop)."""
+    p = registry_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(p.parent, 0o700)
+    fd = os.open(p.parent / ".registry.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def upsert(env: str, *, service: str, account: str, scope: str, fingerprint: str, length: int,
            keychain: Optional[str] = None) -> dict:
     if scope not in SCOPES:
         raise ValueError(f"scope must be one of {SCOPES}")
+    with _locked():
+        return _upsert(env, service=service, account=account, scope=scope, fingerprint=fingerprint,
+                       length=length, keychain=keychain)
+
+
+def _upsert(env, *, service, account, scope, fingerprint, length, keychain) -> dict:
     data = load()
     entry = {"env": env, "service": service, "account": account, "scope": scope,
              "fingerprint": fingerprint, "length": length}
@@ -89,12 +112,13 @@ def upsert(env: str, *, service: str, account: str, scope: str, fingerprint: str
 
 
 def remove(env: str) -> bool:
-    data = load()
-    if env not in data["secrets"]:
-        return False
-    del data["secrets"][env]
-    save(data)
-    return True
+    with _locked():
+        data = load()
+        if env not in data["secrets"]:
+            return False
+        del data["secrets"][env]
+        save(data)
+        return True
 
 
 def settings() -> dict:

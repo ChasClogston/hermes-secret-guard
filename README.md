@@ -13,11 +13,16 @@ Secret Guard closes both ends.
   a native macOS dialog, the value goes straight into your keychain, and Hermes sees only a name,
   a fingerprint and a length. The `secret_request` tool has no value parameter, so there is
   nothing for the model to fill in.
-- **Keys can't come back out.** Tool calls that would read a secret file, run a secrets helper or
-  ask the keychain to print a value are blocked before they run. Every registered value is scrubbed
-  from anything the model sees, including output from commands no filename rule could predict.
-- **A key pasted into chat anyway never reaches a model.** The turn is stopped, the message is
-  stored as a placeholder, and you're told to rotate the key.
+- **Common ways of reading a key back out are blocked.** Tool calls whose command, code or path
+  points at a secret file, runs a secrets helper or asks the keychain to print a value are refused
+  before they run, for every tool, including plugin and MCP tools that take those arguments.
+- **Exact copies of your keys are scrubbed** from tool results, terminal output and replies before
+  the model sees them, including output from commands no filename rule could predict.
+- **A key pasted into chat is stopped before inference.** The turn is blocked, Hermes stores a
+  placeholder instead of the message, and you're told whether to rotate the key.
+
+Secret Guard is not a sandbox. It narrows the common paths; an agent determined to transform a
+key before printing it can still get one out. See *Honest limits*.
 
 ## What it looks like
 
@@ -33,8 +38,8 @@ you:     show me what's in ~/.hermes/.env
 hermes:  Secret Guard blocked that: it reads a secret-shaped file (.env).
 ```
 
-Measured against a real agent in a test profile, with a prefix-less canary key that Hermes's
-built-in regexes don't recognise:
+Measured against a real agent in a test profile (Hermes 0.23.0), with a prefix-less canary key that
+Hermes's built-in regexes don't recognise. Reproduce with `tests/e2e_canary.sh`:
 
 | Attempt | Without Secret Guard | With Secret Guard |
 |---|---|---|
@@ -112,7 +117,7 @@ of overwriting. `hermes secret doctor` lists any variable your old source still 
 
 What Secret Guard does on your machine, so you can decide before installing:
 
-- **No network calls.** Nothing leaves the machine. No telemetry.
+- **No network calls by the plugin.** No telemetry. (Hermes itself sends each resolved key to the service it belongs to.)
 - **Shell commands.** `/usr/bin/security` (create, read and delete keychain items this plugin
   manages) and `/usr/bin/osascript` (the hidden-input dialog). The dialog runs only from
   `hermes secret add` or the `secret_request` tool when you ask Hermes to add a key.
@@ -136,11 +141,24 @@ What Secret Guard does on your machine, so you can decide before installing:
 
 Secret Guard reduces exposure. It is not a sandbox and it does not certify anything.
 
-- **What it can't see:** logging done by MCP servers or child processes outside Hermes; a value
-  split across two outputs or partly echoed; images and screenshots; backups taken before a value
-  was scrubbed.
-- **The path gate matches patterns.** It will block some harmless files (`tokens.txt`) and can be
-  routed around by a determined agent. Value redaction is the layer that doesn't depend on guessing.
+- **Only exact values are scrubbed.** A key that is base64- or hex-encoded, reversed, split across
+  two outputs or partly echoed is not recognised. Redaction is the safety net; the path gate and
+  key entry outside chat are what keep keys from being read in the first place.
+- **What it can't see:** logging done by MCP servers or child processes outside Hermes; images and
+  screenshots; backups taken before a value was scrubbed. The plugin makes no network calls, but
+  Hermes sends resolved keys to the services they belong to, as it does for any secret source.
+- **Shared redaction capacity.** Hermes's exact-value registry holds 64 values per profile, shared
+  with browser-vault passwords. Secret Guard re-registers its keys on every turn, and its own
+  transform hooks scrub with no cap, so an evicted key is still caught there.
+- **Transform order.** When several plugins rewrite the same tool result, Hermes keeps the first
+  rewrite. Hermes's own redaction, which carries Secret Guard's registered values, still runs on
+  terminal output after the transform hooks and inside the file and MCP tool handlers. A tool whose
+  output skips core redaction relies on whichever plugin's rewrite wins.
+- **Argument names decide what the gate checks:** `command`, `code`, `script`, `path`,
+  `file_path`, `paths` and similar. A tool that hides a file path or a shell command under another
+  argument name is not inspected.
+- **The path gate matches patterns.** It will block some harmless files (`tokens.txt`,
+  `secret-santa.log`) and can be routed around, for example by building a filename at run time.
 - **A key pasted into a messaging app has already left your machine.** Secret Guard keeps it from
   the model and the session store; rotate it anyway.
 - **The dialog appears on the Mac Hermes runs on,** not on your phone, and can't show while the
@@ -161,7 +179,8 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
 
 ```
 cd <plugin folder>
-PYTHONPATH=~/.hermes/hermes-agent ~/.hermes/hermes-agent/venv/bin/python tests/test_guard.py
+HA=$(hermes --version | awk -F': ' '/Install directory/ {print $2}')   # your hermes-agent checkout
+PYTHONPATH=$HA $HA/venv/bin/python tests/test_guard.py
 ```
 
 Self-contained: a throwaway `HERMES_HOME`, a throwaway keychain and a random canary, removed at

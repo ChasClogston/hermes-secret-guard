@@ -28,7 +28,7 @@ def ask_value(label: str, timeout_s: int = 300) -> Optional[str]:
     args.append(label)
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=timeout_s + 15)
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError):
         return None
     if r.returncode != 0:
         return None
@@ -51,6 +51,6 @@ def ask_replace(label: str, timeout_s: int = 120) -> bool:
     args.append(label)
     try:
         r = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout_s + 15)
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError):
         return False
     return r.returncode == 0

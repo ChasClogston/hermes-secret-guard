@@ -20,6 +20,16 @@ SECURITY = "/usr/bin/security"
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _ACCT_RE = re.compile(r"^[A-Za-z0-9._@-]+$")
 _MAX_LINE = 4000  # security -i drops input lines near 4,096 bytes (measured 2026-09-30)
+_KC_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
+_TIMEOUT = 30  # seconds for any one `security` call; a stall becomes a clean failure
+
+
+def _run(argv, **kw):
+    """subprocess.run with a hard timeout; a timeout or launch failure becomes KeychainError."""
+    try:
+        return subprocess.run(argv, timeout=_TIMEOUT, **kw)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise KeychainError(f"keychain tool did not complete ({type(exc).__name__}); nothing changed") from None
 
 
 class KeychainError(RuntimeError):
@@ -40,8 +50,9 @@ def _check_names(service: str, account: str) -> None:
 def _kc_args(keychain: Optional[str]) -> list[str]:
     if not keychain:
         return []
-    if not keychain.startswith("/"):
-        raise KeychainError("keychain must be an absolute path")
+    if not _KC_PATH_RE.match(keychain):
+        # it is interpolated into the `security -i` command line, so only plain path characters
+        raise KeychainError("keychain path must be absolute and use only letters, digits, . _ / -")
     return [keychain]
 
 
@@ -61,7 +72,7 @@ def validate_value(value: str) -> str:
 
 def exists(service: str, account: str, keychain: Optional[str] = None) -> bool:
     _check_names(service, account)
-    r = subprocess.run([SECURITY, "find-generic-password", "-s", service, "-a", account, *_kc_args(keychain)],
+    r = _run([SECURITY, "find-generic-password", "-s", service, "-a", account, *_kc_args(keychain)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return r.returncode == 0
 
@@ -69,7 +80,7 @@ def exists(service: str, account: str, keychain: Optional[str] = None) -> bool:
 def read_value(service: str, account: str, keychain: Optional[str] = None) -> Optional[str]:
     """Return the stored value, or None. Callers must never print, log or return it to a model."""
     _check_names(service, account)
-    r = subprocess.run([SECURITY, "find-generic-password", "-w", "-s", service, "-a", account, *_kc_args(keychain)],
+    r = _run([SECURITY, "find-generic-password", "-w", "-s", service, "-a", account, *_kc_args(keychain)],
                        capture_output=True, text=True)
     if r.returncode != 0:
         return None
@@ -103,26 +114,42 @@ def write_value(service: str, account: str, value: str, *, keychain: Optional[st
         if not replace:
             del line
             raise KeychainError(f"{service} already exists; replace not confirmed; nothing written")
-        r = subprocess.run([SECURITY, "delete-generic-password", "-s", service, "-a", account, *kc],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Stage first: write the new value under a temporary name and verify it, so a value
+        # `security` cannot store is caught BEFORE the old entry is deleted.
+        staging = service + ".sg-staging"
+        _run([SECURITY, "delete-generic-password", "-s", staging, "-a", account, *kc],
+             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _run([SECURITY, "-i"], input=line.replace(f'-s "{service}"', f'-s "{staging}"', 1), text=True,
+             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        staged = stored_fingerprint(staging, account, keychain)
+        if not staged or staged[0] != want:
+            _run([SECURITY, "delete-generic-password", "-s", staging, "-a", account, *kc],
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            del line
+            raise KeychainError(f"the new value could not be stored; the existing {service} is unchanged")
+        r = _run([SECURITY, "delete-generic-password", "-s", service, "-a", account, *kc],
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if r.returncode != 0:
             del line
-            raise KeychainError(f"couldn't remove the existing {service}; nothing written")
+            raise KeychainError(f"couldn't remove the existing {service}; it is unchanged "
+                                f"(a verified copy of the new value is in {staging})")
         replaced = True
-    subprocess.run([SECURITY, "-i"], input=line, text=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _run([SECURITY, "-i"], input=line, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     del line
     got = stored_fingerprint(service, account, keychain)
     if not got or got[0] != want:
         if replaced:
-            raise KeychainError(f"WRITE FAILED after the old {service} was removed; the entry is now missing. "
-                                "Add it again with the same value.")
+            raise KeychainError(f"WRITE FAILED after the old {service} was removed. The new value is safe "
+                                f"in {service}.sg-staging; run `hermes secret add` again to finish.")
         raise KeychainError(f"write failed; {service} was not saved")
+    if replaced:
+        _run([SECURITY, "delete-generic-password", "-s", service + ".sg-staging", "-a", account, *kc],
+             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {"service": service, "account": account, "fingerprint": want, "length": length, "replaced": replaced}
 
 
 def delete(service: str, account: str, keychain: Optional[str] = None) -> bool:
     _check_names(service, account)
-    r = subprocess.run([SECURITY, "delete-generic-password", "-s", service, "-a", account, *_kc_args(keychain)],
+    r = _run([SECURITY, "delete-generic-password", "-s", service, "-a", account, *_kc_args(keychain)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return r.returncode == 0

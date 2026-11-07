@@ -56,18 +56,29 @@ def intake(env: str, *, scope: Optional[str] = None, service: Optional[str] = No
     if not value or not value.strip():
         raise IntakeError("cancelled or empty; nothing written")
 
+    protected_now = False
     try:
         result = keychain.write_value(service, account, value, keychain=kc, replace=replace)
-        registry.upsert(env, service=service, account=account, scope=scope,
-                        fingerprint=result["fingerprint"], length=result["length"], keychain=kc)
+        try:
+            registry.upsert(env, service=service, account=account, scope=scope,
+                            fingerprint=result["fingerprint"], length=result["length"], keychain=kc)
+        except Exception as exc:
+            # Keychain and registry must not drift. A brand-new item is rolled back; a replaced one
+            # stays (the old value is already gone) and the user is told exactly what to rerun.
+            if not result["replaced"]:
+                keychain.delete(service, account, kc)
+                raise IntakeError(f"couldn't record {env} in the registry ({type(exc).__name__}); "
+                                  "the keychain item was rolled back, nothing changed") from None
+            raise IntakeError(f"{env} was replaced in the keychain but the registry update failed "
+                              f"({type(exc).__name__}); run `hermes secret add {env}` again") from None
         from . import guard
-        guard.remember_entered(env, value.strip())  # protected from this turn on, not next restart
+        protected_now = guard.remember_entered(env, value.strip())
     except keychain.KeychainError as exc:
         raise IntakeError(str(exc)) from None
     finally:
         del value
     return {"env": env, "service": service, "scope": scope, "fingerprint": result["fingerprint"],
-            "length": result["length"], "replaced": result["replaced"]}
+            "length": result["length"], "replaced": result["replaced"], "protected_now": protected_now}
 
 
 def verify(env: str) -> dict:

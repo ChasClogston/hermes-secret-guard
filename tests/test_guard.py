@@ -165,6 +165,110 @@ try:
     check("telegram wording: rotate it", "Telegram" in m_tg and "rotate" in m_tg, True)
     check("allow  ordinary message", guard.on_pre_llm_call(user_message="add my Groq key please"), None)
     check("allow  mentions sk- prefix", guard.on_pre_llm_call(user_message="OpenAI keys start with sk-"), None)
+    print("== review fixes: gate covers every tool by argument name")
+    blk = lambda tool, args: (guard.on_pre_tool_call(tool, args) or {}).get("action") == "block"
+    check("block  unknown tool with a command arg", blk("custom_executor", {"command": f"cat {H}/.env"}), True)
+    check("block  process_manage", blk("process_manage", {"command": "printenv"}), True)
+    check("block  cronjob_manage scheduling a .env read", blk("cronjob_manage", {"command": f"cat {H}/.env"}), True)
+    check("block  execute_code opening .env", blk("execute_code", {"code": "print(open('.env').read())"}), True)
+    check("block  execute_code keychain print", blk("execute_code", {"code": "subprocess.run(['security','find-generic-password','-s','x','-w'])"}), True)
+    check("block  browser_exec reading a token file", blk("browser_exec", {"js": "fs.readFileSync('/srv/app/api-token.txt')"}), True)
+    check("block  vision tool on a key file", blk("vision_analyze", {"image_path": "/tmp/id_rsa"}), True)
+    check("block  list of paths", blk("some_tool", {"paths": ["a.txt", f"{H}/.env"]}), True)
+    check("allow  execute_code arithmetic", blk("execute_code", {"code": "print(1+1)"}), False)
+    check("allow  query text mentioning .env", blk("web_search", {"query": "cat .env best practice"}), False)
+    check("block  *secret*.log no longer exempt", guard.is_secret_path("production-secrets.log"), True)
+    check("allow  README.md", guard.is_secret_path("README.md"), False)
+    _orig = guard.check_tool_args
+    guard.check_tool_args = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    r = guard.on_pre_tool_call("terminal", {"command": "ls " + CANARY}) or {}
+    check("internal error fails closed", r.get("action"), "block")
+    check("fail-closed message never echoes args", CANARY not in r.get("message", ""), True)
+    guard.check_tool_args = _orig
+
+    print("== review fixes: inbound shapes")
+    check("block  single part dict", (guard.on_pre_llm_call(user_message={"type": "text", "text": CANARY}) or {}).get("action"), "block")
+    check("block  tuple of parts", (guard.on_pre_llm_call(user_message=({"type": "text", "text": "x"}, CANARY)) or {}).get("action"), "block")
+
+    print("== review fixes: entered values are per profile")
+    del os.environ["SG_TEST_KEY"]
+    _s = guard._scope
+    guard._scope = lambda: "/profile/A"
+    guard.remember_entered("SG_TEST_KEY", CANARY)
+    in_a = "SG_TEST_KEY" in guard._load_values()
+    guard._scope = lambda: "/profile/B"
+    in_b = "SG_TEST_KEY" in guard._load_values()
+    check("entered value visible in its own profile", in_a, True)
+    check("entered value NOT visible in another profile", in_b, False)
+    guard._scope = _s; guard._entered.clear()
+    os.environ["SG_TEST_KEY"] = CANARY
+
+    print("== known limits, asserted so the README stays honest")
+    import base64
+    b64 = base64.b64encode(CANARY.encode()).decode()
+    check("LIMIT: base64 of a key is NOT scrubbed (documented)", guard.scrub("x " + b64)[1], 0)
+    check("LIMIT: a key split in two is NOT scrubbed (documented)", guard.scrub(CANARY[:20])[1] + guard.scrub(CANARY[20:])[1], 0)
+    from agent.redact import register_vault_redaction_value, redact_sensitive_text as _rst
+    guard.register_values()
+    for i in range(70):
+        register_vault_redaction_value(f"browser-vault-filler-{i:03d}-{secrets.token_hex(6)}")
+    check("64-cap: core registry evicted our key (documented)", CANARY in _rst("v " + CANARY), True)
+    check("64-cap: plugin's own transform still scrubs it", CANARY not in (guard.on_transform_tool_result(result="v " + CANARY) or CANARY), True)
+    guard.register_values()
+    check("64-cap: next turn's re-registration restores core coverage", CANARY not in _rst("v " + CANARY), True)
+
+    print("== review fixes: keychain safety")
+    try:
+        keychain.write_value("hermes-sg-x", ACCT, "abcdefgh12345", keychain='/tmp/bad"path.keychain-db'); got = "accepted"
+    except keychain.KeychainError:
+        got = "refused"
+    check("keychain path with a quote refused", got, "refused")
+    r2 = keychain.write_value("hermes-sg-test-key", ACCT, CANARY + "-v2", keychain=KC, replace=True)
+    check("staged replace stores the new value", keychain.stored_fingerprint("hermes-sg-test-key", ACCT, KC)[0], r2["fingerprint"])
+    check("staged replace cleans up the staging item", keychain.exists("hermes-sg-test-key.sg-staging", ACCT, KC), False)
+    _sf = keychain.stored_fingerprint
+    keychain.stored_fingerprint = lambda svc, a, k=None: None if svc.endswith(".sg-staging") else _sf(svc, a, k)
+    try:
+        keychain.write_value("hermes-sg-test-key", ACCT, "would-be-v3-value", keychain=KC, replace=True); got = "written"
+    except keychain.KeychainError:
+        got = "refused"
+    keychain.stored_fingerprint = _sf
+    check("failed staging leaves the existing entry untouched", (got, keychain.stored_fingerprint("hermes-sg-test-key", ACCT, KC)[0]), ("refused", r2["fingerprint"]))
+    _sr = subprocess.run
+    def _stall(*a, **k): raise subprocess.TimeoutExpired(a[0] if a else "security", 30)
+    keychain.subprocess.run = _stall
+    try:
+        keychain.write_value("hermes-sg-y", ACCT, "abcdefgh12345", keychain=KC); got = "no error"
+    except keychain.KeychainError:
+        got = "clean KeychainError"
+    keychain.subprocess.run = _sr
+    check("stalled security call becomes a clean error", got, "clean KeychainError")
+
+    print("== review fixes: registry and intake")
+    import io, threading
+    from secret_guard import intake
+    _up = registry.upsert
+    registry.upsert = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+    _stdin = sys.stdin; sys.stdin = io.StringIO("fresh-value-abcdef123\n")
+    try:
+        intake.intake("SG_ROLLBACK_KEY", kc=KC, stdin_test=True); got = "ok"
+    except intake.IntakeError:
+        got = "IntakeError"
+    sys.stdin = _stdin; registry.upsert = _up
+    check("registry failure -> clean error", got, "IntakeError")
+    check("registry failure -> new keychain item rolled back", keychain.exists("hermes-sg-rollback-key", ACCT, KC), False)
+    def _many(n):
+        for i in range(10):
+            registry.upsert(f"SG_RACE_{n}_{i}", service="hermes-x", account=ACCT, scope="all", fingerprint="0"*16, length=1)
+    ts = [threading.Thread(target=_many, args=(n,)) for n in range(8)]
+    [x.start() for x in ts]; [x.join() for x in ts]
+    check("80 concurrent upserts all kept", len([k for k in registry.load()["secrets"] if k.startswith("SG_RACE_")]), 80)
+    for k in [k for k in registry.load()["secrets"] if k.startswith("SG_RACE_")]:
+        registry.remove(k)
+    regp = registry.registry_path(); good = regp.read_text(); regp.write_text("{not json")
+    bad = src.fetch({}, Path(TMP))
+    check("malformed registry: fetch fails cleanly, never raises", (bad.ok, bool(bad.error)), (False, True))
+    regp.write_text(good)
 finally:
     subprocess.run(["/usr/bin/security", "delete-keychain", KC], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

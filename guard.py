@@ -42,16 +42,27 @@ def _get_secret(name: str):
 # Values entered through this process's own dialog during this session. Hermes resolves secrets
 # at startup, so without this a key added mid-session would go unprotected until a restart. Memory
 # only; matched against the registry fingerprint like everything else.
-_entered: dict[str, str] = {}
+_entered: dict[str, dict[str, str]] = {}   # profile home -> {env: value}
 
 
-def remember_entered(env: str, value: str) -> None:
-    if value and len(value) >= 8:
-        _entered[env] = value
-        try:
-            register_values()
-        except Exception:
-            pass
+def _scope() -> str:
+    try:
+        from hermes_constants import get_hermes_home
+        return str(get_hermes_home())
+    except Exception:
+        return ""
+
+
+def remember_entered(env: str, value: str) -> bool:
+    """Protect a just-entered value in THIS profile right away. Returns True only if the value is
+    now in Hermes's redaction registry (the caller reports it; no silent failure)."""
+    if not value or len(value) < 8:
+        return False
+    _entered.setdefault(_scope(), {})[env] = value
+    try:
+        return register_values() > 0 and env in _load_values()
+    except Exception:
+        return False
 
 
 def _load_values() -> dict[str, str]:
@@ -59,7 +70,7 @@ def _load_values() -> dict[str, str]:
     multiplex gateway the active profile can change between turns."""
     values: dict[str, str] = {}
     for env, e in registry.load().get("secrets", {}).items():
-        for v in (_get_secret(env), _entered.get(env)):
+        for v in (_get_secret(env), _entered.get(_scope(), {}).get(env)):
             if v and len(v) >= 8 and keychain.fingerprint(v) == e.get("fingerprint"):
                 values[env] = v
                 break
@@ -97,15 +108,21 @@ def scrub(text: str) -> tuple[str, int]:
 SECRET_PATTERNS = ("*.env", "*.env.*", ".env", "openclaw.json", "*credential*", "*token*",
                    "*secret*", "*.pem", "*.pfx", "*.ppk", "id_rsa", "id_ed25519", "*-keys.json",
                    "auth.json")
-SAFE_EXTENSIONS = (".sh", ".py", ".md", ".log")
+SAFE_EXTENSIONS = (".sh", ".py", ".md")  # code and docs; a *secret*.log is still blocked
 QUOTES = "\"'"
 READERS = frozenset({"cat", "bat", "less", "more", "head", "tail", "sed", "awk", "gawk", "grep",
                      "egrep", "fgrep", "rg", "ag", "strings", "xxd", "od", "hexdump", "base64",
                      "python", "python3", "node", "perl", "ruby", "php", "jq", "yq", "cp", "scp",
                      "rsync", "curl", "nl", "tac", "cut", "sort", "uniq", "diff", "cmp", "vim",
                      "vi", "nano", "open", "pbcopy", "tee", "dd", "zip", "tar"})
-SECRET_TOOLS_ARG = {"read_file": ("path",), "search_files": ("path",), "patch": ("path",),
-                    "write_file": ("path",)}
+# Argument names, not tool names, decide what is checked: any tool (built-in, plugin or MCP) that
+# takes a command, code or a path gets the same check. v0.2 keyed on tool names and missed
+# process_manage, browser_exec, browser_cdp and cronjob_manage.
+COMMAND_KEYS = frozenset({"command", "cmd", "shell", "script"})
+CODE_KEYS = frozenset({"code", "js", "javascript", "expression", "source", "python"})
+PATH_KEYS = frozenset({"path", "file_path", "filepath", "filename", "file", "paths", "files",
+                       "source_path", "image_path", "video_path", "workdir_file"})
+_KEYCHAIN_PRINT_RE = re.compile(r"find-(?:generic|internet)-password[^\n]*?(?:^|\s|['\",])-[a-zA-Z]*[wg]\b|dump-keychain")
 
 
 def _hermes_roots() -> list[str]:
@@ -206,18 +223,57 @@ BLOCK_HINT = ("To check a secret, use `hermes secret list` or `hermes secret ver
               "(fingerprints only). To add or change one, use the secret_request tool.")
 
 
+def check_code(code: str) -> Optional[str]:
+    """Inline code (execute_code, browser JS, CDP expressions): refuse if it names a secret-shaped
+    file or asks the keychain to print a value. Pattern-based, like the rest of layer 1."""
+    if not code:
+        return None
+    if _KEYCHAIN_PRINT_RE.search(code):
+        return "asks the keychain to print a secret value"
+    for tok in re.findall(r"[\w./~-]+", code):
+        if ("/" in tok or tok.startswith(".")) and is_secret_path(tok):
+            return f"code references a secret-shaped file ({os.path.basename(tok)})"
+        if tok.endswith("/secret_guard/emit-secrets.sh") or "/secrets-provider/" in tok:
+            return "code runs a secrets helper script"
+    return None
+
+
+def _strings(v: Any) -> list[str]:
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, (list, tuple)):
+        return [x for x in v if isinstance(x, str)]
+    return []
+
+
+def check_tool_args(tool_name: str, args: dict) -> Optional[str]:
+    cwd = args.get("workdir") or args.get("cwd")
+    cwd = cwd if isinstance(cwd, str) else None
+    for key, val in args.items():
+        k = str(key).lower()
+        for s_ in _strings(val):
+            if k in COMMAND_KEYS:
+                r = check_command(s_, cwd) or check_code(s_)
+            elif k in CODE_KEYS:
+                r = check_code(s_)
+            elif k in PATH_KEYS:
+                r = f"opens a secret-shaped file ({os.path.basename(s_)})" if is_secret_path(s_, cwd) else None
+            else:
+                r = None
+            if r:
+                return r
+    return None
+
+
 def on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_kw) -> Optional[dict]:
-    args = args or {}
-    reason = None
-    if tool_name in ("terminal", "process", "execute_code"):
-        cmd = args.get("command") or args.get("code") or ""
-        reason = check_command(str(cmd), args.get("workdir") or args.get("cwd"))
-    elif tool_name in SECRET_TOOLS_ARG:
-        for key in SECRET_TOOLS_ARG[tool_name]:
-            v = args.get(key)
-            if isinstance(v, str) and is_secret_path(v):
-                reason = f"opens a secret-shaped file ({os.path.basename(v)})"
-                break
+    try:
+        reason = check_tool_args(tool_name, args if isinstance(args, dict) else {})
+    except Exception:
+        # Fail closed explicitly (Hermes would also block on a raise, but with a less useful message).
+        # Never echo the arguments: they may hold the very value being protected.
+        logger.warning("secret-guard: tool check failed; blocking %s", tool_name)
+        return {"action": "block", "message": f"Secret Guard could not check this {tool_name} call, so it "
+                                              f"was blocked. {BLOCK_HINT}"}
     if reason:
         logger.info("secret-guard blocked %s: %s", tool_name, reason)
         return {"action": "block", "message": f"Secret Guard blocked this {tool_name} call: it {reason}. {BLOCK_HINT}"}
@@ -267,11 +323,17 @@ KEY_FORMATS = [
 
 
 def _message_text(m: Any) -> str:
+    """All text in a user message: a string, a list of parts, or a single part dict. Anything else
+    is stringified rather than skipped, so an unexpected shape is still checked."""
+    if m is None:
+        return ""
     if isinstance(m, str):
         return m
-    if isinstance(m, list):
-        return "\n".join(p.get("text", "") for p in m if isinstance(p, dict))
-    return ""
+    if isinstance(m, dict):
+        return "\n".join(str(v) for k, v in m.items() if k in ("text", "content", "input_text") and v)
+    if isinstance(m, (list, tuple)):
+        return "\n".join(_message_text(p) for p in m)
+    return str(m)
 
 
 def find_key_in(text: str) -> Optional[str]:
