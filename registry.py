@@ -91,6 +91,24 @@ def _locked():
         os.close(fd)
 
 
+@contextlib.contextmanager
+def op_lock(service: str):
+    """Serialises a whole keychain-plus-registry operation on one item (add, replace, recover,
+    remove). A different lock file from _locked(), so upsert() inside it never re-enters a lock."""
+    if not re.match(r"^[A-Za-z0-9._@-]+$", service):
+        raise ValueError("bad service name")
+    d = registry_path().parent
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    fd = os.open(d / f".op-{service}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def upsert(env: str, *, service: str, account: str, scope: str, fingerprint: str, length: int,
            keychain: Optional[str] = None) -> dict:
     if scope not in SCOPES:

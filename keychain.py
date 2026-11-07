@@ -29,11 +29,27 @@ def _run(argv, **kw):
     try:
         return subprocess.run(argv, timeout=_TIMEOUT, **kw)
     except (subprocess.TimeoutExpired, OSError) as exc:
-        raise KeychainError(f"keychain tool did not complete ({type(exc).__name__}); nothing changed") from None
+        raise KeychainError(f"keychain tool did not complete ({type(exc).__name__}); the outcome is unknown. "
+                            "Run `hermes secret doctor` to check the item's state.") from None
 
 
 class KeychainError(RuntimeError):
     """A refusal or failure. Messages never contain the value."""
+
+
+STAGING_SUFFIX = ".sg-staging"
+NOT_FOUND = 44  # `security` exit status for errSecItemNotFound (measured on macOS 2026-11-07)
+
+
+def staging_name(service: str) -> str:
+    return service + STAGING_SUFFIX
+
+
+def validate_service(service: str) -> str:
+    """For user-chosen service names: the staging suffix is reserved for recovery copies."""
+    if service.endswith(STAGING_SUFFIX):
+        raise KeychainError(f"service names ending in {STAGING_SUFFIX} are reserved for recovery copies")
+    return service
 
 
 def fingerprint(value: str) -> str:
@@ -74,7 +90,12 @@ def exists(service: str, account: str, keychain: Optional[str] = None) -> bool:
     _check_names(service, account)
     r = _run([SECURITY, "find-generic-password", "-s", service, "-a", account, *_kc_args(keychain)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return r.returncode == 0
+    if r.returncode == 0:
+        return True
+    if r.returncode == NOT_FOUND:
+        return False
+    raise KeychainError(f"couldn't check whether {service} exists (security exit {r.returncode}); "
+                        "the keychain may be locked")
 
 
 def read_value(service: str, account: str, keychain: Optional[str] = None) -> Optional[str]:
@@ -110,46 +131,78 @@ def write_value(service: str, account: str, value: str, *, keychain: Optional[st
         del line
         raise KeychainError(f"value is too long ({length} chars; limit is about 3,900); nothing written")
     replaced = False
+    staging = staging_name(service)
     if exists(service, account, keychain):
         if not replace:
             del line
             raise KeychainError(f"{service} already exists; replace not confirmed; nothing written")
-        # Stage first: write the new value under a temporary name and verify it, so a value
-        # `security` cannot store is caught BEFORE the old entry is deleted.
-        staging = service + ".sg-staging"
-        _run([SECURITY, "delete-generic-password", "-s", staging, "-a", account, *kc],
-             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if exists(staging, account, keychain):
+            del line
+            raise KeychainError(f"an unfinished replace left a recovery copy ({staging}); run "
+                                "`hermes secret recover <ENV_VAR>` first. Nothing was changed.")
+        # Stage first: write the new value under the reserved recovery name and verify it, so a value
+        # `security` cannot store is caught BEFORE the old entry is deleted. The stage is NOT removed
+        # here; the caller removes it only after the registry has committed (clear_staging).
         _run([SECURITY, "-i"], input=line.replace(f'-s "{service}"', f'-s "{staging}"', 1), text=True,
              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         staged = stored_fingerprint(staging, account, keychain)
         if not staged or staged[0] != want:
-            _run([SECURITY, "delete-generic-password", "-s", staging, "-a", account, *kc],
-                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            outcome = delete(staging, account, keychain)
             del line
-            raise KeychainError(f"the new value could not be stored; the existing {service} is unchanged")
-        r = _run([SECURITY, "delete-generic-password", "-s", service, "-a", account, *kc],
-                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if r.returncode != 0:
+            raise KeychainError(f"the new value could not be stored; the existing {service} is unchanged"
+                                + ("" if outcome != "failed" else f" (a partial {staging} may remain)"))
+        if delete(service, account, keychain) != "deleted":
             del line
-            raise KeychainError(f"couldn't remove the existing {service}; it is unchanged "
-                                f"(a verified copy of the new value is in {staging})")
+            raise KeychainError(f"couldn't remove the existing {service}; it is unchanged. A verified copy "
+                                f"of the new value is in {staging}: run `hermes secret recover <ENV_VAR>`.")
         replaced = True
     _run([SECURITY, "-i"], input=line, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     del line
     got = stored_fingerprint(service, account, keychain)
     if not got or got[0] != want:
         if replaced:
-            raise KeychainError(f"WRITE FAILED after the old {service} was removed. The new value is safe "
-                                f"in {service}.sg-staging; run `hermes secret add` again to finish.")
+            raise KeychainError(f"WRITE FAILED after the old {service} was removed. The new value is safe in "
+                                f"{staging}; run `hermes secret recover <ENV_VAR>` to finish (no re-entry needed).")
         raise KeychainError(f"write failed; {service} was not saved")
-    if replaced:
-        _run([SECURITY, "delete-generic-password", "-s", service + ".sg-staging", "-a", account, *kc],
-             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return {"service": service, "account": account, "fingerprint": want, "length": length, "replaced": replaced}
+    return {"service": service, "account": account, "fingerprint": want, "length": length,
+            "replaced": replaced, "staging": staging if replaced else None}
 
 
-def delete(service: str, account: str, keychain: Optional[str] = None) -> bool:
+def clear_staging(service: str, account: str, keychain: Optional[str] = None) -> str:
+    return delete(staging_name(service), account, keychain)
+
+
+def promote_staging(service: str, account: str, keychain: Optional[str] = None) -> dict:
+    """Finish an interrupted replace: copy the verified recovery copy into the final item. The
+    recovery copy is kept; the caller clears it after the registry commits."""
+    staging = staging_name(service)
+    value = read_value(staging, account, keychain)
+    if not value:
+        raise KeychainError(f"no recovery copy ({staging}) to restore from")
+    fp_, length = fingerprint(value), len(value)
+    kc = _kc_args(keychain)
+    kcq = f' "{kc[0]}"' if kc else ""
+    line = f'add-generic-password -s "{service}" -a "{account}" -T {SECURITY} -w "{value}"{kcq}\n'
+    del value
+    if exists(service, account, keychain) and delete(service, account, keychain) != "deleted":
+        del line
+        raise KeychainError(f"couldn't remove the current {service}; recovery copy kept")
+    _run([SECURITY, "-i"], input=line, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    del line
+    got = stored_fingerprint(service, account, keychain)
+    if not got or got[0] != fp_:
+        raise KeychainError(f"restore failed; the recovery copy {staging} is kept, try again")
+    return {"fingerprint": fp_, "length": length}
+
+
+def delete(service: str, account: str, keychain: Optional[str] = None) -> str:
+    """Returns "deleted", "absent" (verified not found) or "failed" (locked, denied, timed out...)."""
     _check_names(service, account)
-    r = _run([SECURITY, "delete-generic-password", "-s", service, "-a", account, *_kc_args(keychain)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return r.returncode == 0
+    try:
+        r = _run([SECURITY, "delete-generic-password", "-s", service, "-a", account, *_kc_args(keychain)],
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except KeychainError:
+        return "failed"
+    if r.returncode == 0:
+        return "deleted"
+    return "absent" if r.returncode == NOT_FOUND else "failed"

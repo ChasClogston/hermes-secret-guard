@@ -15,11 +15,14 @@ Secret Guard closes both ends.
   nothing for the model to fill in.
 - **Common ways of reading a key back out are blocked.** Tool calls whose command, code or path
   points at a secret file, runs a secrets helper or asks the keychain to print a value are refused
-  before they run, for every tool, including plugin and MCP tools that take those arguments.
+  before they run. This applies to any tool, plugin and MCP tools included, whose arguments use the
+  recognised names (`command`, `code`, `script`, `path`, `file_path`, `paths` and similar) at any
+  nesting depth. If the check itself fails, the call is refused.
 - **Exact copies of your keys are scrubbed** from tool results, terminal output and replies before
   the model sees them, including output from commands no filename rule could predict.
-- **A key pasted into chat is stopped before inference.** The turn is blocked, Hermes stores a
-  placeholder instead of the message, and you're told whether to rotate the key.
+- **A key pasted into chat is stopped before inference.** Hermes's `pre_llm_call` veto ends the
+  turn before any model call and stores a placeholder instead of the message; you're told whether
+  to rotate the key. If the check itself fails, the turn is blocked too.
 
 Secret Guard is not a sandbox. It narrows the common paths; an agent determined to transform a
 key before printing it can still get one out. See *Honest limits*.
@@ -75,7 +78,8 @@ lists every profile and says which ones still need a step.
 | `hermes secret add ENV_VAR [--scope all\|default-only]` | Dialog entry. Prints name, fingerprint, length. |
 | `hermes secret list` | Names, scopes, fingerprints. Never values. |
 | `hermes secret verify ENV_VAR` | Checks the keychain item and the value Hermes resolved, by fingerprint. |
-| `hermes secret remove ENV_VAR --yes` | Deletes the keychain item and registry entry. |
+| `hermes secret remove ENV_VAR --yes` | Deletes the keychain item and registry entry; keeps the entry if the delete fails. |
+| `hermes secret recover ENV_VAR [--yes]` | Finishes an interrupted replace from its recovery copy, without re-entering the key. |
 | `hermes secret import SCRIPT` | Registers keys named in an existing `emit "service" "ENV"` keychain helper. Reads names only; never runs it. |
 | `hermes secret doctor` | Read-only health check of every profile. Exit 1 on problems. |
 
@@ -118,14 +122,14 @@ of overwriting. `hermes secret doctor` lists any variable your old source still 
 What Secret Guard does on your machine, so you can decide before installing:
 
 - **No network calls by the plugin.** No telemetry. (Hermes itself sends each resolved key to the service it belongs to.)
-- **Shell commands.** `/usr/bin/security` (create, read and delete keychain items this plugin
-  manages) and `/usr/bin/osascript` (the hidden-input dialog). The dialog runs only from
+- **Shell commands.** `/usr/bin/security` (create, read and delete the keychain items you
+  register with Secret Guard) and `/usr/bin/osascript` (the hidden-input dialog). The dialog runs only from
   `hermes secret add` or the `secret_request` tool when you ask Hermes to add a key.
 - **Stored credentials.** Keys you enter are stored in your login keychain as generic passwords
   named `hermes-<env-var>`. The registry (`<hermes root>/secret_guard/registry.json`, mode 600)
   holds names, scopes and SHA-256 fingerprints, never values.
-- **Credential reads.** As a Hermes secret source, the plugin reads the keychain items it
-  manages at startup and hands them to Hermes, which applies them per profile. Inside the agent,
+- **Credential reads.** As a Hermes secret source, the plugin reads the keychain items you
+  registered (entered through Secret Guard, or existing items you named with `import`) at startup and hands them to Hermes, which applies them per profile. Inside the agent,
   redaction gets values only through Hermes's `get_secret()`. The `hermes secret` CLI reads the
   same items to confirm a write and for `verify`, `doctor` and `import` (fingerprints only).
   `import` reads the names in a helper script you point it at; it never runs the script.
@@ -163,8 +167,20 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   the model and the session store; rotate it anyway.
 - **The dialog appears on the Mac Hermes runs on,** not on your phone, and can't show while the
   Mac is locked or asleep. From Telegram, Hermes tells you this before it asks.
-- **A new key reaches other profiles at their next start.** The session where you enter it is
-  protected immediately; other running sessions pick it up when they restart.
+- **A new key reaches other profiles at their next start.** In the session where you enter it,
+  the plugin checks that Hermes's redactor actually removes that key and reports whether it does.
+  Because Hermes's registry holds 64 values, a later registration can evict it; the plugin's own
+  transform hooks still scrub it from tool results, terminal output and replies. Other running
+  sessions pick it up when they restart.
+- **Hermes skips plugin `pre_llm_call` hooks for sessions with persistence disabled,** so the
+  paste block does not run there; the path gate and redaction still do.
+- **An interrupted replace** (a crash or keychain error mid-way) leaves a verified recovery copy
+  named `<service>.sg-staging`. `hermes secret recover ENV_VAR` finishes the replace without
+  re-entering the key; `verify` and `doctor` report it, and a new replace of that key is refused
+  until it is recovered.
+- **The end-to-end test checks replies, the session store and logs,** and needs positive evidence
+  for each case (a redaction label or a logged block event). It does not capture the exact payload
+  sent to the model provider.
 - **Keychain items made by other tools** may need an access approval the first time Secret Guard
   reads them; the source never prompts, so such an item is skipped (with a warning) until you
   re-add it through `hermes secret add`.

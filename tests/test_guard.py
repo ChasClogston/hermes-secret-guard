@@ -161,7 +161,7 @@ try:
     check("block  multimodal parts", (guard.on_pre_llm_call(user_message=[{"type": "text", "text": "ghp_" + "A" * 36}]) or {}).get("action"), "block")
     m_cli = (guard.on_pre_llm_call(user_message=CANARY, platform="cli") or {}).get("message", "")
     m_tg = (guard.on_pre_llm_call(user_message=CANARY, platform="telegram") or {}).get("message", "")
-    check("cli wording: never left this machine", "never left this machine" in m_cli, True)
+    check("cli wording: typed on this machine", "typed on this machine" in m_cli, True)
     check("telegram wording: rotate it", "Telegram" in m_tg and "rotate" in m_tg, True)
     check("allow  ordinary message", guard.on_pre_llm_call(user_message="add my Groq key please"), None)
     check("allow  mentions sk- prefix", guard.on_pre_llm_call(user_message="OpenAI keys start with sk-"), None)
@@ -225,7 +225,8 @@ try:
     check("keychain path with a quote refused", got, "refused")
     r2 = keychain.write_value("hermes-sg-test-key", ACCT, CANARY + "-v2", keychain=KC, replace=True)
     check("staged replace stores the new value", keychain.stored_fingerprint("hermes-sg-test-key", ACCT, KC)[0], r2["fingerprint"])
-    check("staged replace cleans up the staging item", keychain.exists("hermes-sg-test-key.sg-staging", ACCT, KC), False)
+    check("write_value keeps the recovery copy until the caller commits", keychain.exists("hermes-sg-test-key.sg-staging", ACCT, KC), True)
+    check("clear_staging removes it", (keychain.clear_staging("hermes-sg-test-key", ACCT, KC), keychain.exists("hermes-sg-test-key.sg-staging", ACCT, KC)), ("deleted", False))
     _sf = keychain.stored_fingerprint
     keychain.stored_fingerprint = lambda svc, a, k=None: None if svc.endswith(".sg-staging") else _sf(svc, a, k)
     try:
@@ -269,6 +270,131 @@ try:
     bad = src.fetch({}, Path(TMP))
     check("malformed registry: fetch fails cleanly, never raises", (bad.ok, bool(bad.error)), (False, True))
     regp.write_text(good)
+    print("== round 2: F3 inbound inspection fails closed")
+    _f = guard.find_key_in
+    guard.find_key_in = lambda t: (_ for _ in ()).throw(RuntimeError("boom"))
+    r3 = guard.on_pre_llm_call(user_message="hello " + CANARY) or {}
+    guard.find_key_in = _f
+    check("inspection error blocks the turn", r3.get("action"), "block")
+    check("block message never echoes the message", CANARY not in r3.get("message", ""), True)
+    _mt = guard._message_text
+    guard._message_text = lambda m: (_ for _ in ()).throw(ValueError("bad shape"))
+    check("normalisation error blocks too", (guard.on_pre_llm_call(user_message="x") or {}).get("action"), "block")
+    guard._message_text = _mt
+    check("control: clean message still allowed", guard.on_pre_llm_call(user_message="hello there"), None)
+    check("unknown platform wording does not claim local", "typed on this machine" in (guard.on_pre_llm_call(user_message=CANARY, platform="") or {}).get("message", ""), False)
+    check("api platform is not treated as local", "typed on this machine" in (guard.on_pre_llm_call(user_message=CANARY, platform="api") or {}).get("message", ""), False)
+
+    print("== round 2: F4 nested arguments")
+    check("block  input.command", blk("custom_tool", {"input": {"command": f"cat {H}/.env"}}), True)
+    check("block  list of operations", blk("batch", {"ops": [{"command": "ls"}, {"command": "printenv"}]}), True)
+    check("block  nested code", blk("t", {"request": {"params": {"code": "open('.env').read()"}}}), True)
+    check("block  nested path in list of dicts", blk("t", {"files": [{"path": "a.txt"}, {"path": "/x/id_rsa"}]}), True)
+    check("block  nested cwd applies to its own command", blk("t", {"steps": [{"cwd": H, "command": "cat .env"}]}), True)
+    deep = {"command": "ls"}
+    for _ in range(40):
+        deep = {"wrap": deep}
+    check("block  over-deep payload (budget, never silent pass)", blk("t", deep), True)
+    check("block  over-wide payload", blk("t", {"items": [{"note": "x"}] * 6000}), True)
+    check("allow  harmless nested text", blk("t", {"input": {"query": "how do I cat a .env file safely", "path": "src/app.py"}}), False)
+    check("allow  nested ordinary command", blk("t", {"input": {"command": "git status"}}), False)
+
+    print("== round 2: F5 remove reports truthfully")
+    from secret_guard import cli
+    import argparse, contextlib, io as _io
+    registry.upsert("SG_RM_KEY", service="hermes-sg-rm-key", account=ACCT, scope="all", fingerprint="0"*16, length=1, keychain=KC)
+    _d = keychain.delete
+    keychain.delete = lambda *a, **k: "failed"
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.secret_command(argparse.Namespace(secret_action="remove", env="SG_RM_KEY", yes=True))
+    keychain.delete = _d
+    check("failed delete -> exit 1, no 'Removed'", (rc, "Removed" in buf.getvalue()), (1, False))
+    check("failed delete keeps the registry entry", "SG_RM_KEY" in registry.load()["secrets"], True)
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.secret_command(argparse.Namespace(secret_action="remove", env="SG_RM_KEY", yes=True))
+    check("already-absent item -> reconciled, says so", (rc, "already gone" in buf.getvalue(), "SG_RM_KEY" in registry.load()["secrets"]), (0, True, False))
+    check("delete() distinguishes absent", keychain.delete("hermes-never-existed", ACCT, KC), "absent")
+
+    print("== round 2: F1/F2 interrupted replace is recoverable without re-entry")
+    for e in ("SG_TX_KEY",):
+        keychain.delete("hermes-sg-tx-key", ACCT, KC); keychain.clear_staging("hermes-sg-tx-key", ACCT, KC)
+    sys.stdin = _io.StringIO("tx-value-A-0123456789\n")
+    intake.intake("SG_TX_KEY", kc=KC, stdin_test=True)
+    fpA = registry.load()["secrets"]["SG_TX_KEY"]["fingerprint"]
+    _up = registry.upsert
+    registry.upsert = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+    sys.stdin = _io.StringIO("tx-value-B-9876543210\n")
+    try:
+        intake.intake("SG_TX_KEY", kc=KC, stdin_test=True, yes=True); msg = "returned success"
+    except intake.IntakeError as exc:
+        msg = str(exc)
+    registry.upsert = _up
+    sys.stdin = _stdin
+    fpB = keychain.fingerprint("tx-value-B-9876543210")
+    check("replace + registry failure -> error names recover", "secret recover SG_TX_KEY" in msg, True)
+    check("...recovery copy B survives", keychain.stored_fingerprint("hermes-sg-tx-key.sg-staging", ACCT, KC)[0], fpB)
+    check("...registry still says A", registry.load()["secrets"]["SG_TX_KEY"]["fingerprint"], fpA)
+    check("verify reports the unfinished replace", "unfinished replace" in intake.verify("SG_TX_KEY")["status"], True)
+    sys.stdin = _io.StringIO("tx-value-C-1111111111\n")
+    try:
+        intake.intake("SG_TX_KEY", kc=KC, stdin_test=True, yes=True); got = "accepted"
+    except intake.IntakeError as exc:
+        got = "refused" if "recover" in str(exc) else str(exc)
+    sys.stdin = _stdin
+    check("new replace refused while a recovery copy exists (copy not destroyed)", (got, keychain.exists("hermes-sg-tx-key.sg-staging", ACCT, KC)), ("refused", True))
+    r_ = intake.recover("SG_TX_KEY", yes=True)
+    check("recover finishes the replace with no re-entry", (registry.load()["secrets"]["SG_TX_KEY"]["fingerprint"], keychain.stored_fingerprint("hermes-sg-tx-key", ACCT, KC)[0]), (fpB, fpB))
+    check("recover clears the copy", keychain.exists("hermes-sg-tx-key.sg-staging", ACCT, KC), False)
+    check("recover is idempotent", intake.recover("SG_TX_KEY")["status"], "nothing to recover")
+    # final item lost after delete (the write-failed-after-delete case): stage B present, final absent
+    keychain.write_value("hermes-sg-tx-key.sg-staging", ACCT, "tx-value-D-2222222222", keychain=KC)
+    keychain.delete("hermes-sg-tx-key", ACCT, KC)
+    try:
+        intake.recover("SG_TX_KEY"); got = "acted without --yes"
+    except intake.IntakeError:
+        got = "asked for --yes"
+    check("recover asks before replacing", got, "asked for --yes")
+    intake.recover("SG_TX_KEY", yes=True)
+    check("recover restores a missing item from the copy", keychain.stored_fingerprint("hermes-sg-tx-key", ACCT, KC)[0], keychain.fingerprint("tx-value-D-2222222222"))
+    try:
+        keychain.validate_service("hermes-x.sg-staging"); got = "accepted"
+    except keychain.KeychainError:
+        got = "refused"
+    check("staging suffix reserved for users", got, "refused")
+    sys.stdin = _io.StringIO("rb-value-0123456789\n")
+    _up = registry.upsert; _d = keychain.delete
+    registry.upsert = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+    keychain.delete = lambda *a, **k: "failed"
+    try:
+        intake.intake("SG_RB2_KEY", kc=KC, stdin_test=True); msg = "success"
+    except intake.IntakeError as exc:
+        msg = str(exc)
+    registry.upsert = _up; keychain.delete = _d; sys.stdin = _stdin
+    check("rollback that fails is reported, never 'rolled back'", ("rolled back" not in msg) and ("couldn't roll back" in msg), True)
+    keychain.delete("hermes-sg-rb2-key", ACCT, KC)
+
+    print("== round 2: F6 'protected now' is value-specific")
+    from agent.redact import clear_vault_redaction_values
+    clear_vault_redaction_values(); guard._entered.clear()
+    for i in range(65):
+        n = f"SG_BULK_{i:02d}"; v = f"bulk-guarded-value-{i:02d}-{secrets.token_hex(8)}"
+        os.environ[n] = v
+        registry.upsert(n, service=f"hermes-sg-bulk-{i:02d}", account=ACCT, scope="all", fingerprint=keychain.fingerprint(v), length=len(v))
+    newv = "just-entered-" + secrets.token_hex(10)
+    registry.upsert("SG_NEW_KEY", service="hermes-sg-new-key", account=ACCT, scope="all", fingerprint=keychain.fingerprint(newv), length=len(newv))
+    check("66 guarded values: entered key registered last, verified covered", guard.remember_entered("SG_NEW_KEY", newv), True)
+    check("...and it really is redacted by core", newv not in _rst("x " + newv), True)
+    import agent.redact as _ar
+    _reg = _ar.register_vault_redaction_value
+    _ar.register_vault_redaction_value = lambda v: None
+    clear_vault_redaction_values(); guard._entered.clear()
+    check("protected_now False when the value is not actually covered", guard.remember_entered("SG_NEW_KEY", newv), False)
+    _ar.register_vault_redaction_value = _reg
+    for i in range(65):
+        os.environ.pop(f"SG_BULK_{i:02d}", None); registry.remove(f"SG_BULK_{i:02d}")
+    registry.remove("SG_NEW_KEY"); guard._entered.clear()
 finally:
     subprocess.run(["/usr/bin/security", "delete-keychain", KC], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

@@ -25,6 +25,9 @@ def register_cli(p: argparse.ArgumentParser) -> None:
     r = subs.add_parser("remove", help="Remove a secret from the keychain and the registry")
     r.add_argument("env")
     r.add_argument("--yes", action="store_true")
+    rc = subs.add_parser("recover", help="Finish an interrupted replace from its recovery copy (no re-entry)")
+    rc.add_argument("env")
+    rc.add_argument("--yes", action="store_true")
     im = subs.add_parser("import", help="Register keys named in an existing keychain helper script")
     im.add_argument("script", help="e.g. ~/.hermes/secrets-provider/keychain-secrets-env.sh")
     subs.add_parser("doctor", help="Read-only health check")
@@ -43,6 +46,8 @@ def secret_command(args: argparse.Namespace) -> int:
         print(f"Saved {res['env']} ({res['service']}, scope {res['scope']})"
               + (", replacing the old entry" if res["replaced"] else ""))
         print(f"fingerprint {res['fingerprint']}  length {res['length']}")
+        if res.get("staging_left"):
+            print(f"warning: the recovery copy could not be removed; run `hermes secret recover {res['env']}`")
         print("Profiles pick it up at their next start.")
         return 0
     if act == "list":
@@ -65,9 +70,27 @@ def secret_command(args: argparse.Namespace) -> int:
         if not args.yes:
             print(f"This deletes {args.env} ({entry['service']}) from the keychain. Re-run with --yes to confirm.")
             return 1
-        keychain.delete(entry["service"], entry["account"], entry.get("keychain"))
-        registry.remove(args.env)
-        print(f"Removed {args.env}")
+        with registry.op_lock(entry["service"]):
+            outcome = keychain.delete(entry["service"], entry["account"], entry.get("keychain"))
+            if outcome == "failed":
+                print(f"secret-guard: couldn't delete {entry['service']} from the keychain (locked, denied or "
+                      "timed out). Nothing was changed; the registry entry is kept.")
+                return 1
+            try:
+                registry.remove(args.env)
+            except Exception as exc:
+                print(f"secret-guard: the keychain item is {outcome} but the registry update failed "
+                      f"({type(exc).__name__}). Run `hermes secret remove {args.env} --yes` again.")
+                return 1
+        print(f"Removed {args.env}" + (" (the keychain item was already gone)" if outcome == "absent" else ""))
+        return 0
+    if act == "recover":
+        try:
+            res = _intake.recover(args.env, yes=args.yes)
+        except _intake.IntakeError as exc:
+            print(f"secret-guard: {exc}")
+            return 1
+        print(f"{res['env']}: {res['status']} (fp {res['fingerprint']})")
         return 0
     if act == "import":
         pairs = migrate.parse_existing_helper(Path(os.path.expanduser(args.script)))
@@ -75,6 +98,9 @@ def secret_command(args: argparse.Namespace) -> int:
         kc = registry.settings().get("keychain")
         n = 0
         for service, env in pairs:
+            if service.endswith(keychain.STAGING_SUFFIX):
+                print(f"skip {env}: {service} uses the reserved recovery suffix")
+                continue
             got = keychain.stored_fingerprint(service, acct, kc)
             if not got:
                 print(f"skip {env}: {service} not in keychain")
@@ -88,5 +114,5 @@ def secret_command(args: argparse.Namespace) -> int:
         return 0
     if act == "doctor":
         return doctor.run()
-    print("usage: hermes secret {add,list,verify,remove,import,doctor} ...")
+    print("usage: hermes secret {add,list,verify,remove,recover,import,doctor} ...")
     return 1

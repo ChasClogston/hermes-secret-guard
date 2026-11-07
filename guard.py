@@ -60,9 +60,11 @@ def remember_entered(env: str, value: str) -> bool:
         return False
     _entered.setdefault(_scope(), {})[env] = value
     try:
-        return register_values() > 0 and env in _load_values()
+        register_values()
     except Exception:
         return False
+    # Value-specific: the claim is "this key is redacted now", so test exactly that.
+    return env in _load_values() and core_covers(value)
 
 
 def _load_values() -> dict[str, str]:
@@ -80,17 +82,28 @@ def _load_values() -> dict[str, str]:
 def register_values() -> int:
     """Push every guarded value into Hermes's exact-value model-egress scrub (the vault registry
     Hermes uses for browser-vault passwords; it applies even when security.redact_secrets is off).
-    Re-run each turn: it keeps 64 values per profile and evicts the oldest. It is an undocumented
-    module function, so if an update removes it the plugin's transform hooks still scrub tool
-    results, terminal output and replies, and `hermes secret doctor` reports the change."""
+    Re-run each turn. The registry keeps 64 values per profile and evicts the oldest, so values
+    entered in this session are registered LAST and survive a large guarded set. It is an
+    undocumented module function: if an update removes it, the plugin's transform hooks still scrub
+    tool results, terminal output and replies, and `hermes secret doctor` reports the change."""
     values = _load_values()
     try:
         from agent.redact import register_vault_redaction_value
     except Exception:
         return 0
-    for v in values.values():
-        register_vault_redaction_value(v)
+    entered = _entered.get(_scope(), {})
+    for env in sorted(values, key=lambda e: e in entered):  # entered values last = most recent
+        register_vault_redaction_value(values[env])
     return len(values)
+
+
+def core_covers(value: str) -> bool:
+    """True only if Hermes's core exact-value redactor removes this specific value right now."""
+    try:
+        from agent.redact import redact_registered_vault_values
+        return value not in redact_registered_vault_values("<" + value + ">")
+    except Exception:
+        return False
 
 
 def scrub(text: str) -> tuple[str, int]:
@@ -238,31 +251,56 @@ def check_code(code: str) -> Optional[str]:
     return None
 
 
-def _strings(v: Any) -> list[str]:
-    if isinstance(v, str):
-        return [v]
-    if isinstance(v, (list, tuple)):
-        return [x for x in v if isinstance(x, str)]
-    return []
+class _TooBig(Exception):
+    pass
 
 
-def check_tool_args(tool_name: str, args: dict) -> Optional[str]:
-    cwd = args.get("workdir") or args.get("cwd")
-    cwd = cwd if isinstance(cwd, str) else None
-    for key, val in args.items():
-        k = str(key).lower()
-        for s_ in _strings(val):
-            if k in COMMAND_KEYS:
-                r = check_command(s_, cwd) or check_code(s_)
-            elif k in CODE_KEYS:
-                r = check_code(s_)
-            elif k in PATH_KEYS:
-                r = f"opens a secret-shaped file ({os.path.basename(s_)})" if is_secret_path(s_, cwd) else None
-            else:
-                r = None
+MAX_DEPTH, MAX_NODES, MAX_TEXT = 12, 5000, 2_000_000
+
+
+def _check_string(key: str, val: str, cwd: Optional[str]) -> Optional[str]:
+    if key in COMMAND_KEYS:
+        return check_command(val, cwd) or check_code(val)
+    if key in CODE_KEYS:
+        return check_code(val)
+    if key in PATH_KEYS:
+        return f"opens a secret-shaped file ({os.path.basename(val)})" if is_secret_path(val, cwd) else None
+    return None
+
+
+def _walk(obj: Any, key: str, cwd: Optional[str], depth: int, budget: dict) -> Optional[str]:
+    """Visit nested dicts/lists, applying the rule for the nearest enclosing key name. Bounded:
+    exceeding depth, node or text budgets raises _TooBig (the caller blocks; never a silent pass)."""
+    budget["nodes"] += 1
+    if depth > MAX_DEPTH or budget["nodes"] > MAX_NODES:
+        raise _TooBig
+    if isinstance(obj, str):
+        if key in COMMAND_KEYS or key in CODE_KEYS or key in PATH_KEYS:
+            budget["text"] += len(obj)
+            if budget["text"] > MAX_TEXT:
+                raise _TooBig
+        return _check_string(key, obj, cwd)
+    if isinstance(obj, dict):
+        local = obj.get("workdir") or obj.get("cwd")
+        cwd = local if isinstance(local, str) else cwd   # a nested workdir/cwd applies to its own object
+        for k, v in obj.items():
+            r = _walk(v, str(k).lower(), cwd, depth + 1, budget)
+            if r:
+                return r
+        return None
+    if isinstance(obj, (list, tuple)):
+        for item in obj:
+            r = _walk(item, key, cwd, depth + 1, budget)   # list items inherit the list's key
             if r:
                 return r
     return None
+
+
+def check_tool_args(tool_name: str, args: dict) -> Optional[str]:
+    try:
+        return _walk(args, "", None, 0, {"nodes": 0, "text": 0})
+    except (_TooBig, RecursionError):
+        return "has arguments too large or too deeply nested to inspect"
 
 
 def on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_kw) -> Optional[dict]:
@@ -347,7 +385,8 @@ def find_key_in(text: str) -> Optional[str]:
     return None
 
 
-LOCAL_PLATFORMS = frozenset({"", "cli", "local", "tui", "desktop", "dashboard", "api"})
+# Only surfaces that are on this machine by construction. "api" and "dashboard" can be remote.
+LOCAL_PLATFORMS = frozenset({"cli", "local", "tui", "desktop"})
 
 
 def on_pre_llm_call(user_message: Any = None, platform: str = "", **_kw) -> Optional[dict]:
@@ -358,15 +397,21 @@ def on_pre_llm_call(user_message: Any = None, platform: str = "", **_kw) -> Opti
     try:
         found = find_key_in(_message_text(user_message))
     except Exception:
-        logger.warning("secret-guard: inbound check failed (message allowed)", exc_info=False)
-        return None
+        # Fail closed: an uninspected message may hold a key. Never echo the message or the error.
+        logger.warning("secret-guard: inbound check failed; turn blocked", exc_info=False)
+        return {"action": "block", "message": "🔐 Secret Guard could not safely inspect this message, so the "
+                                              "turn was blocked. Please send it again; if this repeats, run "
+                                              "`hermes secret doctor`."}
     if not found:
         return None
-    if (platform or "").lower() in LOCAL_PLATFORMS:
-        where = "It never left this machine."
-    else:
+    plat = (platform or "").lower()
+    if plat in LOCAL_PLATFORMS:
+        where = "It was typed on this machine."
+    elif plat:
         where = (f"It has already passed through {platform.title()}, though, so treat the key as "
                  "exposed and rotate it at the provider.")
+    else:
+        where = "If it came through a chat app or a remote connection, treat the key as exposed and rotate it."
     return {"action": "block", "message": (
         f"🔐 Secret Guard stopped that message: it contains {found}. No model saw it, and it is not "
         f"stored in this session. {where} To store a key safely, ask me to add it — a hidden dialog "
