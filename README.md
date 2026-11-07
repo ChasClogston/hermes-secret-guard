@@ -186,8 +186,9 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   re-add it through `hermes secret add`.
 - **macOS only** in this version (Keychain + `osascript`). Values with whitespace, quotes or
   backslashes, or longer than about 3,900 characters, are refused; `security -i` can't carry them.
-- Value redaction uses `agent.redact.register_vault_redaction_value`, a module function rather
-  than a documented plugin API (`hermes plugins validate` warns on it). If an update removes it,
+- Value redaction uses `agent.redact.register_vault_redaction_value` (to register keys) and
+  `redact_registered_vault_values` (to confirm a just-entered key is covered), module functions rather
+  than a documented plugin API (`hermes plugins validate` warns on both). If an update removes it,
   the plugin's own `transform_*` hooks still scrub tool results, terminal output and replies, and
   `doctor` reports the change.
 
