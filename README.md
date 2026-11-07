@@ -51,7 +51,17 @@ hermes plugins enable secret-guard --no-allow-tool-override
 hermes tools enable secret_guard          # if your profile restricts toolsets
 ```
 
-Plugins are per profile; install in each profile that should be guarded.
+Then turn on the key source in that profile's `config.yaml` (Hermes applies a secret source only
+when this is set):
+
+```yaml
+secrets:
+  secret_guard:
+    enabled: true
+```
+
+Plugins are per profile; repeat in each profile that should be guarded. `hermes secret doctor`
+lists every profile and says which ones still need a step.
 
 ## Commands
 
@@ -59,25 +69,28 @@ Plugins are per profile; install in each profile that should be guarded.
 |---|---|
 | `hermes secret add ENV_VAR [--scope all\|default-only]` | Dialog entry. Prints name, fingerprint, length. |
 | `hermes secret list` | Names, scopes, fingerprints. Never values. |
-| `hermes secret verify ENV_VAR` | Recomputes the fingerprint from the keychain. |
+| `hermes secret verify ENV_VAR` | Checks the keychain item and the value Hermes resolved, by fingerprint. |
 | `hermes secret remove ENV_VAR --yes` | Deletes the keychain item and registry entry. |
-| `hermes secret wire PROFILE\|all` | Points a profile's `secrets.command` at the generated helper. |
 | `hermes secret import SCRIPT` | Registers keys named in an existing `emit "service" "ENV"` keychain helper. Reads names only; never runs it. |
-| `hermes secret doctor` | Read-only health check. Exit 1 on problems. |
+| `hermes secret doctor` | Read-only health check of every profile. Exit 1 on problems. |
 
 ## How keys reach your profiles
 
-Secret Guard generates one helper, `<hermes root>/secret_guard/emit-secrets.sh`, and wires each
-profile's `secrets.command` to it. The script holds service and variable names only; values are
-read from the keychain at startup.
+Secret Guard is a Hermes **secret source** (`ctx.register_secret_source`), the same mechanism as
+Hermes's Bitwarden and 1Password integrations. At startup Hermes asks it for each profile's keys and
+tells it which profile is asking. Values are read from the keychain then; the plugin's registry
+(`<hermes root>/secret_guard/registry.json`) holds only names, scopes and fingerprints.
 
 Each secret has a scope:
 
 - `all`: every profile gets it.
 - `default-only`: only the root profile. Telegram, Discord and Slack bot tokens are forced to
-  this scope. If a second profile resolves the same bot credential, the multiplex gateway refuses
-  to multiplex and silently falls back to standalone. `doctor` catches a profile wired to the
-  wrong scope (for example one cloned from the root) and `wire` repairs it.
+  this scope. If a second profile resolved the same bot credential, the multiplex gateway would
+  refuse to multiplex and silently fall back to standalone.
+
+If you already feed keys through `secrets.command` or another source, both can run while you
+migrate: Hermes gives each variable to the first source that claims it and logs a warning instead
+of overwriting. `hermes secret doctor` lists any variable your old source still supplies.
 
 ## The three layers
 
@@ -100,26 +113,23 @@ Each secret has a scope:
 What Secret Guard does on your machine, so you can decide before installing:
 
 - **No network calls.** Nothing leaves the machine. No telemetry.
-- **Shell commands.** `/usr/bin/security` (create, update and read keychain items this plugin
-  manages) and `/usr/bin/osascript` (the hidden-input dialog). Both run only from
-  `hermes secret` commands you type or from the `secret_request` tool when you ask Hermes to add
-  a key.
+- **Shell commands.** `/usr/bin/security` (create, read and delete keychain items this plugin
+  manages) and `/usr/bin/osascript` (the hidden-input dialog). The dialog runs only from
+  `hermes secret add` or the `secret_request` tool when you ask Hermes to add a key.
 - **Stored credentials.** Keys you enter are stored in your login keychain as generic passwords
-  named `hermes-<env-var>`. The plugin's own registry
-  (`<hermes home>/secret_guard/registry.json`, mode 600) holds names, scopes and SHA-256
-  fingerprints, never values.
-- **Reads outside its own data.** Inside the agent, values come only through Hermes's
-  `get_secret()`, i.e. what Hermes already resolved for the active profile; the agent process
-  never reads the keychain. The `hermes secret` CLI reads the keychain items this plugin created,
-  to confirm a write and for `verify` / `doctor` / `import` (fingerprints only). `import` reads the
-  service and variable names in a helper script you point it at; it never runs the script.
-- **Writes outside its own data.** `hermes secret wire` edits a profile's `config.yaml` to set
-  `secrets.command`, after saving a timestamped backup next to it. The generated helper lives at
-  `<hermes root>/secret_guard/emit-secrets.sh` and is run by Hermes at startup.
+  named `hermes-<env-var>`. The registry (`<hermes root>/secret_guard/registry.json`, mode 600)
+  holds names, scopes and SHA-256 fingerprints, never values.
+- **Credential reads.** As a Hermes secret source, the plugin reads the keychain items it
+  manages at startup and hands them to Hermes, which applies them per profile. Inside the agent,
+  redaction gets values only through Hermes's `get_secret()`. The `hermes secret` CLI reads the
+  same items to confirm a write and for `verify`, `doctor` and `import` (fingerprints only).
+  `import` reads the names in a helper script you point it at; it never runs the script.
+- **No config edits.** The plugin never writes your `config.yaml`; you add the
+  `secrets.secret_guard` block yourself.
 - **Blocking.** The `pre_tool_call` hook refuses some terminal and file-tool calls (see *The three
   layers*). It fails closed: if the check errors, the tool call is refused.
 - **Unattended runs.** The dialog gives up after 5 minutes and the tool returns a plain error, so
-  cron and gateway runs never hang on it.
+  cron and gateway runs never hang on it. The secret source never prompts.
 - **No background processes.**
 
 ## Honest limits
@@ -135,6 +145,11 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   the model and the session store; rotate it anyway.
 - **The dialog appears on the Mac Hermes runs on,** not on your phone, and can't show while the
   Mac is locked or asleep. From Telegram, Hermes tells you this before it asks.
+- **A new key reaches other profiles at their next start.** The session where you enter it is
+  protected immediately; other running sessions pick it up when they restart.
+- **Keychain items made by other tools** may need an access approval the first time Secret Guard
+  reads them; the source never prompts, so such an item is skipped (with a warning) until you
+  re-add it through `hermes secret add`.
 - **macOS only** in this version (Keychain + `osascript`). Values with whitespace, quotes or
   backslashes, or longer than about 3,900 characters, are refused; `security -i` can't carry them.
 - Value redaction uses `agent.redact.register_vault_redaction_value`, a module function rather

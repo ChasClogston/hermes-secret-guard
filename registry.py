@@ -22,10 +22,8 @@ PLATFORM_BOT_ENVS = frozenset({"TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK
 
 
 def _home() -> Path:
-    """The Hermes ROOT, not the active profile's home: there is one registry and one generated
-    helper per root, and each entry's scope decides which profiles resolve it. A per-profile
-    registry would let `hermes -p X secret add` regenerate the shared helper from X's entries
-    alone and silently drop every other secret from every profile."""
+    """The Hermes ROOT, not the active profile's home: one registry per root, shared by every
+    profile; each entry's scope decides which profiles the keychain source serves it to."""
     try:
         from hermes_constants import get_default_hermes_root
         return Path(get_default_hermes_root())

@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 def _get_secret(name: str):
     """Hermes's own credential route (catalog rule 11): the value Hermes resolved for the active
-    profile, normally via the generated secrets.command helper. Never reads the keychain."""
+    profile, normally from this plugin's own keychain secret source. Never reads the keychain."""
     try:
         from agent.secret_scope import get_secret
     except Exception:

@@ -50,11 +50,6 @@ def handle_secret_request(args: dict[str, Any], **_kw) -> str:
                     "(it cannot show while the Mac is locked or asleep). To add the key later, run "
                     f"`hermes secret add {env}` on {host}.")
         return json.dumps({"ok": False, "error": msg + hint})
-    try:
-        from . import helper
-        helper.write()
-    except Exception:
-        pass
     return json.dumps({"ok": True, **res, "entered_on": host,
-                       "note": "Stored in the keychain. Start a new session (or restart Hermes) for "
-                               "profiles to pick it up."})
+                       "note": "Stored in the keychain and protected from now on. Other profiles and new "
+                               "sessions pick it up at their next start."})

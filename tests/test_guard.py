@@ -7,6 +7,7 @@ the login keychain.
     PYTHONPATH=~/.hermes/hermes-agent ~/.hermes/hermes-agent/venv/bin/python tests/test_guard.py
 """
 import os, secrets, subprocess, sys, tempfile
+from pathlib import Path
 
 ROOT = tempfile.mkdtemp(prefix="secret-guard-test-")
 TMP = os.path.join(ROOT, "profiles", "work")   # run as a NON-default profile on purpose
@@ -29,7 +30,11 @@ CANARY = secrets.token_hex(20)              # prefix-less: core regexes alone wo
 res = keychain.write_value("hermes-sg-test-key", ACCT, CANARY, keychain=KC)
 registry.upsert("SG_TEST_KEY", service="hermes-sg-test-key", account=ACCT, scope="all",
                 fingerprint=res["fingerprint"], length=res["length"], keychain=KC)
-os.environ["SG_TEST_KEY"] = CANARY   # what Hermes's secrets.command would have resolved
+BOT = "123456789:AA" + secrets.token_hex(17)
+res_b = keychain.write_value("hermes-telegram-bot-token", ACCT, BOT, keychain=KC)
+registry.upsert("TELEGRAM_BOT_TOKEN", service="hermes-telegram-bot-token", account=ACCT, scope="default-only",
+                fingerprint=res_b["fingerprint"], length=res_b["length"], keychain=KC)
+os.environ["SG_TEST_KEY"] = CANARY   # what Hermes resolves through the keychain source
 
 fails = 0
 def check(label, got, want):
@@ -42,9 +47,28 @@ B = lambda c: guard.check_command(c, cwd="/tmp") is not None
 H = "~/.hermes"
 try:
     print("== registry is per root, not per profile")
-    from secret_guard import helper
     check("registry lives at the root", str(registry.registry_path()).startswith(os.path.realpath(ROOT) + "/secret_guard") or str(registry.registry_path()).startswith(ROOT + "/secret_guard"), True)
-    check("helper and registry share the root", registry.registry_path().parent == helper.helper_path().parent, True)
+
+    print("== keychain secret source")
+    from secret_guard.source import KeychainSource, root_of, is_root
+    from agent.secret_sources.base import SecretSource
+    src = KeychainSource()
+    check("is a Hermes SecretSource", isinstance(src, SecretSource), True)
+    check("name/shape", (src.name, src.shape), ("secret_guard", "mapped"))
+    check("off unless explicitly enabled (Hermes convention)", src.is_enabled({}), False)
+    check("on with enabled: true", src.is_enabled({"enabled": True}), True)
+    check("root_of(profile) is the root", root_of(Path(TMP)) == Path(ROOT), True)
+    check("profile is not root", is_root(Path(TMP)), False)
+    r_prof = src.fetch({}, Path(TMP))
+    r_root = src.fetch({}, Path(ROOT))
+    check("fetch ok in a profile", r_prof.ok, True)
+    check("profile gets the 'all' secret", r_prof.secrets.get("SG_TEST_KEY") == CANARY, True)
+    check("profile does NOT get the default-only bot token", "TELEGRAM_BOT_TOKEN" in r_prof.secrets, False)
+    check("root gets both", sorted(r_root.secrets) == ["SG_TEST_KEY", "TELEGRAM_BOT_TOKEN"], True)
+    empty = src.fetch({}, Path(tempfile.mkdtemp()))
+    check("no registry -> ok, nothing", (empty.ok, empty.secrets), (True, {}))
+    r_prof.secrets.clear(); r_root.secrets.clear()
+
     print("== keychain write path")
     check("fingerprint round-trips", keychain.stored_fingerprint("hermes-sg-test-key", ACCT, KC)[0], res["fingerprint"])
     for bad in ["has space", 'quo"te', "back\\slash", "x" * 3950]:

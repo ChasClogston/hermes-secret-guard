@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 def register(ctx) -> None:
     if platform.system() != "Darwin":
-        logger.info("secret-guard: macOS only in v0.2; not loading")
+        logger.info("secret-guard: macOS only; not loading")
         return
     from . import guard
     from .cli import register_cli, secret_command
@@ -22,6 +22,8 @@ def register(ctx) -> None:
         description="Secret Guard: enter keys through a hidden dialog, never through chat.")
     ctx.register_tool(name="secret_request", toolset="secret_guard", schema=SECRET_REQUEST_SCHEMA,
                       handler=handle_secret_request, emoji="🔐")
+    from .source import KeychainSource
+    ctx.register_secret_source(KeychainSource())
     ctx.register_hook("on_session_start", guard.on_session_start)
     ctx.register_hook("pre_llm_call", guard.on_pre_llm_call)
     ctx.register_hook("pre_tool_call", guard.on_pre_tool_call)

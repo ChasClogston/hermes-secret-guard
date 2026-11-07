@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import getpass
+import os
+from pathlib import Path
 
-from . import doctor, helper, intake as _intake, keychain, registry
+from . import doctor, intake as _intake, keychain, migrate, registry
 
 
 def register_cli(p: argparse.ArgumentParser) -> None:
@@ -17,15 +20,12 @@ def register_cli(p: argparse.ArgumentParser) -> None:
     a.add_argument("--stdin", action="store_true", help=argparse.SUPPRESS)
     a.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
     subs.add_parser("list", help="List guarded secrets (no values)")
-    v = subs.add_parser("verify", help="Check a secret's fingerprint against the keychain")
+    v = subs.add_parser("verify", help="Check a secret against the keychain and what Hermes resolved")
     v.add_argument("env")
     r = subs.add_parser("remove", help="Remove a secret from the keychain and the registry")
     r.add_argument("env")
     r.add_argument("--yes", action="store_true")
-    w = subs.add_parser("wire", help="Point a profile's secrets.command at the Secret Guard helper")
-    w.add_argument("profile", nargs="?", default="default", help="profile name, or 'all'")
-    subs.add_parser("helper", help="Regenerate the secrets.command helper from the registry")
-    im = subs.add_parser("import", help="Register secrets named in an existing keychain helper script")
+    im = subs.add_parser("import", help="Register keys named in an existing keychain helper script")
     im.add_argument("script", help="e.g. ~/.hermes/secrets-provider/keychain-secrets-env.sh")
     subs.add_parser("doctor", help="Read-only health check")
     p.set_defaults(func=secret_command)
@@ -43,7 +43,7 @@ def secret_command(args: argparse.Namespace) -> int:
         print(f"Saved {res['env']} ({res['service']}, scope {res['scope']})"
               + (", replacing the old entry" if res["replaced"] else ""))
         print(f"fingerprint {res['fingerprint']}  length {res['length']}")
-        print(f"helper updated: {helper.write()}")
+        print("Profiles pick it up at their next start.")
         return 0
     if act == "list":
         secrets = registry.load()["secrets"]
@@ -67,28 +67,10 @@ def secret_command(args: argparse.Namespace) -> int:
             return 1
         keychain.delete(entry["service"], entry["account"], entry.get("keychain"))
         registry.remove(args.env)
-        helper.write()
-        print(f"Removed {args.env}; helper updated")
+        print(f"Removed {args.env}")
         return 0
-    if act == "helper":
-        print(f"wrote {helper.write()}")
-        return 0
-    if act == "wire":
-        names = helper.profiles() if args.profile == "all" else [args.profile]
-        rc = 0
-        for n in names:
-            try:
-                print(helper.wire(n))
-            except Exception as exc:
-                print(f"{n}: NOT wired: {exc}")
-                rc = 1
-        if not helper.is_current():
-            print(f"wrote {helper.write()}")
-        return rc
     if act == "import":
-        from pathlib import Path
-        import getpass, os
-        pairs = helper.parse_existing_helper(Path(os.path.expanduser(args.script)))
+        pairs = migrate.parse_existing_helper(Path(os.path.expanduser(args.script)))
         acct = os.environ.get("USER") or getpass.getuser()
         kc = registry.settings().get("keychain")
         n = 0
@@ -101,9 +83,10 @@ def secret_command(args: argparse.Namespace) -> int:
                             fingerprint=got[0], length=got[1], keychain=kc)
             print(f"registered {env:30} scope {registry.default_scope(env):13} fp {got[0]}")
             n += 1
-        print(f"{n} imported; wrote {helper.write()}")
+        print(f"{n} imported. Run `hermes secret doctor` to see which profiles still get them from "
+              "the old helper; turn that helper off once every profile resolves them from Secret Guard.")
         return 0
     if act == "doctor":
         return doctor.run()
-    print("usage: hermes secret {add,list,verify,remove,wire,helper,import,doctor} ...")
+    print("usage: hermes secret {add,list,verify,remove,import,doctor} ...")
     return 1
