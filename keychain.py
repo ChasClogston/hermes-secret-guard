@@ -99,12 +99,17 @@ def exists(service: str, account: str, keychain: Optional[str] = None) -> bool:
 
 
 def read_value(service: str, account: str, keychain: Optional[str] = None) -> Optional[str]:
-    """Return the stored value, or None. Callers must never print, log or return it to a model."""
+    """Return the stored value, or None ONLY when the item is verifiably absent (exit 44). Any other
+    failure (locked, denied, timeout) raises KeychainError, so "unreadable" is never reported as
+    "missing". Callers must never print, log or return the value to a model."""
     _check_names(service, account)
     r = _run([SECURITY, "find-generic-password", "-w", "-s", service, "-a", account, *_kc_args(keychain)],
                        capture_output=True, text=True)
-    if r.returncode != 0:
+    if r.returncode == NOT_FOUND:
         return None
+    if r.returncode != 0:
+        raise KeychainError(f"couldn't read {service} (security exit {r.returncode}); the keychain may be "
+                            "locked or access was denied")
     return r.stdout.rstrip("\n")
 
 

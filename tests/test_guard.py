@@ -352,9 +352,15 @@ try:
     keychain.write_value("hermes-sg-tx-key.sg-staging", ACCT, "tx-value-D-2222222222", keychain=KC)
     keychain.delete("hermes-sg-tx-key", ACCT, KC)
     try:
+        intake.recover("SG_TX_KEY", yes=True); got = "promoted"
+    except intake.IntakeError as exc:
+        got = "refused" if "does not match a recorded replace" in str(exc) else str(exc)
+    check("R1: a copy with no pending record is never promoted (even with --yes)", got, "refused")
+    registry.set_pending("SG_TX_KEY", keychain.fingerprint("tx-value-D-2222222222"), 21)
+    try:
         intake.recover("SG_TX_KEY"); got = "acted without --yes"
-    except intake.IntakeError:
-        got = "asked for --yes"
+    except intake.IntakeError as exc:
+        got = "asked for --yes" if "--yes" in str(exc) else str(exc)
     check("recover asks before replacing", got, "asked for --yes")
     intake.recover("SG_TX_KEY", yes=True)
     check("recover restores a missing item from the copy", keychain.stored_fingerprint("hermes-sg-tx-key", ACCT, KC)[0], keychain.fingerprint("tx-value-D-2222222222"))
@@ -395,6 +401,108 @@ try:
     for i in range(65):
         os.environ.pop(f"SG_BULK_{i:02d}", None); registry.remove(f"SG_BULK_{i:02d}")
     registry.remove("SG_NEW_KEY"); guard._entered.clear()
+    print("== round 3: R1 replace contract enforced before any change")
+    keychain.write_value("hermes-sg-orphan-key", ACCT, "orphan-value-0123456789", keychain=KC)   # exists, unregistered
+    sys.stdin = _io.StringIO("new-value-0123456789\n")
+    try:
+        intake.intake("SG_ORPHAN_KEY", kc=KC, stdin_test=True, yes=True); got = "replaced"
+    except intake.IntakeError as exc:
+        got = "refused" if "not registered to SG_ORPHAN_KEY" in str(exc) else str(exc)
+    sys.stdin = _stdin
+    check("R1: replacing an existing UNREGISTERED item is refused", got, "refused")
+    check("R1: ...and the item is untouched, no recovery copy made", (keychain.stored_fingerprint("hermes-sg-orphan-key", ACCT, KC)[0], keychain.exists("hermes-sg-orphan-key.sg-staging", ACCT, KC)), (keychain.fingerprint("orphan-value-0123456789"), False))
+    keychain.delete("hermes-sg-orphan-key", ACCT, KC)
+    sys.stdin = _io.StringIO("scope-change-0123456789\n")
+    try:
+        intake.intake("SG_TX_KEY", kc=KC, stdin_test=True, yes=True, scope="default-only"); got = "accepted"
+    except intake.IntakeError as exc:
+        got = "refused" if "to change scope" in str(exc) else str(exc)
+    sys.stdin = _stdin
+    check("R1: changing scope via replace is refused (never silently widened or narrowed)", got, "refused")
+    check("R1: ...registry scope unchanged", registry.load()["secrets"]["SG_TX_KEY"]["scope"], "all")
+    sys.stdin = _io.StringIO("tx-value-E-3333333333\n")
+    intake.intake("SG_TX_KEY", kc=KC, stdin_test=True, yes=True)
+    sys.stdin = _stdin
+    check("R1: successful replace leaves no pending record", "pending" in registry.load()["secrets"]["SG_TX_KEY"], False)
+
+    print("== round 3: R2 remove refuses while a replace is pending")
+    registry.set_pending("SG_TX_KEY", keychain.fingerprint("tx-value-F-4444444444"), 21)
+    keychain.write_value("hermes-sg-tx-key.sg-staging", ACCT, "tx-value-F-4444444444", keychain=KC)
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.secret_command(argparse.Namespace(secret_action="remove", env="SG_TX_KEY", yes=True))
+    check("R2: remove refused, exit 1", (rc, "unfinished replace" in buf.getvalue()), (1, True))
+    check("R2: ...main item, copy and registry all kept", (keychain.exists("hermes-sg-tx-key", ACCT, KC), keychain.exists("hermes-sg-tx-key.sg-staging", ACCT, KC), "SG_TX_KEY" in registry.load()["secrets"]), (True, True, True))
+    r_ = intake.recover("SG_TX_KEY", discard=True)
+    check("R2: recover --discard cancels: copy gone, pending cleared, old key kept", (keychain.exists("hermes-sg-tx-key.sg-staging", ACCT, KC), "pending" in registry.load()["secrets"]["SG_TX_KEY"], keychain.stored_fingerprint("hermes-sg-tx-key", ACCT, KC)[0]), (False, False, keychain.fingerprint("tx-value-E-3333333333")))
+    keychain.write_value("hermes-sg-tx-key.sg-staging", ACCT, "tx-value-G-5555555555", keychain=KC)
+    registry.set_pending("SG_TX_KEY", keychain.fingerprint("tx-value-G-5555555555"), 21)
+    keychain.delete("hermes-sg-tx-key", ACCT, KC)
+    try:
+        intake.recover("SG_TX_KEY", discard=True); got = "discarded"
+    except intake.IntakeError as exc:
+        got = "asked" if "ONLY copy" in str(exc) else str(exc)
+    check("R2: discarding the only remaining copy needs --yes", got, "asked")
+    intake.recover("SG_TX_KEY", yes=True)
+    check("R2: ...and recover restores it instead", keychain.stored_fingerprint("hermes-sg-tx-key", ACCT, KC)[0], keychain.fingerprint("tx-value-G-5555555555"))
+
+    print("== round 3: R3 one bounded mutation lock, state read under it")
+    held = threading.Event(); release = threading.Event()
+    def _holder():
+        with registry.mutation_lock():
+            held.set(); release.wait(5)
+    th = threading.Thread(target=_holder); th.start(); held.wait(5)
+    _lt = registry.LOCK_TIMEOUT; registry.LOCK_TIMEOUT = 0.3
+    import time as _t; t0 = _t.monotonic()
+    sys.stdin = _io.StringIO("busy-value-0123456789\n")
+    try:
+        intake.intake("SG_BUSY_KEY", kc=KC, stdin_test=True); got = "ran"
+    except intake.IntakeError as exc:
+        got = "busy" if "in progress" in str(exc) else str(exc)
+    sys.stdin = _stdin
+    waited = _t.monotonic() - t0
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc_rm = cli.secret_command(argparse.Namespace(secret_action="remove", env="SG_TX_KEY", yes=True))
+    release.set(); th.join(); registry.LOCK_TIMEOUT = _lt
+    check("R3: a held lock gives a clean 'busy', not a hang", (got, waited < 3), ("busy", True))
+    check("R3: remove also waits on the same lock (busy, nothing changed)", (rc_rm, keychain.exists("hermes-sg-tx-key", ACCT, KC)), (1, True))
+    check("R3: nothing written while busy", keychain.exists("hermes-sg-busy-key", ACCT, KC), False)
+    # stale-snapshot guard: state changes between the pre-check and the locked re-check
+    _st = intake._state; calls = {"n": 0}
+    def _flip(*a, **k):
+        calls["n"] += 1
+        st = _st(*a, **k)
+        if calls["n"] == 2:
+            st = dict(st, final=not st["final"])
+        return st
+    intake._state = _flip
+    sys.stdin = _io.StringIO("stale-value-0123456789\n")
+    try:
+        intake.intake("SG_TX_KEY", kc=KC, stdin_test=True, yes=True); got = "wrote"
+    except intake.IntakeError as exc:
+        got = "refused" if "changed while" in str(exc) else str(exc)
+    intake._state = _st; sys.stdin = _stdin
+    check("R3: state changed before the lock -> refused, nothing written", (got, keychain.stored_fingerprint("hermes-sg-tx-key", ACCT, KC)[0]), ("refused", keychain.fingerprint("tx-value-G-5555555555")))
+
+    print("== round 3: R4 unreadable is never 'missing'")
+    _r = keychain._run
+    class _P:
+        returncode = 36; stdout = ""; stderr = ""
+    keychain._run = lambda *a, **k: _P()
+    try:
+        keychain.read_value("hermes-sg-tx-key", ACCT, KC); got = "returned"
+    except keychain.KeychainError:
+        got = "raised"
+    st_v = intake.verify("SG_TX_KEY")["status"]
+    keychain._run = _r
+    check("R4: a non-not-found read error raises, never None", got, "raised")
+    check("R4: verify reports unreadable, not missing", ("couldn't read" in st_v, "missing" in st_v), (True, False))
+    registry.set_pending("SG_TX_KEY", keychain.fingerprint("tx-value-H-6666666666"), 21)
+    keychain.write_value("hermes-sg-tx-key.sg-staging", ACCT, "tx-value-H-6666666666", keychain=KC)
+    keychain.delete("hermes-sg-tx-key", ACCT, KC)
+    check("R4: verify reports the unfinished replace even when the main item is missing", "unfinished replace" in intake.verify("SG_TX_KEY")["status"], True)
+    intake.recover("SG_TX_KEY", yes=True)
 finally:
     subprocess.run(["/usr/bin/security", "delete-keychain", KC], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

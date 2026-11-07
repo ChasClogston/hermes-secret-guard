@@ -20,8 +20,9 @@ Secret Guard closes both ends.
   nesting depth. If the check itself fails, the call is refused.
 - **Exact copies of your keys are scrubbed** from tool results, terminal output and replies before
   the model sees them, including output from commands no filename rule could predict.
-- **A key pasted into chat is stopped before inference.** Hermes's `pre_llm_call` veto ends the
-  turn before any model call and stores a placeholder instead of the message; you're told whether
+- **A key pasted into chat is stopped before inference** whenever Hermes runs plugin
+  `pre_llm_call` hooks (see *Honest limits* for when it doesn't). The veto ends the turn before any
+  model call and stores a placeholder instead of the message; you're told whether
   to rotate the key. If the check itself fails, the turn is blocked too.
 
 Secret Guard is not a sandbox. It narrows the common paths; an agent determined to transform a
@@ -78,8 +79,8 @@ lists every profile and says which ones still need a step.
 | `hermes secret add ENV_VAR [--scope all\|default-only]` | Dialog entry. Prints name, fingerprint, length. |
 | `hermes secret list` | Names, scopes, fingerprints. Never values. |
 | `hermes secret verify ENV_VAR` | Checks the keychain item and the value Hermes resolved, by fingerprint. |
-| `hermes secret remove ENV_VAR --yes` | Deletes the keychain item and registry entry; keeps the entry if the delete fails. |
-| `hermes secret recover ENV_VAR [--yes]` | Finishes an interrupted replace from its recovery copy, without re-entering the key. |
+| `hermes secret remove ENV_VAR --yes` | Deletes the keychain item and registry entry; keeps the entry if the delete fails or a replace is pending. |
+| `hermes secret recover ENV_VAR [--yes] [--discard]` | Finishes (or with `--discard`, cancels) an interrupted replace, without re-entering the key. |
 | `hermes secret import SCRIPT` | Registers keys named in an existing `emit "service" "ENV"` keychain helper. Reads names only; never runs it. |
 | `hermes secret doctor` | Read-only health check of every profile. Exit 1 on problems. |
 
@@ -174,13 +175,24 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   sessions pick it up when they restart.
 - **Hermes skips plugin `pre_llm_call` hooks for sessions with persistence disabled,** so the
   paste block does not run there; the path gate and redaction still do.
-- **An interrupted replace** (a crash or keychain error mid-way) leaves a verified recovery copy
-  named `<service>.sg-staging`. `hermes secret recover ENV_VAR` finishes the replace without
-  re-entering the key; `verify` and `doctor` report it, and a new replace of that key is refused
-  until it is recovered.
+- **Replacing a key is deliberately narrow.** `hermes secret add` replaces only a key already
+  registered to that variable, with the same keychain item, and keeps its scope. It refuses,
+  before changing anything, to overwrite an existing keychain item that isn't registered (register
+  it with `import` first) or to change scope (remove and add it again).
+- **An interrupted replace** (a crash or keychain error mid-way) is recoverable without re-entering
+  the key. Before changing anything, the plugin records the new key's fingerprint as pending; it
+  then writes a verified recovery copy named `<service>.sg-staging`. `hermes secret recover
+  ENV_VAR` finishes the replace (only from a copy that matches the pending record), and
+  `recover --discard` cancels it. While one is pending, `verify` and `doctor` say so (even if the
+  main item is missing), and a new replace or `remove` of that key is refused.
+- **Changes wait at most 30 seconds for each other.** All changes share one lock; if another is
+  in progress you get a "busy" message rather than a hang. The dialog runs before the lock.
+- **Large or deeply nested tool arguments are refused, not skipped.** The gate inspects up to 12
+  levels, 5,000 values and 2 million characters of command, code and path fields per call; a call
+  beyond that is blocked. This can block unusually large legitimate calls.
 - **The end-to-end test checks replies, the session store and logs,** and needs positive evidence
-  for each case (a redaction label or a logged block event). It does not capture the exact payload
-  sent to the model provider.
+  for each case (a redaction label, or a block event for that attempt in the logs). It does not
+  capture the exact payload sent to the model provider; no recording-provider test exists yet.
 - **Keychain items made by other tools** may need an access approval the first time Secret Guard
   reads them; the source never prompts, so such an item is skipped (with a warning) until you
   re-add it through `hermes secret add`.

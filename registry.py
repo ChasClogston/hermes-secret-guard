@@ -14,6 +14,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -76,6 +77,58 @@ def save(data: dict) -> None:
             os.unlink(tmp)
 
 
+LOCK_TIMEOUT = 30.0  # seconds; a held lock becomes a clean "busy" error, never an indefinite wait
+
+
+class RegistryBusy(RuntimeError):
+    pass
+
+
+@contextlib.contextmanager
+def mutation_lock(timeout: Optional[float] = None):
+    """One lock for every logical change (add, replace, recover, remove, import). Taken BEFORE any
+    state is read, so decisions are never made on a stale snapshot. Bounded wait."""
+    d = registry_path().parent
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    fd = os.open(d / ".mutation.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + (LOCK_TIMEOUT if timeout is None else timeout)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RegistryBusy("another Secret Guard change is in progress; try again in a moment")
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def set_pending(env: str, fingerprint: str, length: int) -> None:
+    """Record, BEFORE any keychain change, the replace being attempted: fingerprint and length of the
+    new value (never the value). Recovery promotes only a copy that matches this record."""
+    with _locked():
+        data = load()
+        if env not in data["secrets"]:
+            raise KeyError(env)
+        data["secrets"][env]["pending"] = {"fingerprint": fingerprint, "length": length}
+        save(data)
+
+
+def clear_pending(env: str) -> None:
+    with _locked():
+        data = load()
+        if env in data["secrets"] and "pending" in data["secrets"][env]:
+            del data["secrets"][env]["pending"]
+            save(data)
+
+
 @contextlib.contextmanager
 def _locked():
     """Exclusive lock for a whole read-modify-write, across processes (gateway, CLI, Desktop)."""
@@ -83,24 +136,6 @@ def _locked():
     p.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(p.parent, 0o700)
     fd = os.open(p.parent / ".registry.lock", os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-
-
-@contextlib.contextmanager
-def op_lock(service: str):
-    """Serialises a whole keychain-plus-registry operation on one item (add, replace, recover,
-    remove). A different lock file from _locked(), so upsert() inside it never re-enters a lock."""
-    if not re.match(r"^[A-Za-z0-9._@-]+$", service):
-        raise ValueError("bad service name")
-    d = registry_path().parent
-    d.mkdir(parents=True, exist_ok=True)
-    os.chmod(d, 0o700)
-    fd = os.open(d / f".op-{service}.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield

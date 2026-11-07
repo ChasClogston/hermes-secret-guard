@@ -28,6 +28,7 @@ def register_cli(p: argparse.ArgumentParser) -> None:
     rc = subs.add_parser("recover", help="Finish an interrupted replace from its recovery copy (no re-entry)")
     rc.add_argument("env")
     rc.add_argument("--yes", action="store_true")
+    rc.add_argument("--discard", action="store_true", help="cancel the unfinished replace instead of finishing it")
     im = subs.add_parser("import", help="Register keys named in an existing keychain helper script")
     im.add_argument("script", help="e.g. ~/.hermes/secrets-provider/keychain-secrets-env.sh")
     subs.add_parser("doctor", help="Read-only health check")
@@ -63,30 +64,39 @@ def secret_command(args: argparse.Namespace) -> int:
         print(" ".join(f"{k}={v}" for k, v in res.items()))
         return 0 if res.get("status") == "ok" else 1
     if act == "remove":
-        entry = registry.load()["secrets"].get(args.env)
-        if not entry:
-            print(f"{args.env} is not registered")
+        try:
+            with registry.mutation_lock():
+                entry = registry.load()["secrets"].get(args.env)   # read under the lock
+                if not entry:
+                    print(f"{args.env} is not registered")
+                    return 1
+                svc, acct, kc = entry["service"], entry["account"], entry.get("keychain")
+                if entry.get("pending") or keychain.exists(keychain.staging_name(svc), acct, kc):
+                    print(f"secret-guard: an unfinished replace of {args.env} is pending. Run `hermes secret "
+                          f"recover {args.env}` (or `--discard`) first; nothing was changed.")
+                    return 1
+                if not args.yes:
+                    print(f"This deletes {args.env} ({svc}) from the keychain. Re-run with --yes to confirm.")
+                    return 1
+                outcome = keychain.delete(svc, acct, kc)
+                if outcome == "failed":
+                    print(f"secret-guard: deleting {svc} from the keychain failed or timed out; the outcome is "
+                          "unknown, so the registry entry was kept. Run the command again.")
+                    return 1
+                try:
+                    registry.remove(args.env)
+                except Exception as exc:
+                    print(f"secret-guard: the keychain item is {outcome} but the registry update failed "
+                          f"({type(exc).__name__}). Run `hermes secret remove {args.env} --yes` again.")
+                    return 1
+        except (keychain.KeychainError, registry.RegistryBusy) as exc:
+            print(f"secret-guard: {exc}")
             return 1
-        if not args.yes:
-            print(f"This deletes {args.env} ({entry['service']}) from the keychain. Re-run with --yes to confirm.")
-            return 1
-        with registry.op_lock(entry["service"]):
-            outcome = keychain.delete(entry["service"], entry["account"], entry.get("keychain"))
-            if outcome == "failed":
-                print(f"secret-guard: couldn't delete {entry['service']} from the keychain (locked, denied or "
-                      "timed out). Nothing was changed; the registry entry is kept.")
-                return 1
-            try:
-                registry.remove(args.env)
-            except Exception as exc:
-                print(f"secret-guard: the keychain item is {outcome} but the registry update failed "
-                      f"({type(exc).__name__}). Run `hermes secret remove {args.env} --yes` again.")
-                return 1
         print(f"Removed {args.env}" + (" (the keychain item was already gone)" if outcome == "absent" else ""))
         return 0
     if act == "recover":
         try:
-            res = _intake.recover(args.env, yes=args.yes)
+            res = _intake.recover(args.env, yes=args.yes, discard=args.discard)
         except _intake.IntakeError as exc:
             print(f"secret-guard: {exc}")
             return 1
@@ -97,18 +107,33 @@ def secret_command(args: argparse.Namespace) -> int:
         acct = os.environ.get("USER") or getpass.getuser()
         kc = registry.settings().get("keychain")
         n = 0
-        for service, env in pairs:
-            if service.endswith(keychain.STAGING_SUFFIX):
-                print(f"skip {env}: {service} uses the reserved recovery suffix")
-                continue
-            got = keychain.stored_fingerprint(service, acct, kc)
-            if not got:
-                print(f"skip {env}: {service} not in keychain")
-                continue
-            registry.upsert(env, service=service, account=acct, scope=registry.default_scope(env),
-                            fingerprint=got[0], length=got[1], keychain=kc)
-            print(f"registered {env:30} scope {registry.default_scope(env):13} fp {got[0]}")
-            n += 1
+        try:
+            with registry.mutation_lock():
+                current = registry.load()["secrets"]
+                for service, env in pairs:
+                    if service.endswith(keychain.STAGING_SUFFIX):
+                        print(f"skip {env}: {service} uses the reserved recovery suffix")
+                        continue
+                    if env in current and (current[env].get("pending")
+                                           or keychain.exists(keychain.staging_name(current[env]["service"]),
+                                                              current[env]["account"], current[env].get("keychain"))):
+                        print(f"skip {env}: an unfinished replace is pending (run `hermes secret recover {env}`)")
+                        continue
+                    try:
+                        got = keychain.stored_fingerprint(service, acct, kc)
+                    except keychain.KeychainError as exc:
+                        print(f"skip {env}: {exc}")
+                        continue
+                    if not got:
+                        print(f"skip {env}: {service} not in keychain")
+                        continue
+                    registry.upsert(env, service=service, account=acct, scope=registry.default_scope(env),
+                                    fingerprint=got[0], length=got[1], keychain=kc)
+                    print(f"registered {env:30} scope {registry.default_scope(env):13} fp {got[0]}")
+                    n += 1
+        except registry.RegistryBusy as exc:
+            print(f"secret-guard: {exc}")
+            return 1
         print(f"{n} imported. Run `hermes secret doctor` to see which profiles still get them from "
               "the old helper; turn that helper off once every profile resolves them from Secret Guard.")
         return 0
