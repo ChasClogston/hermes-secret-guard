@@ -228,7 +228,9 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   `redact_registered_vault_values` (to confirm a just-entered key is covered), module functions rather
   than a documented plugin API (`hermes plugins validate` warns on both). If an update removes them,
   the plugin's own `transform_*` hooks still scrub tool results, terminal output and replies, and
-  `doctor` reports the change.
+  `doctor` reports the change. `hermes secret doctor` also reads each profile's `config.yaml` with
+  Hermes's bundled `hermes_yaml.safe_load` (flagged by the same check), because Hermes does not ship
+  PyYAML.
 
 ## Tests
 
