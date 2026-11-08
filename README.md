@@ -162,6 +162,11 @@ What Secret Guard does on your machine, so you can decide before installing:
   holds names, scopes and SHA-256 fingerprints, never values. While a replace is in progress it
   also holds the new key's fingerprint as a pending record, and the keychain holds a recovery copy
   named `<service>.sg-staging`; both are removed when the replace completes or is cancelled.
+- **Keychain access.** Items are created with `-T /usr/bin/security`, so Hermes's secret source can
+  read them at startup without a prompt. The trade-off: any process running as your user can also
+  read them with `security find-generic-password -w`, without a prompt, which is the same exposure as
+  a keychain `secrets.command` helper. A per-read keychain prompt would close that, but would hang
+  cron and gateway runs.
 - **Credential reads.** As a Hermes secret source, the plugin reads the keychain items you
   registered (entered through Secret Guard, or existing items you named with `import`) at startup and hands them to Hermes, which applies them per profile. Inside the agent,
   redaction gets values only through Hermes's `get_secret()`. The `hermes secret` CLI reads the

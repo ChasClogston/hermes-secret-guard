@@ -19,9 +19,9 @@ def _profiles(root: Path) -> list[tuple[str, Path]]:
 
 
 def _load_cfg(home: Path) -> dict:
-    import yaml
+    from hermes_yaml import safe_load  # Hermes's bundled loader; PyYAML is not a Hermes dependency
     try:
-        return yaml.safe_load((home / "config.yaml").read_text()) or {}
+        return safe_load((home / "config.yaml").read_text()) or {}
     except Exception:
         return {}
 
