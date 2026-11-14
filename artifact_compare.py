@@ -18,14 +18,20 @@ THIS TOOL HANDLES LIVE CREDENTIALS
       tool checks that the file is a regular file, not a link, owned by root and not writable by
       group or others, and that every folder above it is owned by root and not writable by group
       or others. It checks the file again after the run and discards the result if the file's
-      identity, size or modification time changed. This closes replacement by any user who is not
-      root. It is two looks at a path, not a lock: it does not bind the run to the file that was
-      checked, and a change made and undone between the looks is not seen.
+      identity, size or modification time changed. This relies on the system's files being
+      trustworthy. It looks at owner and permission bits only, not at access-control lists, and
+      it is two looks at a path, not a lock: it does not bind the run to the file that was
+      checked, a change made and undone between the looks is not seen, and nothing here guards
+      against root or against another program running as you.
     - Output from the program is read a piece at a time with a hard limit of 8,192 bytes and a
-      10 second limit per item. Past either, the program and anything it started are stopped and
-      reaped, and nothing is read from the home. Its error output is discarded unread.
-    - The program gets a small fixed environment (PATH, HOME, USER, LANG), no input, and "/" as
-      its working folder.
+      10 second limit per item. Past either, the program's process group is killed, the program
+      itself is reaped and its pipe closed, and nothing is read from the home. Something the
+      program started that left its process group would not be stopped. Error output is
+      discarded unread.
+    - The program gets a small fixed environment: PATH; HOME and USER taken from the account
+      record of the user running the tool, not from the environment; LANG. No input, and "/" as
+      its working folder. No keychain file is named, so the program searches its default list of
+      keychains. An item name and account identify the query, not one unique item.
     - Core dumps are turned off for this process and its children before any value is fetched. If
       that cannot be confirmed, the tool stops.
     - Values are never printed, logged, written to a file, put in an error message or sent
@@ -45,10 +51,14 @@ WHAT THE VALUES ARE, AND ARE NOT
   rotated is not compared. The output therefore says "supplied value", never "current secret".
 
 WHAT IT PRINTS (contract "artifact-compare-v2")
-  The only names printed are the item names you typed on the command line. Each must be letters,
-  digits, dot, underscore or hyphen, at most 64 characters, and must not be typed twice. If a name
-  you typed contains a fetched value, or a fetched value contains a name, the tool stops before
-  reading the home.
+  The only names ever printed are item names you typed on the command line, and they are printed
+  only when the whole run was allowed to proceed. Item names must not be secret: the tool treats
+  what you type as safe to show. Each must be letters, digits, dot, underscore or hyphen, at most
+  64 characters, and must not be typed twice. If a name you typed contains anything that was
+  fetched, or something fetched contains a name, the tool stops before reading the home.
+  Whenever the tool stops early, for that or any other reason, it prints no name at all: items
+  are then referred to by their position on the command line (item 1, item 2), and a command
+  line it cannot parse gets one fixed message.
   Part 1, by item. For each value: how many times those exact bytes occur in each of the two
   files. Items that return the same value are one line. Occurrences may overlap.
   Part 2, by match. The provider-key-shaped matches of the artifact scope ("artifact-bytes-v2",
@@ -64,8 +74,16 @@ WHAT IT PRINTS (contract "artifact-compare-v2")
 
 ALL OR NOTHING
   Every item you name must be fetched and must be 16 to 4,096 bytes long. If one is missing,
-  unreadable, shorter or longer, the tool says which, by the name you typed, and reads nothing
-  from the home. "Finished" therefore means: every named item was compared against both files in
+  unreadable, shorter or longer, the tool says which, by its position, and reads nothing from
+  the home.
+
+VALUES THAT CANNOT BE COMPARED
+  When a stored value contains a non-printing byte, the system program prints it as hexadecimal
+  digits instead, with nothing to say it has done so. The tool cannot tell that apart from a
+  value that really is hexadecimal text. So any item whose output is an even number of
+  hexadecimal digits and nothing else is refused as value_format_ambiguous, and nothing is read
+  from the home. This also refuses genuine keys made only of hexadecimal digits; they cannot be
+  checked with this tool. The tool never decodes hexadecimal on its own. "Finished" therefore means: every named item was compared against both files in
   full. It does not mean every credential of the home was compared.
 
 WHAT THE OUTPUT DISCLOSES, AND WHAT IT DOES NOT SHOW
@@ -121,9 +139,10 @@ LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MATCH_CLASSES = ("equals_a_supplied_value", "contains_a_supplied_value", "inside_a_supplied_value", "no_supplied_value")
 STATUS = hs.ARTIFACT_STATUS
 ITEM_STATUS = ("fetched", "not_fetched", "item_unavailable", "fetch_timed_out", "fetch_output_too_large", "fetch_failed",
-               "value_too_short", "value_too_long")
+               "value_too_short", "value_too_long", "value_format_ambiguous")
+_HEX = frozenset(b"0123456789abcdefABCDEF")
 SETUP_LABELS = ("no_item_named", "too_many_items", "item_name_not_allowed", "item_named_twice", "account_name_not_allowed",
-                "core_dump_limit_not_set", "tool_path_not_absolute", "tool_unavailable", "tool_is_a_link", "tool_not_a_regular_file",
+                "user_record_unavailable", "core_dump_limit_not_set", "tool_path_not_absolute", "tool_unavailable", "tool_is_a_link", "tool_not_a_regular_file",
                 "tool_owner_not_allowed", "tool_writable_by_others", "tool_folder_owner_not_allowed", "tool_folder_writable_by_others",
                 "tool_changed_during_run", "an_item_could_not_be_used", "a_name_and_a_value_overlap")
 RUN_LABELS = SETUP_LABELS + ("refused_sqlite_loaded_in_process", "home_unavailable", "home_path_changed_during_run", "database_absent",
@@ -201,7 +220,9 @@ def _stop_child(proc) -> None:
 def fetch_one(argv, env):
     """Run one fetch and return (value or None, item status). Output is read a piece at a time: past
     FETCH_MAX_OUTPUT bytes or FETCH_TIMEOUT_S seconds the program is stopped at once and nothing it printed
-    is kept. KeyboardInterrupt is passed on after the same clean-up."""
+    is kept. For a value that is too short, too long or ambiguous the bytes are still returned with that
+    status, so the caller can check them against the typed names before dropping them.
+    KeyboardInterrupt is passed on after the same clean-up."""
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 close_fds=True, start_new_session=True, cwd="/", env=env, bufsize=0)
@@ -247,49 +268,62 @@ def fetch_one(argv, env):
     if value.endswith(b"\n"):
         value = value[:-1]
     if len(value) < MIN_VALUE_BYTES:
-        return None, "value_too_short"
+        return value, "value_too_short"
     if len(value) > MAX_VALUE_BYTES:
-        return None, "value_too_long"
+        return value, "value_too_long"
+    if len(value) % 2 == 0 and all(b in _HEX for b in value):
+        return value, "value_format_ambiguous"       # may be the program's hexadecimal rendering of other bytes
     return value, "fetched"
 
 
 def fetch_items(labels, account):
-    """Fetch every named item. Returns (values, items, label): `values` maps a value to the list of names
-    that returned it; `items` maps each name to its status; `label` is a fixed reason nothing may be read,
-    or None. All or nothing: any item that cannot be used leaves `values` empty."""
-    items = {name: "not_fetched" for name in labels}
+    """Fetch every named item. Returns (values, statuses, label): `values` maps a value to the list of names
+    that returned it; `statuses` is the list of item statuses in command-line order; `label` is a fixed
+    reason nothing may be read, or None. No name is ever returned except inside `values`, and `values` is
+    empty unless every item is usable and no name overlaps anything fetched."""
     if not labels:
-        return {}, items, "no_item_named"
+        return {}, [], "no_item_named"
+    if any(not isinstance(name, str) or not LABEL_RE.match(name) for name in labels):
+        return {}, [], "item_name_not_allowed"
     if len(labels) > MAX_ITEMS:
-        return {}, items, "too_many_items"
-    if any(not LABEL_RE.match(name) for name in labels):
-        return {}, {}, "item_name_not_allowed"            # a name that is not allowed is not echoed either
+        return {}, [], "too_many_items"
     if len(set(labels)) != len(labels):
-        return {}, items, "item_named_twice"
-    if not LABEL_RE.match(account):
-        return {}, items, "account_name_not_allowed"
+        return {}, [], "item_named_twice"
+    if not isinstance(account, str) or not LABEL_RE.match(account):
+        return {}, [], "account_name_not_allowed"
+    statuses = ["not_fetched"] * len(labels)
+    try:
+        import pwd
+        record = pwd.getpwuid(os.geteuid())
+        env = {"PATH": "/usr/bin:/bin", "HOME": record.pw_dir, "USER": record.pw_name, "LANG": "C"}
+    except Exception:
+        return {}, statuses, "user_record_unavailable"
     if not disable_core_dumps():
-        return {}, items, "core_dump_limit_not_set"
-    env = {"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME", "/"), "USER": account, "LANG": "C"}
+        return {}, statuses, "core_dump_limit_not_set"
+    fetched = []                                          # every byte string that came back, usable or not
     values = {}
-    for name in labels:
+    for i, name in enumerate(labels):
         before, label = check_tool(SECURITY_BIN, TOOL_OWNER_UID)
         if label:
-            return {}, items, label
+            return {}, statuses, label
         value, status = fetch_one([SECURITY_BIN, "find-generic-password", "-w", "-s", name, "-a", account], env)
         after, label = check_tool(SECURITY_BIN, TOOL_OWNER_UID)
         if label or after != before:
-            return {}, items, label or "tool_changed_during_run"
-        items[name] = status
+            return {}, ["not_fetched"] * len(labels), label or "tool_changed_during_run"
+        statuses[i] = status
         if value is not None:
-            values.setdefault(value, []).append(name)
-    if any(status != "fetched" for status in items.values()):
-        return {}, items, "an_item_could_not_be_used"
-    for value in values:
+            fetched.append(value)
+            if status == "fetched":
+                values.setdefault(value, []).append(name)
+    # Before anything else is decided: a typed name must not carry, or be carried by, anything that came back,
+    # including bytes that are about to be dropped as too short, too long or ambiguous.
+    for value in fetched:
         for name in labels:
-            if name.encode() in value or value in name.encode():
-                return {}, items, "a_name_and_a_value_overlap"
-    return values, items, None
+            if value and (name.encode() in value or value in name.encode()):
+                return {}, ["not_fetched"] * len(labels), "a_name_and_a_value_overlap"
+    if any(status != "fetched" for status in statuses):
+        return {}, statuses, "an_item_could_not_be_used"
+    return values, statuses, None
 
 
 def _new_file() -> dict:
@@ -298,7 +332,7 @@ def _new_file() -> dict:
 
 def _new_result() -> dict:
     return {"contract": CONTRACT, "scans_contract": hs.ARTIFACT_CONTRACT, "files": {n: _new_file() for n in hs.ARTIFACTS},
-            "items": {}, "values_compared": 0, "supplied": [],
+            "items": [], "values_compared": 0, "supplied": [],
             "matches": {c: {"distinct": 0, "names": []} for c in MATCH_CLASSES},
             "distinct_counts_are_lower_bounds": False, "run": [], "finished": False}
 
@@ -488,8 +522,8 @@ def render(res: dict) -> str:
            "  NOT a read of the conversations. No value, no byte of either file, no offset and no digest is printed.",
            "  Values are what this Mac's Keychain returned now for the names you typed. Nothing ties them to this home or to what Hermes uses.",
            "  A count above zero says those bytes are in this home's database. Treat this output as sensitive."]
-    for name in sorted(res["items"]):
-        out.append("item [%s]: %s" % (name, res["items"][name]))
+    for i, status in enumerate(res["items"], 1):
+        out.append("item %d: %s" % (i, status))
     for name in hs.ARTIFACTS:
         f = res["files"][name]
         out.append("%s: status %s, %d of %d byte(s) read, traversal finished %s, change observed %s"
@@ -510,7 +544,8 @@ def render(res: dict) -> str:
     out.append("Comparison " + ("finished: every named item was compared against both files in full."
                                 if res["finished"] else "NOT FINISHED: this is a partial or inconclusive result."))
     if "an_item_could_not_be_used" in res["run"]:
-        out.append("At least one named item could not be fetched or was outside 16 to 4,096 bytes. Nothing was read from the home.")
+        out.append("At least one item could not be fetched, was outside 16 to 4,096 bytes, or came back in an ambiguous form.")
+        out.append("Items are numbered in the order you typed them. Nothing was read from the home.")
     if "home_path_changed_during_run" in res["run"]:
         out.append("The path you named no longer points at the folder that was read. The counts describe the folder opened at the start.")
     out.append("Zero does not show a credential was never in the database: only that these exact bytes were not found in one run.")
@@ -518,8 +553,17 @@ def render(res: dict) -> str:
     return "\n".join(out)
 
 
+class _QuietParser(argparse.ArgumentParser):
+    """A command line that cannot be parsed gets one fixed message. Nothing that was typed is repeated."""
+
+    def error(self, message):
+        sys.stderr.write("artifact_compare: the command line was not understood; nothing was run. See --help.\n")
+        raise SystemExit(2)
+
+
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="artifact_compare", description="Names-and-counts comparison of database artifacts with Keychain items you name.")
+    ap = _QuietParser(prog="artifact_compare", allow_abbrev=False,
+                      description="Names-and-counts comparison of database artifacts with Keychain items you name.")
     ap.add_argument("--home", required=True, help="the one Hermes home whose two files are read (no default)")
     ap.add_argument("--keychain-service", action="append", default=[], metavar="NAME",
                     help="a Keychain item (service name) to fetch and compare; repeat for up to 8 (no default)")
@@ -551,13 +595,13 @@ def main(argv=None) -> int:
                     account = pwd.getpwuid(os.geteuid()).pw_name
                 except Exception:
                     account = ""
-            values, items, label = fetch_items(list(args.keychain_service), account)
+            values, statuses, label = fetch_items(list(args.keychain_service), account)
             if label:
                 values = {}
-                res = _new_result(); res["items"] = items; res["run"].append(label)
+                res = _new_result(); res["items"] = statuses; res["run"].append(label)
             else:
                 res = compare(pinned, values)
-                res["items"] = items
+                res["items"] = statuses
                 if hs._home_moved(args.home, pinned):
                     res["run"].append("home_path_changed_during_run"); res["finished"] = False
         print(json.dumps(res, indent=2, sort_keys=True) if args.json else render(res))

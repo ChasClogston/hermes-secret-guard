@@ -7,6 +7,7 @@ never run: the tests point the tool at a throwaway script that prints made-up va
 No keychain and no real credential is touched. Nothing here imports sqlite3.
 """
 import hashlib
+import pwd
 import json
 import os
 import re
@@ -172,6 +173,7 @@ class ToolTrust(unittest.TestCase):
 
 class Fetch(Home):
     ENV = {"PATH": "/usr/bin:/bin", "HOME": "/", "USER": "u", "LANG": "C"}
+    G = "g" * 16                                                                       # not hexadecimal
 
     def one(self, lines, name="t.sh"):
         before = fds()
@@ -186,17 +188,34 @@ class Fetch(Home):
         self.assertEqual(self.one(["printf '%s' " + shlex.quote(K1)]), (K1.encode(), "fetched"))
         self.assertEqual(self.one(["printf '%s\\n\\n' " + shlex.quote(K1)]), ((K1 + "\n").encode(), "fetched"))      # only one newline is taken off
         self.assertEqual(self.one(["echo %s%s >&2" % (CANARY, K1), "printf '%s\\n' " + shlex.quote(K1), "exit 44"]), (None, "item_unavailable"))
-        self.assertEqual(self.one(["printf '%s\\n' short"]), (None, "value_too_short"))
-        self.assertEqual(self.one(["printf '%s\\n' " + "a" * 15]), (None, "value_too_short"))
-        self.assertEqual(self.one(["printf '%s\\n' " + "a" * 16])[1], "fetched")
-        self.assertEqual(self.one(["printf '%s\\n' " + "a" * 4096])[1], "fetched")
-        self.assertEqual(self.one(["printf '%s\\n' " + "a" * 4097]), (None, "value_too_long"))
+        self.assertEqual(self.one(["printf '%s\\n' short"]), (b"short", "value_too_short"))     # bytes come back so names can be checked against them
+        self.assertEqual(self.one(["printf '%s\\n' " + "g" * 15])[1], "value_too_short")
+        self.assertEqual(self.one(["printf '%s\\n' " + "g" * 16])[1], "fetched")
+        self.assertEqual(self.one(["printf '%s\\n' " + "g" * 4096])[1], "fetched")
+        self.assertEqual(self.one(["printf '%s\\n' " + "g" * 4097])[1], "value_too_long")
         self.assertEqual(ac.fetch_one([os.path.join(self.base, "missing")], self.ENV), (None, "fetch_failed"))
 
+    def test_output_that_may_be_a_hexadecimal_rendering_is_refused(self):
+        """R2. The system program prints a value with a non-printing byte as hexadecimal digits, unmarked.
+        An even run of hexadecimal digits is therefore refused, never decoded, and never compared."""
+        secret = b"\x00made-up\xffbinary value 01"                                    # what would be stored
+        for shown, status in ((secret.hex(), "value_format_ambiguous"),               # the program's rendering of it
+                              ("0123456789abcdef0123", "value_format_ambiguous"),     # a genuine printable hexadecimal key: also refused
+                              ("0123456789ABCDEF0123", "value_format_ambiguous"),
+                              ("deadbeef" * 8, "value_format_ambiguous"),
+                              ("0123456789abcdef012", "fetched"),                     # odd length cannot be that rendering
+                              ("0123456789abcdefg0", "fetched"),                      # one character that is not hexadecimal
+                              ("sk-0123456789abcdef0123", "fetched")):
+            self.assertEqual(self.one(["printf '%s\\n' " + shown]), (shown.encode(), status), shown)
+        self.item("bin-item", secret.hex()); self.item("plain-item", K1)
+        self.put(db=b"x " + secret + b" y " + secret.hex().encode() + b" z")
+        for names in (["bin-item"], ["plain-item", "bin-item"]):
+            values, statuses, label = ac.fetch_items(names, "me")
+            self.assertEqual((values, label, statuses[-1]), ({}, "an_item_could_not_be_used", "value_format_ambiguous"))
     def test_the_output_limit_is_enforced_while_reading(self):
         """C2. The program is stopped as soon as one byte past the limit arrives, while it is still running."""
-        fill = "head -c %d /dev/zero | tr '\\\\0' a"
-        self.assertEqual(self.one([fill % 8192]), (None, "value_too_long"))             # exactly at the limit: read whole, then judged by length
+        fill = "head -c %d /dev/zero | tr '\\000' g"
+        self.assertEqual(self.one([fill % 8192]), (b"g" * 8192, "value_too_long"))      # exactly at the limit: read whole, then judged by length
         for lines, label in (([fill % 8193, "sleep 30"], "cap+1 then still running"), ([fill % 100000], "finite oversize"),
                              (["while :; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; done"], "never stops")):
             t0 = time.monotonic()
@@ -221,14 +240,14 @@ class Fetch(Home):
         with mock.patch.object(ac, "FETCH_TIMEOUT_S", 0.6):
             t0 = time.monotonic()
             self.assertEqual(self.one(["printf '%s\\n' " + shlex.quote(K1), "sleep 30"]), (None, "fetch_timed_out"))
-            pidfile = os.path.join(self.base, "pid")
-            # the program exits at once but leaves a child holding the pipe open
-            self.assertEqual(self.one(["sleep 30 & echo $! > %s" % shlex.quote(pidfile), "printf '%s\\n' " + shlex.quote(K1)], name="h.sh"),
-                             (None, "fetch_timed_out"))
+            beat = os.path.join(self.base, "beat")
+            # the program exits at once but leaves a child that holds the pipe open and keeps writing a heartbeat
+            self.assertEqual(self.one(["( while :; do date +%%s%%N > %s; sleep 0.05; done ) &" % shlex.quote(beat),
+                                       "sleep 0.2", "printf '%s\\n' " + shlex.quote(K1)], name="h.sh"), (None, "fetch_timed_out"))
             self.assertLess(time.monotonic() - t0, 8)
-        time.sleep(0.2)
-        state = subprocess.run(["ps", "-o", "stat=", "-p", text_of(pidfile).strip()], capture_output=True, text=True).stdout.strip()
-        self.assertTrue(state == "" or state.startswith("Z"), state)                   # the child it started was stopped too
+        self.assertTrue(os.path.exists(beat))                                          # it did run
+        time.sleep(0.3); first = text_of(beat); time.sleep(0.5)
+        self.assertEqual(text_of(beat), first)                                         # and it was stopped with the program
         real, n = select.select, {"n": 0}
 
         def selecting(*a):
@@ -250,47 +269,53 @@ class Fetch(Home):
         def popen(argv, **kw):
             seen.append((list(argv), kw.get("shell", False), kw.get("stdin"), kw.get("stderr"), kw.get("cwd"), dict(kw.get("env") or {})))
             return real(argv, **kw)
-        with mock.patch.object(subprocess, "Popen", popen), mock.patch.dict(os.environ, {"SECRET_IN_ENV": CANARY, "HOME": "/somewhere"}):
-            values, items, label = ac.fetch_items(["openai-item"], "someone")
-        self.assertEqual((values, items, label), ({K1.encode(): ["openai-item"]}, {"openai-item": "fetched"}, None))
+        me = pwd.getpwuid(os.geteuid())
+        with mock.patch.object(subprocess, "Popen", popen), mock.patch.dict(os.environ, {"SECRET_IN_ENV": CANARY, "HOME": "/somewhere", "USER": "other"}):
+            values, statuses, label = ac.fetch_items(["openai-item"], "someone")
+        self.assertEqual((values, statuses, label), ({K1.encode(): ["openai-item"]}, ["fetched"], None))
         self.assertEqual(seen, [([self.tool, "find-generic-password", "-w", "-s", "openai-item", "-a", "someone"], False, subprocess.DEVNULL,
-                                 subprocess.DEVNULL, "/", {"PATH": "/usr/bin:/bin", "HOME": "/somewhere", "USER": "someone", "LANG": "C"})])
-
+                                 subprocess.DEVNULL, "/", {"PATH": "/usr/bin:/bin", "HOME": me.pw_dir, "USER": me.pw_name, "LANG": "C"})])   # from the account record, not the environment
+        with mock.patch.object(pwd, "getpwuid", side_effect=KeyError("no record")):
+            self.assertEqual(ac.fetch_items(["openai-item"], "someone"), ({}, ["not_fetched"], "user_record_unavailable"))
 
 class Items(Home):
     def test_names_must_be_plain_and_unique(self):
         self.item("openai-item", K1)
-        self.assertEqual(ac.fetch_items([], "me"), ({}, {}, "no_item_named"))
-        self.assertEqual(ac.fetch_items(["i%d" % i for i in range(9)], "me")[2], "too_many_items")
-        for bad in ("-w", "has space", "a/b", "../x", "", "x" * 65, "né", "a;b", "$(id)"):
-            self.assertEqual(ac.fetch_items(["openai-item", bad], "me"), ({}, {}, "item_name_not_allowed"), bad)       # and not echoed back
-        self.assertEqual(ac.fetch_items(["openai-item", "openai-item"], "me")[2], "item_named_twice")                  # C3
+        self.assertEqual(ac.fetch_items([], "me"), ({}, [], "no_item_named"))
+        self.assertEqual(ac.fetch_items(["i%d" % i for i in range(9)], "me"), ({}, [], "too_many_items"))
+        for bad in ("-w", "has space", "a/b", "../x", "", "x" * 65, "n\u00e9", "a;b", "$(id)"):
+            self.assertEqual(ac.fetch_items(["openai-item", bad], "me"), ({}, [], "item_name_not_allowed"), bad)
+            self.assertEqual(ac.fetch_items(["i%d" % i for i in range(8)] + [bad], "me"), ({}, [], "item_name_not_allowed"), bad)   # checked before the count
+        self.assertEqual(ac.fetch_items(["openai-item", "openai-item"], "me"), ({}, [], "item_named_twice"))               # C3
         for bad in ("", "-a", "two words"):
-            self.assertEqual(ac.fetch_items(["openai-item"], bad)[2], "account_name_not_allowed", bad)
+            self.assertEqual(ac.fetch_items(["openai-item"], bad), ({}, [], "account_name_not_allowed"), bad)
         with mock.patch.object(ac, "disable_core_dumps", lambda: False):
-            self.assertEqual(ac.fetch_items(["openai-item"], "me")[2], "core_dump_limit_not_set")
-        self.assertFalse(self.ran())                                                                                   # nothing was run for any of these
-
+            self.assertEqual(ac.fetch_items(["openai-item"], "me"), ({}, ["not_fetched"], "core_dump_limit_not_set"))
+        self.assertFalse(self.ran())                                                                                       # nothing was run for any of these
     def test_all_or_nothing(self):
-        self.item("openai-item", K1); self.item("short-item", "abc"); self.item("long-item", "L" * 5000)
-        for names, status in ((["openai-item", "absent-item"], {"openai-item": "fetched", "absent-item": "item_unavailable"}),
-                              (["short-item", "openai-item"], {"short-item": "value_too_short", "openai-item": "fetched"}),
-                              (["long-item"], {"long-item": "value_too_long"})):
-            self.assertEqual(ac.fetch_items(names, "me"), ({}, status, "an_item_could_not_be_used"))
+        self.item("openai-item", K1); self.item("short-item", "xyz"); self.item("long-item", "L" * 5000)
+        for names, statuses in ((["openai-item", "absent-item"], ["fetched", "item_unavailable"]),
+                                (["short-item", "openai-item"], ["value_too_short", "fetched"]),
+                                (["long-item"], ["value_too_long"])):
+            self.assertEqual(ac.fetch_items(names, "me"), ({}, statuses, "an_item_could_not_be_used"))    # by position, never by name
         self.item("voice-item", K1); self.item("other-item", K2)
-        values, items, label = ac.fetch_items(["openai-item", "other-item", "voice-item"], "me")
-        self.assertEqual((values, label), ({K1.encode(): ["openai-item", "voice-item"], K2.encode(): ["other-item"]}, None))   # same value, two names
-
+        values, statuses, label = ac.fetch_items(["openai-item", "other-item", "voice-item"], "me")
+        self.assertEqual((values, statuses, label), ({K1.encode(): ["openai-item", "voice-item"], K2.encode(): ["other-item"]}, ["fetched"] * 3, None))
     def test_a_typed_name_and_a_fetched_value_must_not_overlap(self):
-        """C1. The only names ever printed are the ones typed. If a typed name carries a value, or a value carries
-        a typed name, the run stops before anything is read."""
-        self.item("a" * 20, "a" * 16)                                                  # the value lies inside the name
-        self.assertEqual(ac.fetch_items(["a" * 20], "me")[::2], ({}, "a_name_and_a_value_overlap"))
+        """R1 / C1. If a typed name carries anything that was fetched, or the reverse, the run stops, and what
+        comes back names nothing: no name, and every item reset to not_fetched."""
+        gone = ({}, "a_name_and_a_value_overlap")
+        self.item("g" * 20, "g" * 16)                                                  # the value lies inside the name
+        self.assertEqual(ac.fetch_items(["g" * 20], "me"), ({}, ["not_fetched"], "a_name_and_a_value_overlap"))
         self.item("openai-item", "prefix-openai-item-suffix-0123456789")               # the name lies inside the value
-        self.assertEqual(ac.fetch_items(["openai-item"], "me")[::2], ({}, "a_name_and_a_value_overlap"))
+        self.assertEqual(ac.fetch_items(["openai-item"], "me")[::2], gone)
         self.item("first-item", K1); self.item("second-item", "zz-first-item-zz-0123456789")   # another item's name inside a value
-        self.assertEqual(ac.fetch_items(["first-item", "second-item"], "me")[::2], ({}, "a_name_and_a_value_overlap"))
-
+        self.assertEqual(ac.fetch_items(["first-item", "second-item"], "me"), ({}, ["not_fetched"] * 2, "a_name_and_a_value_overlap"))
+        self.item("xyz", "xyz")                                                        # a value too short to compare is still checked against names
+        self.assertEqual(ac.fetch_items(["xyz"], "me"), ({}, ["not_fetched"], "a_name_and_a_value_overlap"))
+        self.item("0123456789abcdef", "0123456789abcdef")                              # and so is one refused as ambiguous
+        self.assertEqual(ac.fetch_items(["0123456789abcdef"], "me"), ({}, ["not_fetched"], "a_name_and_a_value_overlap"))
+        self.assertEqual(ac.fetch_items(["first-item", "absent-item", "xyz"], "me"), ({}, ["not_fetched"] * 3, "a_name_and_a_value_overlap"))   # one failed item does not hide another's overlap
     def test_the_program_is_looked_at_before_and_after_every_run(self):
         """C4. Two looks at the path, and the result is discarded if the file changed in between."""
         self.item("openai-item", K1)
@@ -303,7 +328,7 @@ class Items(Home):
             os.chmod(self.tool + ".new", 0o700); os.replace(self.tool + ".new", self.tool)
             return out
         with mock.patch.object(ac, "fetch_one", swapping):
-            self.assertEqual(ac.fetch_items(["openai-item"], "me"), ({}, {"openai-item": "not_fetched"}, "tool_changed_during_run"))
+            self.assertEqual(ac.fetch_items(["openai-item"], "me"), ({}, ["not_fetched"], "tool_changed_during_run"))
         os.chmod(self.tool, 0o770)
         self.assertEqual(ac.fetch_items(["openai-item"], "me")[2], "tool_writable_by_others")
         os.chmod(self.tool, 0o700); os.chmod(os.path.dirname(self.tool), 0o777)
@@ -387,7 +412,7 @@ class Compare(Home):
             data = fh.read()
         self.put(db=CANARY.encode() + data + CANARY.encode())
         res = self.run_compare(vals)
-        res["items"] = {n: "fetched" for names in vals.values() for n in names}
+        res["items"] = ["fetched"] * 4
         allowed = set(re.findall(r"[A-Za-z_]+", ac.render(ac._new_result()) + json.dumps(ac._new_result())
                                  + " ".join(ac.MATCH_CLASSES + ac.STATUS + ac.RUN_LABELS + ac.ITEM_STATUS)
                                  + " FOUND found not names occurrences distinct at least true false yes no item openai voice other github"
@@ -527,7 +552,7 @@ class Invocation(Home):
         args = ["--home", self.home, "--keychain-account", "me"] + [x for n in ("openai-item", "voice-item", "other-item", "github-item") for x in ("--keychain-service", n)]
         code, out, err = self.cli(*args)
         self.assertEqual((code, err), (0, ""))
-        self.assertIn("item [openai-item]: fetched", out)
+        self.assertIn("item 1: fetched", out); self.assertIn("item 4: fetched", out)
         self.assertIn("FOUND      [openai-item, voice-item]  state.db 2  state.db-wal 0", out)
         self.assertIn("FOUND      [other-item]  state.db 1  state.db-wal 2", out)
         self.assertIn("not found  [github-item]  state.db 0  state.db-wal 0", out)
@@ -558,14 +583,46 @@ class Invocation(Home):
         self.standard(); self.item("openai-item", K1)
         code, out, err = self.cli("--home", self.home, "--keychain-account", "me", "--keychain-service", "openai-item", "--keychain-service", "absent-item")
         self.assertEqual((code, err), (1, ""))
-        self.assertIn("item [absent-item]: item_unavailable", out); self.assertIn("item [openai-item]: fetched", out)
+        self.assertIn("item 1: fetched", out); self.assertIn("item 2: item_unavailable", out)
         self.assertIn("run notes: an_item_could_not_be_used", out); self.assertIn("Nothing was read from the home.", out)
         self.assertIn("state.db: status not_reached, 0 of 0 byte(s) read", out)
-        self.assertNotIn(CANARY, out); self.assertNotIn(K1, out)
-        code, out, err = self.cli("--home", self.home, "--keychain-account", "me", "--keychain-service", "openai-item", "--keychain-service", "EVIL$(id)")
-        self.assertEqual(code, 1); self.assertIn("run notes: item_name_not_allowed", out)
-        self.assertNotIn("EVIL", out); self.assertNotIn("openai-item", out)                 # a refused command line echoes no name at all
+        for text in (CANARY, K1, "openai-item", "absent-item"):                             # a run that stops early prints no name
+            self.assertNotIn(text, out)
 
+    def test_no_refusal_ever_repeats_what_was_typed_or_fetched(self):
+        """R1. Every way of stopping early, as text and as JSON, on both output streams. A made-up value is used
+        as a name, alone and beside other items, and its whole, its start and its end must appear nowhere."""
+        self.standard()
+        secret = "Zx9Qw8Er7Ty6Ui5Op4As3Df2Gh"                                               # 26 characters, allowed as a name
+        self.item(secret, secret); self.item("openai-item", K1); self.item("xyz", "xyz")
+        nine = [x for i in range(8) for x in ("--keychain-service", "i%d" % i)]
+        cases = [
+            (["--keychain-service", secret], "a_name_and_a_value_overlap"),
+            (["--keychain-service", "openai-item", "--keychain-service", secret], "a_name_and_a_value_overlap"),
+            (["--keychain-service", secret, "--keychain-service", "absent-item"], "a_name_and_a_value_overlap"),
+            (["--keychain-service", "xyz"], "a_name_and_a_value_overlap"),
+            (nine + ["--keychain-service", secret + "!bad"], "item_name_not_allowed"),      # too many and not allowed: neither is echoed
+            (nine + ["--keychain-service", secret], "too_many_items"),
+            (["--keychain-service", secret, "--keychain-service", secret], "item_named_twice"),
+            (["--keychain-service", secret, "--keychain-account", "bad account " + secret], "account_name_not_allowed"),
+            (["--keychain-service", "openai-item", "--keychain-service", "absent-" + secret], "an_item_could_not_be_used"),
+        ]
+        for extra, label in cases:
+            for fmt in ([], ["--json"]):
+                args = ["--home", self.home] + (["--keychain-account", "me"] if "--keychain-account" not in extra else []) + extra + fmt
+                code, out, err = self.cli(*args)
+                self.assertEqual(code, 1, (label, fmt))
+                self.assertIn(label, out, (label, fmt))
+                for text in (secret, secret[:10], secret[-10:], "openai-item", "absent-", K1, CANARY, "bad account"):
+                    self.assertNotIn(text, out + err, (label, fmt, text))
+                self.assertIn("0 of 0 byte(s) read" if not fmt else '"bytes_read": 0', out)
+        for bad in (["--no-such-option-" + secret], ["--keychain-service"], ["--home", self.home, "stray-" + secret], ["--keychain-serv", secret]):
+            code, out, err = self.cli(*bad, plain=True)                                     # a command line that cannot be parsed
+            self.assertEqual((code, out), (2, ""), bad)
+            self.assertEqual(err, "artifact_compare: the command line was not understood; nothing was run. See --help.\n")
+        ran = self.ran()
+        code, out, err = self.cli("--home", self.home, "--keychain-account", "me", "--keychain-serv", "openai-item")   # a shortened option is not accepted
+        self.assertEqual((code, out, self.ran()), (2, "", ran))
     def test_what_the_program_prints_is_only_ever_a_value(self):
         """C1. Text shaped like NAME=VALUE from the fetch program is a value and nothing else. No name can come from it."""
         payload = "EVIL_NAME=" + fake(7, 30)
@@ -597,6 +654,8 @@ class Invocation(Home):
         doc = ac.__doc__
         for word in ac.MATCH_CLASSES + ("/usr/bin/security find-generic-password -w -s NAME -a ACCOUNT", "at most 8", "8,192 bytes", "10 second",
                                         "16 to 4,096 bytes", "900 second", "THIS TOOL HANDLES LIVE CREDENTIALS", "It runs no program you supply",
+                                        "value_format_ambiguous", "never decodes hexadecimal", "Item names must not be secret", "it prints no name at all",
+                                        "not at access-control lists", "searches its default list of\n      keychains", "not from the environment",
                                         "not a lock", "Core dumps are turned off", "never \"current secret\"", "ALL OR NOTHING",
                                         "the first class that fits", "A count of zero does not show", "no_supplied_value does not show a match is harmless"):
             self.assertIn(word, doc)

@@ -336,7 +336,10 @@ python3 artifact_compare.py --home ~/.hermes --keychain-service NAME [--keychain
 until the comparison ends. It answers one question: do those bytes occur in `state.db` or
 `state.db-wal` of the home? (Contract `artifact-compare-v2`.)
 
-It prints the item names you typed, and counts: per item, how many times its exact bytes
+It prints the item names you typed, and counts, and prints those names only when the whole
+run was allowed to proceed. **Item names must not be secret**: the tool treats what you type
+as safe to show. Whenever it stops early it prints no name at all and refers to items by
+their position on the command line. Per item, how many times its exact bytes
 occur in each file; and, for the provider-key-shaped matches of the artifact scope, how many
 distinct strings equal a supplied value, contain one, lie inside one, or match none (each in
 the first class that fits). It never prints a value, a byte of either file, an offset or a
@@ -350,13 +353,23 @@ chooses which two files are read. The output says "supplied value", never "curre
 - It runs no program you supply. The one program is a fixed path, checked before and after
   each run: a regular file, not a link, owned by root, not writable by group or others, and
   the same for every folder above it. If the file changed between the two looks the result is
-  discarded. That is two looks, not a lock; it closes replacement by any user who is not root.
+  discarded. That is two looks, not a lock. It reads owner and permission bits, not
+  access-control lists, and it does not guard against root or another program running as you.
 - Output is read a piece at a time with a hard 8,192-byte and 10-second limit per item. Past
-  either, the program and anything it started are stopped and reaped.
+  either, the program's process group is killed and the program reaped. Something it started
+  that left that group would not be stopped.
 - A small fixed environment, no input, error output discarded.
 - Core dumps are turned off before any value is fetched, or the tool stops.
 - All or nothing: every named item must be fetched and be 16 to 4,096 bytes, or nothing is
-  read from the home. Names must be plain, unique, and must not overlap a fetched value.
+  read from the home. Names must be plain, unique, and must not overlap anything fetched,
+  including bytes that are about to be dropped as unusable.
+- Hexadecimal-only output is refused. The system program prints a value containing a
+  non-printing byte as hexadecimal digits, unmarked, so an even run of hexadecimal digits is
+  ambiguous. The tool refuses it (`value_format_ambiguous`) and never decodes it. Genuine
+  keys made only of hexadecimal digits cannot be checked with this tool.
+- HOME and USER for the program come from your account record, not the environment. No
+  keychain file is named, so the program searches its default list; a name and account
+  identify the query, not one unique item.
 - Nothing is fetched until the terminal, the SQLite check and the home have passed.
 
 **What it cannot do.** Zero memory, or protect a value from another program running as you.
