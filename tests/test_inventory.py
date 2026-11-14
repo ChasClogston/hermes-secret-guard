@@ -318,8 +318,68 @@ class I2_Discovery(Tree):
         self.assertEqual((k["Bad-No-Marker"], k["gone"], k[".deleted"], k["stray.txt"], k["dangling-link"]),
                          ("not-a-profile", "deleted", "not-a-profile", "not-a-profile", "not-a-profile"))
         self.assertEqual(rep["skipped_counts"], {"ambiguous": 6, "deleted": 1, "not-a-profile": 5})
-        self.assertIn("AMBIGUOUS", inv.render(rep))
+        self.assertIn("NEEDS ATTENTION: 6 ambiguous entries", inv.render(rep)); self.assertEqual(rep["needs_attention"], 6)
         self.assertEqual(rep["counts"]["configured"], 1)                         # the deleted profile is not counted
+
+    def test_tombstones_follow_links_markers_do_not(self):
+        """Hermes: a tombstone counts when `Path(tombstone).exists()`, which follows symlinks.
+        A dangling tombstone link deletes nothing. Markers are the opposite on purpose."""
+        dd = os.path.join(self.root, "profiles", ".deleted")
+        for name in ("plain", "linked", "dangling", "looped", "alive"):
+            self.home(name, with_plugin=False)
+        write(os.path.join(dd, "plain"), "")
+        target = os.path.join(self.base, "real-tombstone"); write(target, "")
+        os.symlink(target, os.path.join(dd, "linked"))
+        os.symlink(os.path.join(self.base, "no-such-target"), os.path.join(dd, "dangling"))
+        os.symlink(os.path.join(dd, "looped"), os.path.join(dd, "looped"))
+        os.makedirs(self.P("marker-dangling")); os.symlink(os.path.join(self.base, "gone"), os.path.join(self.P("marker-dangling"), ".env"))
+        rep = self.report()
+        from pathlib import Path
+        hermes = {n: Path(dd, n).exists() for n in ("plain", "linked", "dangling", "looped", "alive")}
+        self.assertEqual(hermes, {"plain": True, "linked": True, "dangling": False, "looped": False, "alive": False})
+        k = self.kinds(rep)
+        self.assertEqual((k.get("plain"), k.get("linked")), ("deleted", "deleted"))
+        r = self.rows(rep)
+        for live in ("dangling", "looped", "alive", "marker-dangling"):
+            self.assertIn(live, r, live)                                         # counted as a home
+            self.assertNotIn(live, k)
+        self.assertEqual(rep["unique_homes"], 5)
+
+    def test_a_tombstone_that_cannot_be_examined_is_not_a_deletion(self):
+        self.home("alpha", with_plugin=False)
+        tomb = os.path.join(self.root, "profiles", ".deleted", "alpha")
+        real = os.stat
+
+        def fake(path, *a, **k):
+            if str(path) == tomb:
+                raise PermissionError(13, "denied")
+            return real(path, *a, **k)
+        with mock.patch("os.stat", fake):
+            rep = self.report()
+        self.assertEqual(self.rows(rep)["alpha"]["state"], "unreadable")
+        self.assertFalse(rep["complete"])
+        self.assertEqual(self.kinds(rep), {})
+
+    @unittest.skipIf(IS_ROOT, "root ignores file modes")
+    def test_a_tombstone_link_to_an_inaccessible_target(self):
+        self.home("alpha", with_plugin=False)
+        locked = os.path.join(self.base, "locked"); write(os.path.join(locked, "t"), "")
+        dd = os.path.join(self.root, "profiles", ".deleted"); os.makedirs(dd)
+        os.symlink(os.path.join(locked, "t"), os.path.join(dd, "alpha"))
+        os.chmod(locked, 0)
+        rep = self.report()
+        self.assertEqual(self.rows(rep)["alpha"]["state"], "unreadable")       # neither deleted nor silently live
+        self.assertFalse(rep["complete"])
+
+    def test_ambiguous_entries_are_reported_separately_from_completeness(self):
+        write(os.path.join(self.P("Upper"), "config.yaml"), ENABLED)
+        rep = self.report()
+        self.assertEqual((rep["complete"], rep["needs_attention"]), (True, 1))
+        code, out, _ = cli("--root", self.root, "--json")
+        self.assertEqual((code, json.loads(out)["needs_attention"]), (0, 1))
+        text = cli("--root", self.root)[1]
+        self.assertIn("NEEDS ATTENTION: 1 ambiguous entry", text)
+        self.assertIn("fixed baseline", text); self.assertIn("installed Hermes is not detected", text)
 
     def test_duplicates_are_counted_once(self):
         self.home("real", NOT_LISTED)

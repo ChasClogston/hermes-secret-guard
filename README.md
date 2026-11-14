@@ -133,12 +133,14 @@ Hermes itself would list: a valid profile id (`a-z`, `0-9`, `_`, `-`, up to 64 c
 from Hermes's source at commit `3b4215785882` (0.23); the report names that version. Markers
 are checked for existence only and never opened. Everything else under `profiles/` is counted
 by kind: `not-a-profile`, `deleted`, or `ambiguous` (it looks like a home, but Hermes would not
-list it; check it by hand). A home reached twice is counted once. Plugins are per home:
+list it; check it by hand). A tombstone counts as Hermes counts it, following symlinks: a dangling tombstone link deletes nothing, while a dangling marker link still marks a home. A tombstone that cannot be examined makes the row `unreadable`, never deleted. A home reached twice is counted once. Plugins are per home:
 nothing is inherited from the root profile.
 
 **When the inventory is incomplete (exit code 1).** A root you asked for is missing, is not a
 folder or cannot be listed; a home is `unreadable` or `unknown`; a folder has more entries than
 the tool will list; or there is no YAML reader. An incomplete run never reads as a clean one.
+
+**Complete is not the same as fully accounted for.** `complete` means the stated rules were applied to everything in scope. Ambiguous entries are counted separately as `needs_attention`, in the text and in JSON, and still need a person to resolve them. The Hermes commit shown is a compatibility baseline: the installed Hermes is not detected, and a change in its rules needs this tool to be updated.
 
 **Malformed never becomes positive.** `plugins.enabled` and `plugins.disabled` must each be a
 list of text (or missing, or empty). A scalar, a mapping or a non-text member makes the home

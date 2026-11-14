@@ -20,7 +20,9 @@ Bundled plugins, opt-in project plugins (`./.hermes/plugins`), pip entry-point p
 
 Profile discovery follows Hermes's own rules as read from its source at commit 3b4215785882
 (0.23): a folder under `profiles/` is a profile when its name is a valid profile id, it holds
-at least one identity marker, and it has no tombstone under `profiles/.deleted/`.
+at least one identity marker, and it has no tombstone under `profiles/.deleted/`. That commit is
+a compatibility baseline. The installed Hermes is not detected; if its rules change, this file
+needs maintenance. It never imports Hermes's profile code to find out.
 """
 
 from __future__ import annotations
@@ -195,6 +197,19 @@ def _exists(path: str) -> str:
         return "unreadable"
 
 
+def _tombstoned(path: str) -> str:
+    """'yes', 'no' or 'unreadable', as Hermes decides it: `Path(tombstone).exists()`, which follows
+    symlinks. A dangling tombstone link therefore does NOT delete a profile. This is deliberately
+    different from identity markers, where a dangling link still counts."""
+    try:
+        os.stat(path)
+        return "yes"
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            return "no"
+        return "unreadable"
+
+
 def _markers(home: str) -> str:
     """Does this folder carry a Hermes identity marker? 'yes', 'no' or 'unreadable'. A marker
     counts when it is a regular file or any symlink, as in Hermes. Nothing is opened."""
@@ -276,7 +291,7 @@ def discover(roots: list) -> dict:
             if marked == "unreadable":
                 homes.append(dict(base, name=name, path=p, source=source + ", profiles folder", kind="unexaminable")); continue
             if valid and marked == "yes":
-                tomb = _exists(os.path.join(pdir, TOMBSTONES, name))
+                tomb = _tombstoned(os.path.join(pdir, TOMBSTONES, name))
                 if tomb == "yes":
                     skip(p, "deleted", "deleted profile (tombstone present)")
                 elif tomb == "unreadable":
@@ -475,7 +490,10 @@ def run(roots: list, system: str = None, loader="auto", expect_version: str = No
     return {"host": _clean(socket.gethostname()), "platform": system or "unknown", "discovery_rules": DISCOVERY_RULES,
             "location_inspected": LOCATION, "searched": found["searched"], "skipped": found["skipped"],
             "skipped_counts": kinds, "homes": rows, "unique_homes": len(unique), "counts": counts, "runtime": RUNTIME,
-            "complete": not incomplete, "incomplete_reasons": incomplete}
+            "complete": not incomplete, "incomplete_reasons": incomplete,
+            # `complete` means the stated rules were applied to everything in scope. It does not mean
+            # every possible home is accounted for: ambiguous entries still need a person to look.
+            "needs_attention": kinds.get("ambiguous", 0)}
 
 
 def _public(report: dict, names: bool, paths: bool) -> dict:
@@ -484,7 +502,7 @@ def _public(report: dict, names: bool, paths: bool) -> dict:
     profile names and skipped entry names. `paths` adds full paths as well."""
     names = names or paths
     out = {k: report[k] for k in ("host", "platform", "discovery_rules", "location_inspected", "skipped_counts",
-                                  "unique_homes", "counts", "runtime", "complete", "incomplete_reasons")}
+                                  "unique_homes", "counts", "runtime", "complete", "incomplete_reasons", "needs_attention")}
     out["searched"] = [dict({"number": s["number"], "source": s["source"]}, **({"root": _clean(s["root"])} if paths else {}))
                        for s in report["searched"]]
     out["homes"] = []
@@ -535,7 +553,9 @@ def render(report: dict, names: bool = False, paths: bool = False) -> str:
     out.append("Entries under profiles/ that are not counted as homes: %d" % sum(sk.values())
                + ("" if not sk else " (" + ", ".join("%d %s" % (sk[k], k) for k in sorted(sk)) + ")"))
     if sk.get("ambiguous"):
-        out.append("  AMBIGUOUS entries look like homes but Hermes would not list them. Check them by hand (--names).")
+        out.append("  NEEDS ATTENTION: %d ambiguous entr%s. They look like homes but Hermes would not list them, so they are"
+                   % (sk["ambiguous"], "y" if sk["ambiguous"] == 1 else "ies"))
+        out.append("  not counted. Resolve them by hand (--names shows which).")
     for s in pub.get("skipped", []):
         out.append("  - %s: %s [%s]" % (s["path"] if paths else s["name"], s["reason"], s["kind"]))
     if not names:
@@ -544,7 +564,9 @@ def render(report: dict, names: bool = False, paths: bool = False) -> str:
             "'configured' means plugin files are present at the location inspected and the home's config lists the plugin.",
             "It does not mean the guard is loaded or enforcing: runtime behaviour was not tested.",
             "'absent' means absent from that location. Bundled, project and pip-installed plugins are not inspected.",
-            "Inventory " + ("complete." if pub["complete"] else "INCOMPLETE: " + "; ".join(pub["incomplete_reasons"]) + ".")]
+            "Inventory " + ("complete: the stated profile rules were applied to everything in scope."
+                            if pub["complete"] else "INCOMPLETE: " + "; ".join(pub["incomplete_reasons"]) + "."),
+            "The profile rules are a fixed baseline (%s). The installed Hermes is not detected and may differ." % pub["discovery_rules"]]
     return "\n".join(out)
 
 
