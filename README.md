@@ -98,6 +98,71 @@ lists every profile and says which ones still need a step.
 | `hermes secret import SCRIPT` | Registers keys named in an existing `emit "service" "ENV"` keychain helper. Reads names only; never runs it. |
 | `hermes secret doctor` | Read-only health check of every profile. Exit 1 on problems. |
 
+## History scan: is secret-shaped text sitting in a home's text records?
+
+```bash
+python3 history_scan.py --home ~/.hermes/profiles/<one-profile>     # you, at a terminal
+```
+
+A summary-only, read-only scan of **one** Hermes home. It is a standalone script: not a
+Hermes command, not an agent tool, not a hook, never scheduled. `--home` is required and has
+no default.
+
+**What it covers (contract `text-v1`, Hermes 0.23):** the direct entries of two folders.
+
+| Kind | Files |
+|---|---|
+| transcripts | `sessions/*.jsonl`, `sessions/*.json` |
+| logs | `logs/*.log`, `logs/*.log.N` |
+
+**What it does not cover, and says so on every run:** the session database `state.db`, where
+Hermes keeps most conversation history; every other file and folder in the home and every
+subfolder of the two above; binary formats, archives and compressed files; secrets in any
+encoded or transformed form; assignments to secret-looking names; generic high-entropy
+strings; and values registered with Secret Guard (that would need the keychain, which this
+tool never touches). A finished run is a finished scan of that text scope only. **Zero
+findings does not show the home holds no secrets.**
+
+**What it looks for:** three fixed categories.
+
+| Category | Matches | Distinct count |
+|---|---|---|
+| `private-key-header` | a PEM `-----BEGIN ... PRIVATE KEY-----` line | no: every key of a type shares the header, so only occurrences are counted |
+| `provider-key-prefix` | seven key shapes: `sk-ant-`, `sk-` / `sk-proj-`, GitHub `ghp_`-family and `github_pat_`, Slack `xox?-`, AWS `AKIA`, Google `AIza` | yes |
+| `bot-token-shape` | digits, a colon, 35 token characters | yes |
+
+The shapes were chosen by the author from the public look of these keys. They are not vendor
+guarantees: a key of another length or alphabet is missed, and a look-alike string is counted.
+A match whose last 24 characters hold fewer than 8 different characters is treated as a
+placeholder and counted separately.
+
+**What it prints:** counters and fixed labels. Per kind: files inspected, bytes read,
+occurrences by category, placeholder-like matches, and file notes under fixed labels. Then
+totals with distinct candidates, run notes, and whether the text scope finished. No source text
+or identifiers are emitted: no file name, path, offset, snippet, digest or error message.
+Distinct candidates are counted with a keyed digest whose key exists only in memory for the
+run. It writes no file, so there is no report to protect or clean up.
+
+**How it reads:** it walks from the chosen home by directory handle and opens each entry
+without following symlinks and without blocking, then checks the open handle is a regular
+file. Work is bounded by entries listed, files opened, bytes per file and in total, and a time
+budget. Anything cut short is counted under a fixed label and the result is "NOT FINISHED",
+never a clean one. Cancelling or an internal error gives the same.
+
+**Limits.**
+- *Same-user limit.* The tool refuses to run unless attached to a terminal. That is friction,
+  not proof that a person started it: any process running as you can start the script or
+  imitate a terminal. Because it prints only counters, that is what such a process could learn.
+- *Scope means directory entries.* A hard-linked file shares its content with a file elsewhere;
+  it is scanned and counted as `hard_linked`. A folder renamed after it was opened is still
+  read through the open handle.
+- *The time budget is cooperative.* It is checked between bounded reads and cannot interrupt a
+  read the operating system has stalled.
+- *No snapshot.* A file that changes while it is read is counted as `changed_during_scan`.
+  Nothing claims a point-in-time view of a live history.
+
+`python tests/test_history_scan.py` runs on synthetic homes with synthetic keys.
+
 ## How keys reach your profiles
 
 Secret Guard is a Hermes **secret source** (`ctx.register_secret_source`), the same mechanism as
