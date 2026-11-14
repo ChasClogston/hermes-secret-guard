@@ -231,13 +231,19 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   always, and for other programs only when such a file exists in a folder the command line
   may be using. In a shell that kept its folder from an
   earlier call, `rev credentials` is therefore not caught.
-- **Folder changes inside one command line are followed, cautiously.** A `cd` at the top level,
-  not after `&&`, `||` or `|`, not piped, backgrounded or inside `if`/`while`/`{ }`, moves where
-  relative names are looked up. Any other `cd` (in a subshell, a pipeline, a substitution, a
-  conditional) may or may not take effect, so the new folder is added and the old ones are kept;
-  later commands are checked under every candidate, and a block under any of them blocks. More
-  than eight candidates refuses the line. A folder named at run time (`cd "$DIR"`) cannot be
-  followed, and neither can a folder change made in an earlier call.
+- **A folder change inside one command line never removes a folder from the check.** Nothing
+  the gate can see proves that a `cd` ran and worked: it may sit in a branch that is not taken,
+  its redirection may fail, the target may be unreadable. So every `cd` target is added as a
+  candidate and the earlier folders stay; later commands are checked under every candidate, and
+  a block under any of them blocks. The one narrowing is the AND-list: in `cd X && cmd`, `cmd`
+  runs only if that `cd` ran and succeeded, so `cmd` is checked from `X` alone, for as long as
+  the `&&` run lasts. It applies only to the bare form `cd X` (no `!`, keyword, option or
+  redirection, not piped, not after `||`) and not on a line that redefines `cd` or sets
+  `CDPATH`. The cost: `cd X; grep -r word .` and `cd X || exit; grep -r word .` are refused when
+  the starting folder holds a secret file; write `cd X && grep -r word .`. More than eight
+  candidates refuses the line. A folder named at run time (`cd "$DIR"`), an inherited `CDPATH`,
+  a `cd` redefined outside the line, and a folder change made in an earlier call cannot be
+  followed.
 - **Command parsing is a small grammar, not a shell.** Quotes, `;`, `|`, `&&`, `$(...)`,
   backticks, `sh -c` and `eval` are handled. Here-documents, aliases, functions, variables holding
   command names and scripts on disk are not. Whether a `grep` call is recursive, and

@@ -675,8 +675,7 @@ def _split_records(command: str) -> list:
 
     Each record is (text, depth, prev, next): how deeply the command sits inside parentheses or
     substitutions, and the operator before and after it. That is the only shell structure kept;
-    it is what lets a `cd` be told apart as certain (top level, unconditional, not piped or
-    backgrounded) or merely possible."""
+    it is what lets `cd X && cmd` be recognised as an AND-list."""
     recs, buf, quote, i, n = [], [], "", 0, len(command)
     stack: list = []                            # (opener, quote state to restore) per open substitution
     state = {"paren": 0, "last": None}
@@ -777,60 +776,66 @@ def _check_command(command: str, cwd: Optional[str], _depth: int) -> Optional[st
         return "reads a file list produced by another command; name the files instead"
     guarded = _guarded_names()
     cwds = [cwd]                                 # every folder this command line may be working in
-    seen = [cwd]                                 # every folder it has ever been in (for popd, cd -)
+    # A folder change never removes a candidate: nothing here can show that a cd ran and worked
+    # (it may sit in an untaken branch, its redirection may fail, its target may be unreadable).
+    # The one narrowing kept is the AND-list: in `cd X && cmd`, cmd runs only if that cd ran and
+    # succeeded, so cmd alone is checked from X. `chain` holds those folders while the && run lasts.
+    chain = None                                 # (folders, depth) or None
+    chainable = not _CD_REDEFINED_RE.search(command)
     for seg, depth, prev, nxt in _split_records(command):
         toks = _tokens(seg)
         if not toks:
             continue
+        in_chain = chain is not None and prev == "&&" and depth == chain[1]
+        here = chain[0] if in_chain else cwds
+        if not in_chain:
+            chain = None
         step = _cd_args(toks)
         if step is not None:
-            args, conditional = step
-            # Certain: at the top level, not after && / || / |, not piped or backgrounded, not inside
-            # if/while/{...}. Then the folder really changes for what follows. Anything else may or
-            # may not take effect, so the new folder is added and the old ones stay. Later commands
-            # are checked under every candidate; a block under any of them blocks.
-            certain = (depth == 0 and not conditional and prev in (None, ";") and nxt in (None, ";", "&&", "||"))
-            if toks[-1] == "popd" or args == ["-"]:
-                cwds = list(seen)                # back to some earlier folder: any of them
-            elif len(args) <= 1 and not (args and ("$" in args[0] or "`" in args[0])):
+            args, plain = step
+            moved, static = [], False
+            if len(args) <= 1 and not (args and ("$" in args[0] or "`" in args[0] or args[0] == "-")):
+                static = True
                 target = args[0] if args else os.path.expanduser("~")
-                moved, stayed = [], []
-                for base in cwds:
-                    cand = _abs(target, base)
-                    (moved if os.path.isdir(cand) else stayed).append(cand if os.path.isdir(cand) else base)
-                # where the target does not exist the cd fails and the line carries on where it was
-                cwds = list(dict.fromkeys((moved + stayed) if certain else (cwds + moved)))
-            # a target built at run time ($DIR) cannot be followed: the candidates stay as they are
-            for c in cwds:
-                if c not in seen:
-                    seen.append(c)
-            if len(cwds) > MAX_CWDS or len(seen) > 4 * MAX_CWDS:
+                moved = [c for c in (_abs(target, base) for base in here) if os.path.isdir(c)]
+            # `cd -`, popd and a target built at run time ($DIR) cannot be followed: the candidates
+            # already hold every folder this line has been in, and they stay as they are
+            cwds = list(dict.fromkeys(cwds + moved))
+            if len(cwds) > MAX_CWDS:
                 return "changes folder too many times to check; run the commands separately"
+            ok = (chainable and plain and static and moved and nxt == "&&" and prev in (None, ";", "&&", "("))
+            chain = (moved, depth) if ok else None
             continue
-        for where in cwds:
+        for where in here:
             reason = _check_tokens(toks, where, guarded, _depth)
             if reason:
                 return reason
     return None
 
 
+# a line that redefines cd, or sets a search path for it, gets no AND-list narrowing
+_CD_REDEFINED_RE = re.compile(r"\b(?:cd|pushd)\s*\(\s*\)|\bfunction\s+(?:cd|pushd)\b|\balias\b[^;|&\n]*\b(?:cd|pushd)=|CDPATH")
+
+
 _SHELL_KEYWORDS = ("then", "do", "else", "elif", "if", "while", "until", "{", "!", "time")
 
 
 def _cd_args(toks: list) -> Optional[tuple]:
-    """(arguments, conditional) of a cd/pushd/popd command, or None if the tokens are some other
-    command. `conditional` is True when it follows a shell keyword such as `then` or `do`."""
-    i, conditional = 0, False
+    """(arguments, plain) of a cd/pushd/popd command, or None if the tokens are some other command.
+    `plain` is True only for the bare form `cd [--] [target]`: no keyword, `!`, assignment, wrapper,
+    option or redirection in the same simple command."""
+    i = 0
     while i + 1 < len(toks) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[i]) or toks[i] in ("command", "builtin")
                                  or toks[i] in _SHELL_KEYWORDS):
-        conditional = conditional or toks[i] in _SHELL_KEYWORDS
         i += 1
     if i < len(toks) and toks[i] in ("cd", "pushd", "popd"):
-        args = [a for a in toks[i + 1:] if a not in ("--", "-P", "-L", "-e", "-@", ";", "}", "fi", "done")
+        rest = toks[i + 1:]
+        args = [a for a in rest if a not in ("--", "-P", "-L", "-e", "-@", ";", "}", "fi", "done")
                 and not re.match(r"^\d*[<>]", a) and not re.match(r"^&?\d*$", a)]
         if toks[i] == "popd":
-            return (["-"], conditional)
-        return (args, conditional)
+            return (["-"], False)
+        plain = i == 0 and toks[0] in ("cd", "pushd") and [a for a in rest if a != "--"] == args
+        return (args, plain)
     return None
 
 

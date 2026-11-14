@@ -330,9 +330,35 @@ class ReviewFindings(Fixture):
             ("R6: cd to a folder named at run time", T("cd \"$DIR\" && grep -r drill hidden_only"), "blocked"),
             ("R6: cd - returns to an earlier folder", T("cd clean; cd -; grep -r drill hidden_only"), "blocked"),
             ("control: a certain cd moves the lookup: grep -r .", T("cd clean && grep -r print ."), "allowed"),
-            ("control: cd with a redirect is still followed", T("cd clean 2>/dev/null; grep -r print src"), "allowed"),
-            ("control: cd X || exit", T("cd clean || exit 1; grep -r print src"), "allowed"),
-            ("control: newline-separated", T("cd clean\ngrep -r print ."), "allowed"),
+            # recheck 5: nothing shows a cd ran and worked, so it never removes a folder
+            ("R6b: input redirection fails, attached", T("cd clean <missing; tar -cf - hidden_only"), "blocked"),
+            ("R6b: input redirection fails, spaced", T("cd clean < missing; tar -cf - hidden_only"), "blocked"),
+            ("R6b: output redirection fails", T("cd clean >missing/out; grep -r drill hidden_only"), "blocked"),
+            ("R6b: output redirection fails, spaced", T("cd clean > missing/out; grep -r drill hidden_only"), "blocked"),
+            ("R6b: stderr redirection fails", T("cd clean 2>missing/out; tar -cf - hidden_only"), "blocked"),
+            ("R6b: untaken branch, command between", T("if false; then true; cd clean; fi; tar -cf - hidden_only"), "blocked"),
+            ("R6b: untaken else branch", T("if true; then :; else :; cd clean; fi; grep -r drill hidden_only"), "blocked"),
+            ("R6b: loop body that never runs", T("while false; do :; cd clean; done; tar -cf - hidden_only"), "blocked"),
+            ("R6b: for loop over nothing", T("for x in; do :; cd clean; done; tar -cf - hidden_only"), "blocked"),
+            ("R6b: case arm not taken", T("case a in b) :; cd clean;; esac; tar -cf - hidden_only"), "blocked"),
+            ("R6b: function defined, never called", T("f() { :; cd clean; }; tar -cf - hidden_only"), "blocked"),
+            ("R6b: negated cd before &&", T("! cd no-such-folder 2>/dev/null && tar -cf - hidden_only"), "blocked"),
+            ("R6b: A || cd X && read", T("true || cd clean && tar -cf - hidden_only"), "blocked"),
+            ("R6b: piped cd before &&", T("true | cd clean && tar -cf - hidden_only"), "blocked"),
+            ("R6b: && run broken by ;", T("cd no-such-folder 2>/dev/null && true; tar -cf - hidden_only"), "blocked"),
+            ("R6b: && run broken by ||", T("cd no-such-folder 2>/dev/null && true || tar -cf - hidden_only"), "blocked"),
+            ("R6b: cd redefined as a function", T("cd() { :; }; cd clean && tar -cf - hidden_only"), "blocked"),
+            ("R6b: cd aliased", T("alias cd=true; cd clean && tar -cf - hidden_only"), "blocked"),
+            ("R6b: CDPATH set on the line", T("CDPATH=/tmp; cd clean && tar -cf - hidden_only"), "blocked"),
+            # the cost: only `cd X && cmd` narrows; these ran before and are refused now, because the
+            # folder the line started in holds a secret file and the cd is not proven
+            ("cost: cd X; search .", T("cd clean; grep -r print ."), "blocked"),
+            ("cost: cd X || exit; search", T("cd clean || exit 1; grep -r print ."), "blocked"),
+            ("cost: newline-separated", T("cd clean\ngrep -r print ."), "blocked"),
+            ("control: cd X; read a named clean file", T("cd clean; cat src/app.py"), "allowed"),
+            ("control: cd X && a && b", T("cd clean && ls && grep -r print ."), "allowed"),
+            ("control: (cd X && search .)", T("(cd clean && grep -r print .)"), "allowed"),
+            ("cost: cd with a redirection && search .", T("cd clean 2>/dev/null && grep -r print ."), "blocked"),
             ("control: cd clean && grep -r src", T("cd clean && grep -r print src"), "allowed"),
             ("control: (cd clean); grep -r clean", T("(cd clean); grep -r print clean"), "allowed"),
             ("control: cd clean/src && cat app.py", T("cd clean/src && cat app.py"), "allowed"),
@@ -551,6 +577,35 @@ class Differential(Fixture):
             self.skipTest("no tar, zip or diff")
         self.assertGreater(self.check(cmds), 3)
 
+    def test_r6_unproven_folder_changes_really_leak_and_block(self):
+        """Recheck 5. Each line is really run with sh: it must exit 0 and print the synthetic value,
+        which shows the cd did not take effect, and the gate must have blocked it beforehand."""
+        if not shutil.which("tar"):
+            self.skipTest("no tar")
+        self.assertFalse(os.path.exists(os.path.join(self.w, "missing")))
+        cmds = ["cd clean <missing; tar -cf - hidden_only", "cd clean < missing; tar -cf - hidden_only",
+                "cd clean >missing/out; grep -r drill hidden_only", "cd clean > missing/out; grep -r drill hidden_only",
+                "cd clean 2>missing/out; tar -cf - hidden_only", "if false; then true; cd clean; fi; tar -cf - hidden_only",
+                "if true; then :; else :; cd clean; fi; grep -r drill hidden_only",
+                "while false; do :; cd clean; done; tar -cf - hidden_only",
+                "for x in; do :; cd clean; done; tar -cf - hidden_only",
+                "case a in b) :; cd clean;; esac; tar -cf - hidden_only", "f() { :; cd clean; }; tar -cf - hidden_only",
+                "! cd no-such-folder 2>/dev/null && tar -cf - hidden_only", "true || cd clean && tar -cf - hidden_only",
+                "true | cd clean && tar -cf - hidden_only", "cd no-such-folder 2>/dev/null && true; tar -cf - hidden_only",
+                "cd no-such-folder 2>/dev/null && true || tar -cf - hidden_only",
+                "cd() { :; }; cd clean && tar -cf - hidden_only",
+                # unchanged controls: a sequential cd and a failed target
+                "cd clean; tar -cf - ../hidden_only", "cd no-such-folder; tar -cf - hidden_only",
+                "cd clean && tar -cf - ../hidden_only"]
+        bad = []
+        for c in cmds:
+            verdict = self.verdict("terminal", {"command": c})          # judged before it runs
+            r = subprocess.run(["/bin/sh", "-c", c], cwd=self.w, capture_output=True, text=True, timeout=20,
+                               errors="replace", stdin=subprocess.DEVNULL)
+            if r.returncode != 0 or VALUE not in r.stdout or verdict != "blocked":
+                bad.append((c, r.returncode, VALUE in r.stdout, verdict))
+        self.assertEqual(bad, [])
+
     def test_generated_folder_change_matrix(self):
         """Every folder-change form in front of every read, really run. Where the read printed the
         synthetic value, the gate must have blocked the whole line."""
@@ -560,12 +615,17 @@ class Differential(Fixture):
                     "cd clean; cd ..; ", "cd clean && cd .. && ", "x=$(cd clean); ", "cd clean & ",
                     "{ cd clean; }; cd ..; ", "cd clean; (cd ..); cd ..; ", "cd sub; cd ../clean; cd ..; ",
                     "(cd clean; cd src); ", "cd clean; cd - >/dev/null; ", "if true; then cd clean; fi; cd ..; ",
-                    "cd no-such 2>/dev/null; ", "cd clean; cd src; cd ../..; ", "((cd clean)); ", "cd . && "]
+                    "cd no-such 2>/dev/null; ", "cd clean; cd src; cd ../..; ", "((cd clean)); ", "cd . && ",
+                    "cd clean <missing; ", "cd clean >missing/o; ", "cd clean 2> missing/o; ",
+                    "if false; then :; cd clean; fi; ", "while false; do :; cd clean; done; ",
+                    "f() { :; cd clean; }; ", "true || cd clean && ", "true | cd clean && ", "! cd no-such 2>/dev/null && ",
+                    "cd no-such 2>/dev/null && :; ", "(cd clean && :); ", "cd clean && :; "]
         reads = ["tar -cf - hidden_only", "grep -r drill hidden_only", "grep -r drill .", "tar -cf - -- -data",
                  "cd hidden_only && grep -r drill .", "(cd sub && tr a a < prod.env)", "cd aws; fold credentials",
                  "grep -r print clean"]
         n = self.check([p + r for p in prefixes for r in reads])
-        self.assertGreater(n, 60)
+        self.matrix_read = n
+        self.assertGreater(n, 110)
 
     def test_copy_effects_imply_block(self):
         """cp and rsync print nothing: the effect is the copy. Run each into a scratch folder outside
