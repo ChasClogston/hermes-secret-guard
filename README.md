@@ -320,6 +320,29 @@ The script must never be imported into a running Hermes: closing a file descript
 process that also holds a SQLite connection to the same file can cancel that connection's
 locks.
 
+### One-off triage of artifact matches
+
+```bash
+python3 artifact_triage.py --home ~/.hermes/profiles/<one-profile>
+```
+
+When the artifact scope reports provider-key-shaped matches, this says what kind of match
+each one is, without showing any of them (contract `artifact-triage-v1`). It reads the same
+two files the same way, finds the same matches, and prints one line per group with labels and
+two counts: which listed shape, the class of the byte before it, whether the bytes before it
+complete a common English word ending in "sk" (task, desk, disk, risk, mask, flask, ask),
+the class of the characters after the prefix (for example `uuid_layout` or
+`mixed_alphanumeric`), and their number. It never prints a matched byte, a neighbour, an
+offset or a digest, and writes no file.
+
+The reason it exists: the artifact scope matches a provider-key shape wherever its prefix
+starts, so "task-" followed by a long identifier reads as "sk-" plus a key body. The labels
+are hints. A letter before, a listed word and an identifier-shaped body point to an ordinary
+identifier; a mixed-case body after a non-word byte points to a pasted key. Neither is
+proof, `hex_and_hyphens` clears nothing because some real keys are hexadecimal, and every
+limit of the artifact scope applies. `python tests/test_artifact_triage.py` covers it with
+synthetic byte files.
+
 `python tests/test_artifact_scan.py` builds synthetic databases and runs every scan in its own
 process. It compares the scanner with an independent hand-written whole-file pass (physical
 bytes, no regular expression shared with the scanner) and with the stored values (logical),
