@@ -325,6 +325,37 @@ The script must never be imported into a running Hermes: closing a file descript
 process that also holds a SQLite connection to the same file can cancel that connection's
 locks.
 
+### One-off comparison with a home's current secrets
+
+```bash
+python3 artifact_compare.py --home ~/.hermes --secrets-command /absolute/path/to/helper
+```
+
+**This tool handles live credentials.** It runs the helper you name, the same program Hermes
+runs at start-up (`secrets.command`), and holds every value it prints in memory for the run.
+It answers one question: is the current value of any of those secrets present, byte for byte,
+in `state.db` or `state.db-wal`? (Contract `artifact-compare-v1`.)
+
+It prints secret names and counts and nothing else: per secret, how many times its exact
+bytes occur in each file; and, for the provider-key-shaped matches of the artifact scope, how
+many distinct strings equal a current secret, contain one, lie inside one, or match none. It
+never prints a value, a byte of either file, an offset or a digest, writes no file and opens
+no network connection.
+
+The helper path has no default and must be an absolute path to a regular file that you own
+and nobody else can write. It is run directly, never through a shell, with a 30 second and
+1 MiB limit, and only after the terminal, the home and the SQLite checks have passed. If it
+is refused or fails, nothing is read. Values shorter than 16 bytes or longer than 4,096 are
+not searched for and are listed by name.
+
+What it cannot tell you: a count of zero shows only that those exact bytes were not found as
+one run, not that the credential was never there (a split, re-encoded or since-rotated value
+is not found); `no_current_secret` does not show a match is harmless; and the tool cannot
+protect the values from another program running as you, or know whether the helper is safe
+to run. The output names credentials that are in the database, so treat it as sensitive.
+Every limit of the artifact scope applies. `python tests/test_artifact_compare.py` covers it
+with made-up values and throwaway helper scripts; no real helper or credential is used.
+
 `python tests/test_artifact_scan.py` builds synthetic databases and runs every scan in its own
 process. It compares the scanner with an independent hand-written whole-file pass (physical
 bytes, no regular expression shared with the scanner) and with the stored values (logical),
