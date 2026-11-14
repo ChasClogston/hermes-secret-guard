@@ -19,25 +19,35 @@ WHAT IT PRINTS (contract "artifact-triage-v1")
     shape        which of the seven listed shapes the match starts with
     before       the class of the one byte before the match:
                  start_of_file, letter, digit, hyphen_or_underscore, other_printable, not_printable
-    word         whether the bytes just before the match, joined to the "sk" of the prefix, end in
-                 one of a fixed list of English words: flask, task, desk, disk, risk, mask, ask
-                 (the longest that fits, so "multitask" reads as task), or none.
-                 Only for the shapes that begin "sk-". Compared against that fixed list; the bytes
-                 themselves are never printed.
+    word         listed_word when the bytes just before the match, joined to the "sk" of the
+                 prefix, end in one of a fixed list of English words (flask, task, desk, disk,
+                 risk, mask, ask), otherwise none. Only for the shapes that begin "sk-"; other
+                 shapes say not_applicable. Which word it was is not printed.
     body         the class of the characters after the prefix:
                  uuid_layout (8-4-4-4-12 hexadecimal), hex_and_hyphens, lowercase_and_hyphens,
                  digits_and_hyphens, mixed_alphanumeric, other
-    length       the number of characters after the prefix
-  It never prints a matched byte, a neighbouring byte, an offset, a page number, a digest, a file
-  name other than the two fixed ones, or an error message taken from input. It writes no file.
+    length       a range for the number of characters after the prefix:
+                 under_32, 32_to_39, 40_to_63, 64_to_127, 128_or_more
+  No raw excerpt is printed: no matched byte, no neighbouring byte, no offset, no page number, no
+  digest, no file name other than the two fixed ones, no error message taken from input. It
+  writes no file.
 
-WHAT A RESULT MEANS
-  - "letter" before, a word from the list, and uuid_layout or lowercase_and_hyphens is what an
-    ordinary identifier such as a task id looks like. It is a strong hint, not proof, that the
-    match is not a credential.
-  - "mixed_alphanumeric" after a byte that is not a letter or digit is what a pasted key looks
-    like. It is a hint, not proof, that the match is a credential.
-  - "hex_and_hyphens" clears nothing: some real keys are hexadecimal.
+WHAT THE OUTPUT STILL DISCLOSES
+  Labels are metadata about the matches, and metadata is information. A group with one member
+  tells a reader that a string of that shape, body class and length range exists in the home,
+  and, with listed_word, that the bytes before it spell one of seven fixed words. The per-file
+  totals and the group counts show how the matches are distributed between the two files and
+  across kinds. Read the output with that in mind before sharing it.
+
+HOW TO READ THE COUNTS
+  - The labels are structural classifications only. No label and no combination of labels
+    confirms a credential or clears one. A match after the word "task" with a uuid_layout body
+    is shaped like an ordinary identifier, and it may still be a credential; hex_and_hyphens
+    describes real keys as well as identifiers.
+  - Nothing here should be used to ignore a candidate automatically or to change what the
+    scanner detects.
+  - Distinct counts are per group and do not add up: the same byte string seen in two different
+    contexts is counted once in each of two groups.
   - Every limit of the artifact scope applies: physical neighbouring bytes, not stored values;
     deleted or superseded content can match; values split across pages are not put back together;
     the two files are not a snapshot. Nothing here speaks to the database's health.
@@ -46,11 +56,19 @@ WHAT A RESULT MEANS
 LIMITS
   Same fixed byte limits as the artifact scope (4 GiB per file, 6 GiB for both) and a 600 second
   cooperative time budget that cannot interrupt a stalled system call. At most 500 groups and
-  200,000 distinct strings are remembered; past either, the run says so and is not finished, and
-  distinct counts are lower bounds. If the home cannot be opened, or a file changes while it is
-  read, the run is not finished. It declines to run when the standard sqlite3 module is already
-  loaded in its process; that is a rejection check, not proof that no SQLite connection exists.
-  The terminal check is friction, not proof that a person started the run.
+  200,000 distinct strings are remembered. Past the group limit, the groups shown keep their own
+  counts and the groups left out are not represented at all; past the distinct limit, distinct
+  counts are lower bounds. Either way the run says so and is not finished.
+  Each of the two entries is looked at before it is opened and again at the end, whether or not
+  it existed or could be opened. A file that appears, disappears, is replaced, grows, shrinks or
+  is modified in between makes the run not finished, and so does a check that cannot be made. An
+  absent log that stays absent is normal. Seeing no change does not show the files were stable.
+  The home is opened once and read through that handle. If the path you named no longer points
+  at that folder at the end, the run says so and is not finished; a path re-pointed and restored
+  in between is not seen. If the home cannot be opened, nothing is read.
+  It declines to run when the standard sqlite3 module is already loaded in its process; that is a
+  rejection check, not proof that no SQLite connection exists. The terminal check is friction,
+  not proof that a person started the run. No system-call trace of this tool exists on macOS.
 """
 import argparse
 import errno
@@ -78,10 +96,11 @@ SHAPE_PREFIXES = (                      # checked in this order; the first that 
 SHAPES = tuple(n for n, _p in SHAPE_PREFIXES) + ("unrecognised",)
 BEFORE = ("start_of_file", "letter", "digit", "hyphen_or_underscore", "other_printable", "not_printable")
 WORDS = ("flask", "task", "desk", "disk", "risk", "mask", "ask")      # longest first; each ends in "sk"
-WORD_LABELS = WORDS + ("none", "not_applicable")
+WORD_LABELS = ("listed_word", "none", "not_applicable")
+LENGTHS = ("under_32", "32_to_39", "40_to_63", "64_to_127", "128_or_more")
 BODY = ("uuid_layout", "hex_and_hyphens", "lowercase_and_hyphens", "digits_and_hyphens", "mixed_alphanumeric", "other")
 STATUS = hs.ARTIFACT_STATUS
-RUN_LABELS = ("refused_sqlite_loaded_in_process", "home_unavailable", "database_absent", "source_change_observed",
+RUN_LABELS = ("refused_sqlite_loaded_in_process", "home_unavailable", "home_path_changed_during_run", "database_absent", "source_change_observed",
               "truncated_at_size_cap", "total_byte_limit_reached", "time_budget_reached", "group_limit_reached",
               "distinct_limit_reached", "cancelled", "internal_error")
 MAX_GROUPS = 500
@@ -115,10 +134,8 @@ def classify(token: bytes, left: bytes):
     if prefix.startswith(b"sk-"):
         word = "none"
         joined = (left + b"sk").lower()
-        for w in WORDS:
-            if joined.endswith(w.encode()):
-                word = w
-                break
+        if any(joined.endswith(w.encode()) for w in WORDS):
+            word = "listed_word"
     body = token[len(prefix):]
     chars = frozenset(body)
     parts = body.split(b"-")
@@ -134,7 +151,9 @@ def classify(token: bytes, left: bytes):
         kind = "mixed_alphanumeric"
     else:
         kind = "other"
-    return shape, before, word, kind, len(body)
+    n = len(body)
+    return shape, before, word, kind, ("under_32" if n < 32 else "32_to_39" if n < 40 else "40_to_63" if n < 64
+                                       else "64_to_127" if n < 128 else "128_or_more")
 
 
 def _new_file() -> dict:
@@ -159,7 +178,7 @@ def triage(home_fd: int) -> dict:
         note("refused_sqlite_loaded_in_process")
         return res
     key = os.urandom(32)
-    groups, digests, fds, opened = {}, {}, [], {}
+    groups, digests, fds, opened, initial = {}, {}, [], {}, {}
     state = {"total": 0, "distinct": 0, "overflow": False}
     deadline = time.monotonic() + TIME_BUDGET_S
 
@@ -188,9 +207,14 @@ def triage(home_fd: int) -> dict:
             g[1] += 1
 
     try:
+        for name in hs.ARTIFACTS:                  # look at both entries first, before either is opened
+            initial[name] = hs._entry_identity(home_fd, name)
         for name in hs.ARTIFACTS:
             tick()
             f = res["files"][name]
+            if initial[name] == "unreadable":
+                f["status"] = "unreadable"
+                continue
             try:
                 fd = os.open(name, hs._FILE, dir_fd=home_fd)
             except OSError as exc:
@@ -207,6 +231,8 @@ def triage(home_fd: int) -> dict:
             if not stat.S_ISREG(st.st_mode):
                 f["status"] = "not_a_regular_file"
                 continue
+            if initial[name] != (st.st_dev, st.st_ino):
+                f["change_observed"] = True        # the entry was absent or a different file when first looked at
             f["extent_bytes"] = st.st_size
             opened[name] = (fd, st)
         for name in hs.ARTIFACTS:
@@ -254,18 +280,23 @@ def triage(home_fd: int) -> dict:
     except BaseException:
         note("internal_error")
     finally:
+        # End checks for every entry that was looked at, opened or not: an entry that appeared,
+        # disappeared or was replaced, and an open file that grew, shrank or was modified.
         for name in hs.ARTIFACTS:
-            if name not in opened:
+            if name not in initial:
                 continue
             try:
-                fd, st = opened[name]
-                end, entry = os.fstat(fd), hs._entry_identity(home_fd, name)
-                if (end.st_size, end.st_mtime_ns) != (st.st_size, st.st_mtime_ns) or entry != (st.st_dev, st.st_ino):
+                if hs._entry_identity(home_fd, name) != initial[name]:
                     res["files"][name]["change_observed"] = True
+                if name in opened:
+                    fd, st = opened[name]
+                    end = os.fstat(fd)
+                    if (end.st_size, end.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
+                        res["files"][name]["change_observed"] = True
             except KeyboardInterrupt:
                 note("cancelled")
             except BaseException:
-                res["files"][name]["change_observed"] = True
+                res["files"][name]["change_observed"] = True       # a check that cannot be made is not a pass
         for fd in fds:
             try:
                 os.close(fd)
@@ -294,8 +325,9 @@ def triage(home_fd: int) -> dict:
 
 def render(res: dict) -> str:
     out = ["Secret Guard artifact triage: labels and counts only (contract %s, for matches of %s)" % (res["contract"], res["scans_contract"]),
-           "  NOT a read of the conversations. No matched byte, neighbour, offset or digest is printed.",
-           "  The labels are hints about what kind of match each is. They do not confirm or clear a credential."]
+           "  NOT a read of the conversations. No raw excerpt is printed: no matched byte, neighbour, offset or digest.",
+           "  The labels are structural classifications only. No label or combination confirms a credential or clears one.",
+           "  They are still information about the matches. Distinct counts are per group and do not add up."]
     for name in hs.ARTIFACTS:
         f = res["files"][name]
         out.append("%s: status %s, %d of %d byte(s) read, traversal finished %s, change observed %s, provider-key matches %d"
@@ -304,12 +336,16 @@ def render(res: dict) -> str:
     low = res["distinct_counts_are_lower_bounds"]
     out.append("groups across both files: %d" % len(res["groups"]))
     for g in res["groups"]:
-        out.append("    shape [%s]  before %s  word %s  body %s  length %d  occurrences %d  distinct %s%d"
+        out.append("    shape [%s]  before %s  word %s  body %s  length %s  occurrences %d  distinct %s%d"
                    % (g["shape"], g["before"], g["word"], g["body"], g["length"], g["occurrences"], "at least " if low else "", g["distinct"]))
     if low:
         out.append("The distinct limit was reached. Occurrences are exact; every distinct figure is a lower bound.")
+    if "group_limit_reached" in res["run"]:
+        out.append("The group limit was reached. The groups above keep their own counts; groups left out are not shown at all.")
     out.append("run notes: " + (", ".join(res["run"]) if res["run"] else "none"))
     out.append("Triage " + ("finished." if res["finished"] else "NOT FINISHED: this is a partial or inconclusive result."))
+    if "home_path_changed_during_run" in res["run"]:
+        out.append("The path you named no longer points at the folder that was read. The counts describe the folder opened at the start.")
     out.append("Zero groups does not show the database holds no secrets. The two files were not read as a snapshot.")
     return "\n".join(out)
 
@@ -335,6 +371,9 @@ def main(argv=None) -> int:
             res["run"].append("home_unavailable")
         else:
             res = triage(pinned)
+            if hs._home_moved(args.home, pinned):          # also true when the comparison cannot be made
+                res["run"].append("home_path_changed_during_run")
+                res["finished"] = False
         print(json.dumps(res, indent=2, sort_keys=True) if args.json else render(res))
         return 0 if res["finished"] else 1
     except KeyboardInterrupt:
