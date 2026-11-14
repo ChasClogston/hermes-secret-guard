@@ -213,15 +213,14 @@ PATH_KEYS = frozenset({"path", "file_path", "filepath", "filename", "file", "pat
                        "source_path", "image_path", "video_path", "workdir_file"})
 
 # --- 1.1: reads that reach a secret file without naming it
-# Folder scans use every name pattern, with a short list of exceptions for names that would
-# otherwise block a recursive search in most repositories: tokenizer files, compiled Python
-# (credential_files.cpython-314.pyc) and placeholder env files (.env.example). A direct read of
-# any of these is still blocked by the path rule.
-BENIGN_DIR_NAMES = ("*tokeniz*", "*.pyc", "*.pyo", "*.env.example", "*.env.sample", "*.env.template",
-                    "*.env.dist", ".env.example", ".env.sample", ".env.template", ".env.dist")
-# rg and ag skip dotfiles and honour ignore files. These folders are assumed ignored for those two
-# tools only; grep -r, tar, zip, cp -r and search_files are scanned without exclusions.
-IGNORED_BY_RG = frozenset({"node_modules", "__pycache__", "venv"})
+# Folder scans use every name pattern, with two explicit, documented reductions in coverage so that
+# a recursive search of an ordinary repository is not always refused: a fixed list of tokenizer
+# data files, and compiled Python. Neither is proof the file is harmless. A direct read of any of
+# these is still blocked by the path rule. Placeholder env files (.env.example) are NOT exempt.
+BENIGN_DIR_NAMES = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model",
+                    "special_tokens_map.json", "added_tokens.json", "*.pyc", "*.pyo")
+# The time limit is cooperative: it is checked between directory listings and every 256 entries.
+# One slow filesystem call cannot be interrupted by it.
 SCAN_MAX_DEPTH, SCAN_MAX_ENTRIES, SCAN_MAX_SECONDS = 12, 20000, 2.0
 GLOB_MAX_MATCHES = 2000
 SHELL_MAX_DEPTH = 3
@@ -233,9 +232,9 @@ ALWAYS_RECURSIVE = HIDDEN_SKIPPERS | {"tar", "zip", "rsync"}
 # outside these tables and the flag tables below makes the call "not understood": the working
 # folder is then scanned as well as any folder named.
 _VALUE_OPTS = {
-    "grep": ("efmABCdD", {"regexp", "file", "max-count", "after-context", "before-context", "context",
-                          "include", "exclude", "exclude-dir", "exclude-from", "label", "binary-files",
-                          "devices", "directories", "color", "colour"}),
+    "grep": ("efmABdD", {"regexp", "file", "max-count", "after-context", "before-context",
+                         "include", "exclude", "exclude-dir", "exclude-from", "label", "binary-files",
+                         "devices", "directories"}),
     "rg": ("efgtTABCmjMdEr", {"regexp", "file", "glob", "iglob", "type", "type-not", "type-add",
                               "type-clear", "after-context", "before-context", "context", "max-count",
                               "threads", "max-columns", "max-depth", "maxdepth", "encoding", "replace",
@@ -269,6 +268,11 @@ _FLAG_OPTS = {
            "numbers", "nonumbers", "heading", "noheading", "filename", "nofilename", "null", "stats",
            "search-binary", "search-zip", "skip-vcs-ignores", "only-matching", "column", "vimgrep"}),
 }
+# Options whose value is optional. GNU and BSD grep disagree on some (-C, --context), so a bare
+# one never consumes the next token unless that token is a number, and marks the call "not
+# understood". --color/--colour never take a separate value in either.
+_OPTIONAL_OPTS = {"grep": ("C", {"context", "color", "colour"}), "rg": ("", set()), "ag": ("", set())}
+_SETTLED_OPTIONAL = {"color", "colour"}
 PLAIN_READERS = ("cat", "bat", "less", "more", "head", "tail", "nl", "tac", "strings", "xxd", "od",
                  "hexdump", "base64")
 _SUBST_READ_RE = re.compile(r"(?:^|[|;&\n(]\s*)(?:sudo\s+)?(?:" + "|".join(PLAIN_READERS)
@@ -331,6 +335,10 @@ class _Budget:
         if self.entries > SCAN_MAX_ENTRIES or (self.entries % 256 == 0 and time.monotonic() > self.deadline):
             raise _ScanTooBig
 
+    def check_time(self) -> None:
+        if time.monotonic() > self.deadline:
+            raise _ScanTooBig
+
 
 _budget_var: "contextvars.ContextVar[Optional[_Budget]]" = contextvars.ContextVar("secret_guard_budget", default=None)
 
@@ -353,8 +361,8 @@ def _dir_secret_name(path: str) -> bool:
 def _glob_regex(pattern: str) -> Optional["re.Pattern[str]"]:
     """A ripgrep/gitignore-style glob with a folder part, as a regex over the relative path.
     None when the glob uses syntax this does not model (the caller then applies no filter)."""
-    if not pattern or pattern.startswith("!") or any(c in pattern for c in "{}\\"):
-        return None
+    if not pattern or pattern.startswith("!") or any(c in pattern for c in "{}[]\\"):
+        return None                              # exclusions, braces, classes: not modelled
     pattern = pattern.lstrip("/")
     out, i = [], 0
     while i < len(pattern):
@@ -367,11 +375,6 @@ def _glob_regex(pattern: str) -> Optional["re.Pattern[str]"]:
             out.append("[^/]*"); i += 1
         elif c == "?":
             out.append("[^/]"); i += 1
-        elif c == "[":
-            j = pattern.find("]", i + 2)
-            if j < 0:
-                return None
-            out.append("[" + pattern[i + 1:j].replace("\\", "\\\\") + "]"); i = j + 1
         else:
             out.append(re.escape(c)); i += 1
     try:
@@ -385,8 +388,10 @@ def _name_filter(name_glob: Optional[str]):
     only when it can be modelled exactly; anything else is ignored, which can only block more."""
     if not name_glob:
         return None
-    if "/" not in name_glob and not name_glob.startswith("!") and not any(c in name_glob for c in "{}\\"):
-        return lambda rel: fnmatch.fnmatch(os.path.basename(rel), name_glob)
+    if any(c in name_glob for c in "{}[]\\") or name_glob.startswith("!"):
+        return None                              # includes [!x] and [^x], which tools and fnmatch read differently
+    if "/" not in name_glob:
+        return lambda rel: fnmatch.fnmatchcase(os.path.basename(rel), name_glob)
     rx = _glob_regex(name_glob)
     return (lambda rel: rx.match(rel) is not None) if rx else None
 
@@ -402,6 +407,7 @@ def secret_file_under(root: str, name_glob: Optional[str] = None, include_hidden
     stack = [(root, 0)]
     while stack:
         folder, depth = stack.pop()
+        budget.check_time()
         try:
             with os.scandir(folder) as it:
                 for e in it:
@@ -511,6 +517,7 @@ def _parse_search_args(prog: str, args: list) -> dict:
     family = "grep" if prog in GREP_FAMILY else prog
     v_short, v_long = _VALUE_OPTS[family]
     f_short, f_long = _FLAG_OPTS[family]
+    o_short, o_long = _OPTIONAL_OPTS[family]
     short, long_flags, operands = [], [], []
     understood, pattern_given, glob_given = True, False, False
     i = 0
@@ -523,7 +530,12 @@ def _parse_search_args(prog: str, args: list) -> dict:
         if a.startswith("--"):
             name, eq, _val = a[2:].partition("=")
             long_flags.append(name)
-            if name in v_long:
+            if name in o_long:
+                if not eq and name not in _SETTLED_OPTIONAL:
+                    if i < len(args) and args[i].isdigit():
+                        i += 1
+                    understood = False           # tools disagree on whether a bare one takes a value
+            elif name in v_long:
                 pattern_given = pattern_given or name in ("regexp", "file")
                 glob_given = glob_given or name in ("glob", "iglob")
                 if not eq:
@@ -532,6 +544,13 @@ def _parse_search_args(prog: str, args: list) -> dict:
                 understood = False
         elif a.startswith("-") and len(a) > 1:
             for j, ch in enumerate(a[1:], start=1):
+                if ch in o_short:
+                    if j == len(a) - 1:          # bare: a following number is its value, nothing else is
+                        if i < len(args) and args[i].isdigit():
+                            i += 1
+                        else:
+                            understood = False
+                    break                        # attached digits are the value
                 if ch in v_short:
                     pattern_given = pattern_given or ch in "ef"
                     glob_given = glob_given or (family == "rg" and ch == "g")
@@ -553,32 +572,39 @@ def _recursive_folders(prog: str, args: list, cwd: Optional[str]) -> Optional[tu
     understood, or names no existing path, the working folder is included."""
     here = _abs(".", cwd)
     if prog in GREP_FAMILY or prog in HIDDEN_SKIPPERS:
+        # Recursion, dotfile reach and candidate folders are read from the raw tokens, so an option
+        # value mistaken for something else can only add scanning, never remove it.
+        end = args.index("--") if "--" in args else len(args)
+        raw_opts = [a for a in args[:end] if a.startswith("-") and len(a) > 1]
+        raw_short = "".join(a[1:] for a in raw_opts if not a.startswith("--"))
+        raw_long = [a[2:].partition("=")[0] for a in raw_opts if a.startswith("--")]
+        if prog in GREP_FAMILY and not (any(c in raw_short for c in "rRd") or "recursive" in raw_long
+                                        or "dereference-recursive" in raw_long or "directories" in raw_long):
+            return None
         parsed = _parse_search_args(prog, args)
-        short, long_flags = parsed["short"], parsed["long"]
-        if prog in GREP_FAMILY and not ("r" in short or "R" in short or "recursive" in long_flags
-                                        or "dereference-recursive" in long_flags
-                                        or "directories" in long_flags
-                                        or any(re.fullmatch(r"-[A-Za-z]*d.*", a) for a in args if not a.startswith("--"))):
-            return None                          # -d/--directories can mean recurse; treated as recursive
         operands = parsed["operands"]
         paths = operands if parsed["pattern_given"] else operands[1:]
-        hidden, skip = True, frozenset()
+        hidden = True
         if prog in HIDDEN_SKIPPERS:
-            hidden = ("hidden" in long_flags or "." in short or parsed["glob_given"]
-                      or short.count("u") >= (2 if prog == "rg" else 1)
-                      or long_flags.count("unrestricted") >= (2 if prog == "rg" else 1))
-            skip = frozenset() if ("no-ignore" in long_flags or "u" in short or "unrestricted" in long_flags
-                                   or "U" in short or "skip-vcs-ignores" in long_flags) else IGNORED_BY_RG
-        folders, named_existing = [], False
+            hidden = ("hidden" in raw_long or "." in raw_short or "glob" in raw_long or "iglob" in raw_long
+                      or (prog == "rg" and "g" in raw_short)
+                      or raw_short.count("u") >= (2 if prog == "rg" else 1)
+                      or raw_long.count("unrestricted") >= (2 if prog == "rg" else 1))
+        named_existing = False
         for p in paths:
             for m in (expand_glob(p, cwd) if _has_magic(p) else [_abs(p, cwd)]):
-                if os.path.isdir(m):
-                    folders.append(m); named_existing = True
-                elif os.path.exists(m):
+                if os.path.exists(m):
                     named_existing = True
+        folders = []
+        for tok in args:                         # every token that is a folder, wherever it sits
+            if tok.startswith("-"):
+                continue
+            for m in (expand_glob(tok, cwd) if _has_magic(tok) else [_abs(tok, cwd)]):
+                if os.path.isdir(m):
+                    folders.append(m)
         if not named_existing or not parsed["understood"]:
             folders.append(here)
-        return list(dict.fromkeys(folders)), hidden, skip
+        return list(dict.fromkeys(folders)), hidden, frozenset()
     flags = [a for a in args if a.startswith("-")]
     pos = [a for a in args if not a.startswith("-")]
     short = "".join(f[1:] for f in flags if not f.startswith("--"))

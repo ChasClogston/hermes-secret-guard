@@ -200,26 +200,36 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   with offsets and column groups is not matched; `xxd -p` is. Redaction is the safety net; the
   path gate and key entry outside chat are what keep keys from being read in the first place.
 - **Folder reads are checked by file name, within limits.** One tool call gets one work budget
-  for all its folder scans and glob expansions: 20,000 entries, 12 levels and two seconds. Past
-  that, or when a folder cannot be listed, the call is blocked. Symlinked folders are not followed,
-  so `grep -R`, `rg -L` or `cp -L` can read further than the scan looked. Tokenizer files,
-  compiled Python (`*.pyc`) and placeholder env files (`.env.example`, `.env.sample`,
-  `.env.template`, `.env.dist`) are not treated as secrets in a folder scan, so a recursive
-  search of an ordinary repository still works; a direct read of one is still blocked, and a real
-  key left in `.env.example` is not protected from a folder search. `access-token.txt` is. A secret in an ordinarily named file is not seen.
-- **The scan follows each tool's own reach, approximately.** `grep -r`, `tar`, `zip`, `cp -r` and
-  `search_files` are scanned in full, including `.git` and `node_modules`. `rg` and `ag` are
-  assumed to skip dotfiles, `node_modules`, `venv` and `__pycache__` unless `--hidden`, `-uu`,
-  `--no-ignore` or a `--glob` is given; a config file or alias that changes those defaults is not
+  for all its folder scans and glob expansions: 20,000 entries and 12 levels, plus a two-second
+  budget that is cooperative (checked between folder listings; it cannot interrupt one slow
+  filesystem call). Past that, or when a folder cannot be listed, the call is blocked. Symlinked
+  folders are not followed, so `grep -R`, `rg -L` or `cp -L` can read further than the scan
+  looked. A secret in an ordinarily named file is not seen.
+- **Two deliberate reductions in folder-scan coverage.** A fixed list of tokenizer data files
+  (`tokenizer.json`, `tokenizer_config.json`, `tokenizer.model`, `special_tokens_map.json`,
+  `added_tokens.json`) and compiled Python (`*.pyc`, `*.pyo`) do not block a folder search. That
+  is a noise trade, not proof those files are harmless: bytecode can embed a credential. A direct
+  read of any of them is still blocked. Placeholder env files (`.env.example` and the like) are
+  not exempt, so a recursive search of a repository that has one is refused; search a subfolder.
+- **Whole-repository searches are often refused.** Name patterns also match public material such
+  as `cacert.pem`. This is the cost of blocking by file name.
+- **The scan is at least as wide as the tool, never narrower by assumption.** Every folder is
+  scanned in full for `grep -r`, `tar`, `zip`, `cp -r`, `search_files`, `rg` and `ag`, including
+  `node_modules` and virtual environments: ignore files are not read, so `rg` may be refused for
+  a file it would in fact skip. The one modelled difference is dotfiles, which `rg` and `ag` skip
+  unless `--hidden`, `-uu` or a `--glob` is given; a config file or alias that changes that is not
   seen. A search tool's file filter is honoured only when it can be modelled exactly (`*.py`,
-  `src/**/*.py`); exclusions and brace patterns are ignored, which can only block more.
+  `src/**/*.py`); exclusions, brace patterns and character classes are ignored, which can only
+  block more.
 - **The scan uses the folder Hermes runs in** when a command gives a relative path. A tool with
   its own working folder, a remote backend or a container may be reading somewhere the scan did
   not look. This is a real gap, not a formality.
 - **Command parsing is a small grammar, not a shell.** Quotes, `;`, `|`, `&&`, `$(...)`,
   backticks, `sh -c` and `eval` are handled. Here-documents, aliases, functions, variables holding
-  command names and scripts on disk are not. An option the tables do not know makes a `grep`/`rg`
-  call "not understood", and the working folder is then scanned as well as any folder named.
+  command names and scripts on disk are not. Whether a `grep` call is recursive, and
+  which folders it names, are read from the raw arguments, so a misread option can only add
+  scanning. An option the tables do not know, or one whose value is optional in some `grep`
+  builds, makes the call "not understood": the working folder is then scanned as well.
 - **Some ordinary commands are now refused.** `cat $(...)`, `find . -exec grep ...`,
   `sh -c "$CMD"` and `grep -r` in a project that keeps a `.env` file are blocked; name the files
   or a subfolder instead. `rg` skips dotfiles by default, so a hidden `.env` does not block it
@@ -289,8 +299,9 @@ quietly overclaim).
 1.1 matrix: named secret files, folder-wide reads, globs, command substitution, environment reads,
 `file://` addresses, the ordinary commands that must keep working, the encoded forms that are
 redacted, and the known limits that are not. It also holds a regression for each finding of the
-independent review of the first 1.1 candidate (option parsing, path-aware search filters, shell
-wrappers, bounded work, scan errors, mixed wrapped output and short values).
+two independent reviews of the 1.1 candidates, and differential tests that really run the
+installed `grep` and ripgrep in the synthetic tree: whenever the tool prints the synthetic value,
+the gate must have blocked that command or search filter.
 
 `tests/e2e_canary.sh` runs the same attacks against a real Hermes agent in a throwaway home and
 throwaway keychain, and requires positive evidence for each result. See the script header for setup.

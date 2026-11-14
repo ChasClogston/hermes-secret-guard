@@ -6,7 +6,7 @@ keychain, no network. Synthetic files and one synthetic value in a temporary fol
 Each row states the expected result. Rows marked KNOWN LIMIT document what layer 1 cannot see;
 layer 2 (value redaction) is the control there.
 """
-import base64, importlib.util, json, os, shutil, sys, tempfile, unittest, urllib.parse
+import base64, importlib.util, json, os, shutil, subprocess, sys, tempfile, unittest, urllib.parse
 from unittest import mock
 
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,23 +23,27 @@ def T(command):
     return ("terminal", {"command": command})
 
 
-class GateMatrix(unittest.TestCase):
+class Fixture(unittest.TestCase):
+    """Shared synthetic tree. Holds no tests of its own."""
     @classmethod
     def setUpClass(cls):
         cls.old = os.getcwd()
         cls.base = os.path.realpath(tempfile.mkdtemp(prefix="sg-gate-"))
         w = cls.w = os.path.join(cls.base, "work")
         for d in ("sub", "clean/src", "hidden_only", "nested/a/b/c/d/e/f/g", "nprod", "tokdir",
-                  "proj/node_modules/pkg", "proj/src"):
+                  "proj/node_modules/pkg", "proj/src", "placeholder", "deps/venv", "deps/__pycache__"):
             os.makedirs(os.path.join(w, d))
         cls.deep = os.path.join(cls.base, "deep", *"abcdefghijklmn")   # beyond the scan depth
         os.makedirs(cls.deep)
-        files = {".env": "DRILL_FAKE_KEY=" + VALUE + "\n", "notes.txt": "hello\n", "sub/prod.env": "X=1\n",
+        S = "DRILL_FAKE_KEY=" + VALUE + "\n"
+        files = {".env": S, "notes.txt": "hello\n", "sub/prod.env": S, "patfile": "drill\n",
+                 "placeholder/.env.example": S, "placeholder/a.txt": "x\n", "deps/venv/prod.env": S,
+                 "deps/__pycache__/prod.env": S, "clean/src/tokenized-secrets.py": "x\n",
                  "clean/src/app.py": "print(1)\n", "clean/tokenizer.json": "{}\n", "clean/readme.md": "x\n",
-                 "clean/.env.example": "KEY=changeme\n", "clean/src/credential_files.cpython-314.pyc": "x",
-                 "hidden_only/.env": "X=1\n", "hidden_only/a.txt": "x\n", "nested/a/b/c/d/e/f/g/x.txt": "x\n",
-                 "nprod/prod.env": "X=1\n", "tokdir/access-token.txt": "x\n",
-                 "proj/node_modules/pkg/prod.env": "X=1\n", "proj/src/a.py": "x\n"}
+                 "clean/src/credential_files.cpython-314.pyc": "x",
+                 "hidden_only/.env": S, "hidden_only/a.txt": "x\n", "nested/a/b/c/d/e/f/g/x.txt": "x\n",
+                 "nprod/prod.env": S, "tokdir/access-token.txt": "x\n", "tokdir/tokenized-secrets.json": "x\n",
+                 "proj/node_modules/pkg/prod.env": S, "proj/src/a.py": "x\n"}
         for rel, text in files.items():
             with open(os.path.join(w, rel), "w") as fh:
                 fh.write(text)
@@ -59,6 +63,8 @@ class GateMatrix(unittest.TestCase):
                for got in [self.verdict(tool, args)] if got != want]
         self.assertEqual(bad, [], "\n".join(f"{l}: want {w}, got {g}" for l, w, g in bad))
 
+
+class GateMatrix(Fixture):
     def test_named_secret_files_stay_blocked(self):
         w = self.w
         self.run_rows([
@@ -143,8 +149,7 @@ class GateMatrix(unittest.TestCase):
             ("search_files file_glob=*.py over secret folder", ("search_files", {"pattern": "x", "path": w, "file_glob": "*.py"}), "allowed"),
             ("search_files names only", ("search_files", {"pattern": "*.env", "path": w, "target": "files"}), "allowed"),
             ("search_files single ordinary file", ("search_files", {"pattern": "h", "path": w + "/notes.txt"}), "allowed"),
-            ("grep -r clean folder (tokenizer.json, .env.example, credential .pyc present)", T("grep -r print clean"), "allowed"),
-            ("direct read of .env.example is still blocked", T("cat clean/.env.example"), "blocked"),
+            ("grep -r clean folder (tokenizer.json, credential .pyc present)", T("grep -r print clean"), "allowed"),
             ("grep without -r on a file", T("grep hello notes.txt"), "allowed"),
             ("grep -r in an 8-level clean folder", T("grep -r x nested"), "allowed"),
             ("rg in hidden_only (dotfiles skipped)", T("rg X hidden_only"), "allowed"),
@@ -174,17 +179,9 @@ class GateMatrix(unittest.TestCase):
         ])
 
 
-class ReviewFindings(GateMatrix):
-    """Regressions for the independent review of 490fb4d (SG-PR1-01 .. 07). Expected results are
-    the reviewer's: none was changed to bless a bypass."""
-
-    def test_named_secret_files_stay_blocked(self): pass
-    def test_folder_wide_reads_now_blocked(self): pass
-    def test_globs_and_substitution_now_blocked(self): pass
-    def test_environment_reads_now_blocked(self): pass
-    def test_file_urls_now_blocked(self): pass
-    def test_ordinary_work_still_allowed(self): pass
-    def test_known_limits_documented(self): pass
+class ReviewFindings(Fixture):
+    """Regressions for the independent reviews of 490fb4d (SG-PR1-01 .. 07) and 0143557 (R1 .. R3).
+    Expected results are the reviewer's: none was changed to bless a bypass."""
 
     def test_02_recursive_search_options(self):
         self.run_rows([
@@ -207,8 +204,25 @@ class ReviewFindings(GateMatrix):
             ("grep -r reads node_modules", T("grep -r X proj"), "blocked"),
             ("tar reads node_modules", T("tar cf /tmp/p.tar proj"), "blocked"),
             # controls that must keep working
-            ("rg skips node_modules by default", T("rg X proj"), "allowed"),
+            ("R3: rg reads node_modules when nothing ignores it", T("rg X proj"), "blocked"),
+            ("R3: rg reads venv", T("rg X deps"), "blocked"),
+            ("R3: ag is scanned the same way", T("ag X proj"), "blocked"),
             ("rg --no-ignore reads node_modules", T("rg --no-ignore X proj"), "blocked"),
+            ("R1: grep --color -r", T("grep --color -r X hidden_only"), "blocked"),
+            ("R1: grep --colour -r", T("grep --colour -r X hidden_only"), "blocked"),
+            ("R1: grep --color=always -r", T("grep --color=always -r X hidden_only"), "blocked"),
+            ("R1: grep -r --color=never", T("grep -r --color=never X hidden_only"), "blocked"),
+            ("R1: grep -R --color", T("grep -R --color X hidden_only"), "blocked"),
+            ("R1: grep -C -r (BSD optional value)", T("grep -C -r X hidden_only"), "blocked"),
+            ("R1: grep --context -r", T("grep --context -r X hidden_only"), "blocked"),
+            ("R1: grep -C 2 -r", T("grep -C 2 -r X hidden_only"), "blocked"),
+            ("R1: a swallowed folder is still scanned", T("grep -r --frob hidden_only X notes.txt"), "blocked"),
+            ("placeholder env file blocks a folder search", T("grep -r x placeholder"), "blocked"),
+            ("tokenized-secrets.json is not exempt", T("grep -r x tokdir"), "blocked"),
+            ("R1 control: grep --color -r in a clean folder", T("grep --color -r print clean"), "allowed"),
+            ("R1 control: grep --color=always -rn clean", T("grep --color=always -rn print clean"), "allowed"),
+            ("R1 control: grep -C 2 -r clean", T("grep -C 2 -r print clean"), "allowed"),
+            ("R1 control: non-recursive grep --color on a file", T("grep --color hello notes.txt"), "allowed"),
             ("grep -rePATTERN clean (attached value)", T("grep -rePATTERN clean"), "allowed"),
             ("grep -r -e A -e B clean", T("grep -r -e a -e b clean"), "allowed"),
             ("grep -r -- PATTERN clean", T("grep -r -- x clean"), "allowed"),
@@ -230,6 +244,12 @@ class ReviewFindings(GateMatrix):
             ("file_glob exclusion is not proof of safety", S(file_glob="!*.py"), "blocked"),
             ("file_glob braces not modelled", S(file_glob="*.{py,env}"), "blocked"),
             ("file_glob *.env", S(file_glob="*.env"), "blocked"),
+            ("R2: **/[!x]*.env", S(file_glob="**/[!x]*.env"), "blocked"),
+            ("R2: sub/[!x]*.env", S(file_glob="sub/[!x]*.env"), "blocked"),
+            ("R2: [^x]*.env", S(file_glob="[^x]*.env"), "blocked"),
+            ("R2: range class p[a-z]od.env", S(file_glob="p[a-z]od.env"), "blocked"),
+            ("R2: literal ] in class", S(file_glob="[]p]rod.env"), "blocked"),
+            ("R2: class in a clean-looking filter is not modelled", S(file_glob="*.p[y]"), "blocked"),
             ("file_glob *.py", S(file_glob="*.py"), "allowed"),
             ("file_glob **/*.py", S(file_glob="**/*.py"), "allowed"),
             ("file_glob clean/src/*.py", S(file_glob="clean/src/*.py"), "allowed"),
@@ -310,6 +330,90 @@ class ReviewFindings(GateMatrix):
             self.assertEqual(self.verdict(*T("grep -r x clean")), "blocked")
         self.assertEqual(self.verdict(*T("grep -r x clean")), "allowed")
         self.assertNotIn(VALUE, guard.check_tool_args("terminal", {"command": "grep -r x ."}) or "")
+
+
+class Differential(Fixture):
+    """Tool versus gate. Each command is really run in the synthetic tree; if its output contains
+    the synthetic value, the gate must have blocked it. One direction only: the gate may block
+    more than the tool reads. Uses whatever grep is installed (GNU, BSD or ugrep) and ripgrep when
+    present; rows for a missing tool are skipped."""
+
+    def reads_value(self, command):
+        try:
+            r = subprocess.run(command, shell=True, cwd=self.w, capture_output=True, text=True, timeout=20,
+                               stdin=subprocess.DEVNULL, env={**os.environ, "RIPGREP_CONFIG_PATH": "", "GREP_OPTIONS": ""})
+        except subprocess.TimeoutExpired:
+            return False
+        return VALUE in r.stdout
+
+    def check(self, commands):
+        read, missed = 0, []
+        for c in commands:
+            if self.reads_value(c):
+                read += 1
+                if self.verdict("terminal", {"command": c}) != "blocked":
+                    missed.append(c)
+        self.assertEqual(missed, [], "the tool printed the value and the gate allowed it")
+        return read
+
+    def test_grep_reads_imply_block(self):
+        if not shutil.which("grep"):
+            self.skipTest("no grep")
+        n = self.check([
+            "grep -r drill hidden_only", "grep -R drill hidden_only", "grep --color -r drill hidden_only",
+            "grep --colour -r drill hidden_only", "grep --color=always -r drill hidden_only",
+            "grep --color=never -R drill hidden_only", "grep -r --color drill hidden_only",
+            "grep -C -r drill hidden_only", "grep -C 1 -r drill hidden_only", "grep -C1 -r drill hidden_only",
+            "grep --context -r drill hidden_only", "grep --context=1 -r drill hidden_only",
+            "grep -A 1 -r drill hidden_only", "grep -rA1 drill hidden_only", "grep -rn drill hidden_only",
+            "grep -rh drill", "grep -r drill", "grep -r drill .", "grep -ri DRILL .", "grep -r -e drill -e other",
+            "grep -re drill", "grep -r --regexp=drill", "grep -r -f patfile hidden_only", "grep -r drill n*",
+            "grep -r drill h*", "grep -r --include='*.env' drill .", "grep -r --include '*.env' drill .",
+            "grep -r --exclude-dir=clean drill .", "grep -r --exclude='*.py' drill sub",
+            "grep -d recurse drill hidden_only", "grep --directories=recurse drill hidden_only",
+            "grep -r -- drill hidden_only", "grep -r --null drill hidden_only", "grep -r -m 1 drill hidden_only",
+            "grep -r --binary-files=text drill hidden_only", "grep -rs drill proj", "grep -r drill deps",
+            "grep -r drill placeholder", "grep -rl drill . | head -1; grep -r drill sub",
+            "sh -c 'grep --color -r drill hidden_only'", "egrep -r drill hidden_only", "fgrep -r drill hidden_only",
+            "grep --color drill notes.txt", "grep -r print clean", "grep --color -r print clean",
+        ])
+        self.assertGreater(n, 10, "the grep here printed the value for too few rows to mean anything")
+
+    def test_ripgrep_reads_imply_block(self):
+        if not shutil.which("rg"):
+            self.skipTest("no ripgrep")
+        n = self.check([
+            "rg drill", "rg drill .", "rg drill sub", "rg -uu drill hidden_only", "rg -uun drill hidden_only",
+            "rg -uuu drill hidden_only", "rg -u -u drill hidden_only", "rg --hidden drill hidden_only",
+            "rg -. drill hidden_only", "rg --hidden -g '*' drill", "rg -g '.env' drill hidden_only",
+            "rg --glob '.env' drill hidden_only", "rg --glob='*.env' drill", "rg -g'*.env' drill",
+            "rg drill proj", "rg drill deps", "rg --no-ignore drill proj", "rg -e drill -e other",
+            "rg --regexp drill", "rg --color always drill sub", "rg --color=never drill sub", "rg -C 1 drill sub",
+            "rg -C1 drill sub", "rg --sort path drill sub", "rg -n -i DRILL sub", "rg drill n*", "rg drill s*",
+            "rg --hidden --glob '**/[!x]*.env' drill .", "rg --unrestricted --unrestricted drill hidden_only",
+            "rg -L drill sub", "rg --no-config drill sub", "rg -j 1 drill sub", "rg -M 500 drill sub",
+            "rg --max-depth 5 drill", "rg -t py drill", "rg --type-not py drill sub", "rg -- drill sub",
+            "rg -u drill hidden_only", "rg drill hidden_only", "rg print clean", "rg drill placeholder",
+            "rg --hidden drill placeholder", "sh -c 'rg -uu drill hidden_only'",
+        ])
+        self.assertGreater(n, 10)
+
+    def test_search_filter_selection_implies_block(self):
+        if not shutil.which("rg"):
+            self.skipTest("no ripgrep")
+        globs = ["*.env", "**/*.env", "sub/*.env", "**/[!x]*.env", "sub/[!x]*.env", "[^x]*.env", "*.[e]nv", "sub/**",
+                 "*.{py,env}", "!*.py", "**/prod.*", "p*", "*.py", "clean/**", "?rod.env", "**/sub/*", "/sub/prod.env",
+                 "**/node_modules/**", "deps/*/prod.env", "**/.env", ".env", "[]p]rod.env", "p[a-z]od.env", "*.e?v",
+                 "**", "*", "hidden_only/.*", "**/.e*", "nprod/prod.env", "*/prod.env"]
+        read, missed = 0, []
+        for g in globs:
+            cmd = "rg --hidden --no-ignore --glob " + "'" + g + "'" + " drill ."
+            if self.reads_value(cmd):
+                read += 1
+                if self.verdict("search_files", {"pattern": "drill", "path": self.w, "file_glob": g}) != "blocked":
+                    missed.append(g)
+        self.assertEqual(missed, [], "ripgrep selected a secret file under this filter and the gate allowed it")
+        self.assertGreater(read, 10)
 
 
 class EncodedForms(unittest.TestCase):
