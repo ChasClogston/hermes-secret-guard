@@ -80,8 +80,48 @@ if act:
                 raise OSError(5, act.get("text", "boom"))
         return data
     os.read = acting
+late = opts.get("late")
+if late:
+    import time as _t
+    class Clock:                               # the scanner's clock, which a hook can push past the deadline
+        jump = 0.0
+        @staticmethod
+        def monotonic():
+            return _t.monotonic() + Clock.jump
+    hs.time = Clock
+    calls = {"n": 0}
+    def at(nth, what):
+        calls["n"] += 1
+        if calls["n"] == nth:
+            if what == "late":
+                Clock.jump = 100000.0
+            elif what == "crash":
+                raise RuntimeError(opts.get("text", "boom"))
+            elif what == "oserror":
+                raise OSError(5, opts.get("text", "boom"))
+    kind, nth, what = late["hook"], late["nth"], late["what"]
+    if kind == "entry":
+        real_e = hs._entry_identity
+        def entry(fd, name):
+            at(nth, what); return real_e(fd, name)
+        hs._entry_identity = entry
+    elif kind == "fstat":
+        real_f = os.fstat
+        def fstat(fd):
+            at(nth, what); return real_f(fd)
+        os.fstat = fstat
+    elif kind == "count":
+        real_c = hs._count_flag
+        def count(d, bit):
+            at(nth, what); return real_c(d, bit)
+        hs._count_flag = count
+def open_fds():
+    return len(os.listdir("/dev/fd"))
+before_fds = open_fds()
+t_start = __import__("time").time()
 res = hs.scan_artifacts(opts["home"], text_cancelled=bool(opts.get("text_cancelled")))
-print(json.dumps({"res": res, "text": hs.render_artifacts(res), "trace": trace,
+t_end = __import__("time").time()
+print(json.dumps({"res": res, "text": hs.render_artifacts(res), "trace": trace, "fd_delta": open_fds() - before_fds, "window": [t_start, t_end],
                   "mods": sorted(m for m in sys.modules if m.split(".")[0] in ("sqlite3", "_sqlite3", "socket", "subprocess", "mmap", "fcntl"))}))
 '''
 
@@ -478,6 +518,47 @@ print(json.dumps({"text": text, "art": art, "moved": hs._home_moved(home, pinned
         self.assertEqual(data["artifact_scope"]["artifacts"]["state.db"]["occurrences"]["provider-key-prefix"], 2)   # the opened folder, not the swapped-in one
         self.assertTrue(data["artifact_scope"]["scope_finished"])
 
+    def test_command_fails_closed_when_the_home_cannot_be_pinned(self):
+        """If the first open of the home fails, neither scope runs. Before this, each scope opened the path
+        for itself, so a path re-pointed in between gave two folders and one finished result."""
+        import errno
+        for code in (errno.ENOENT, errno.EACCES, errno.EIO):
+            for extra in ((), ("--database-artifacts",)):
+                shutil.rmtree(self.base); os.makedirs(self.home)
+                self.two_homes()
+                wrapper = ("import os, sys; sys.path.insert(0, %r); import history_scan as hs\n"
+                           "real, home, n = os.open, %r, {'home': 0, 'other': 0, 'read': 0}\n"
+                           "def opening(path, flags, *a, **k):\n"
+                           "    if path == home:\n"
+                           "        n['home'] += 1\n"
+                           "        if n['home'] == 1:\n"
+                           "            raise OSError(%d, 'synthetic')\n"                    # later opens of the path would succeed
+                           "    else:\n"
+                           "        n['other'] += 1\n"
+                           "    return real(path, flags, *a, **k)\n"
+                           "os.open = opening\n"
+                           "real_read = os.read\n"
+                           "def reading(fd, size):\n"
+                           "    n['read'] += 1; return real_read(fd, size)\n"
+                           "os.read = reading\n"
+                           "code = hs.main(['--home', home, '--json', *%r])\n"
+                           "sys.stderr.write('opens %%d %%d reads %%d' %% (n['home'], n['other'], n['read']))\n"
+                           "sys.exit(code)\n" % (REPO, self.home, code, list(extra)))
+                code_out, out, err = Invocation.cli(self, cmd=[sys.executable, "-c", wrapper])
+                self.assertEqual((code_out, err), (1, "opens 1 0 reads 0"), (code, extra))           # one failed open, then nothing opened or read
+                data = json.loads(out)
+                text = data["text_scope"] if extra else data
+                self.assertEqual((text["run"], text["complete"]), (["home_unavailable"], False))
+                self.assertEqual(sum(text["kinds"][k]["bytes_read"] + text["kinds"][k]["files_inspected"] for k in text["kinds"]), 0)
+                if extra:
+                    art = data["artifact_scope"]
+                    self.assertEqual((data["complete"], art["scope_finished"], art["run"]), (False, False, ["home_unavailable"]))
+                    self.assertEqual([a["status"] for a in art["artifacts"].values()], ["not_reached", "not_reached"])
+        code_out, out, err = Invocation.cli(self, "--home", os.path.join(self.base, "missing"), "--database-artifacts")
+        self.assertEqual(code_out, 1)
+        self.assertIn("run notes: home_unavailable", out); self.assertIn("artifact run notes: home_unavailable", out)
+        self.assertIn("NOT both finished", out)
+
     def test_unmoved_run_has_no_aggregate_note(self):
         self.two_homes()
         code, out, err = Invocation.cli(self, "--home", self.home, "--database-artifacts", "--json")
@@ -656,18 +737,75 @@ class Bounds(DB):
         self.assertEqual((db["occurrences"]["provider-key-prefix"], wal["occurrences"]["provider-key-prefix"]), (60, 60))   # occurrences stay exact
         self.assertEqual(out["res"]["combined_distinct_candidates"]["provider-key-prefix"], 70)                             # one map for both
         self.assertEqual((out["res"]["scope_finished"], out["res"]["run"]), (False, ["distinct_limit_reached"]))
+        # a capped count is marked as a lower bound in the JSON and in the printed summary, per file and combined
+        self.assertTrue(out["res"]["distinct_counts_are_lower_bounds"])
+        self.assertEqual((db["distinct_is_lower_bound"], wal["distinct_is_lower_bound"]), (True, True))
+        self.assertIn("at least 70 (limit reached: a lower bound)", out["text"])
+        self.assertEqual(out["text"].count("limit reached: a lower bound"), 6)             # two categories per file, two combined
+        self.assertIn("Occurrences are exact; every distinct figure above is a lower bound.", out["text"])
+        self.assertNotRegex(out["text"], r"occurrences \d+, distinct \d")                   # no unqualified distinct figure is left
         out = run_scan(self.home)
         db, wal = self.arts(out)
         self.assertEqual((db["distinct_candidates"]["provider-key-prefix"], wal["distinct_candidates"]["provider-key-prefix"],
                           out["res"]["combined_distinct_candidates"]["provider-key-prefix"]), (60, 60, 100))
+        self.assertFalse(out["res"]["distinct_counts_are_lower_bounds"])
+        self.assertEqual((db["distinct_is_lower_bound"], wal["distinct_is_lower_bound"]), (False, False))
+        self.assertNotIn("lower bound", out["text"]); self.assertNotIn("at least", out["text"])
+
+    def two_files(self):
+        with open(self.db, "wb") as fh:
+            fh.write(b" " + key(1).encode() + b" " * 5000)
+        with open(self.wal, "wb") as fh:
+            fh.write(b" " + key(2).encode() + b" " * 5000)
+
+    def test_budget_that_runs_out_during_the_end_checks_is_not_a_finished_scope(self):
+        """Time lost after the last read still counts. The clock is pushed past the deadline inside the
+        end-of-scan entry check, the end-of-scan descriptor check, and the final counting, in turn.
+        Nothing sleeps: the scanner's clock is moved. Every case must end not finished, with both
+        files fully read, the descriptors closed and only a fixed label reported."""
+        self.two_files()
+        clean = run_scan(self.home, late={"hook": "entry", "nth": 99, "what": "late"})          # hooks installed, never fired
+        self.assertEqual((clean["res"]["scope_finished"], clean["res"]["run"], clean["fd_delta"]), (True, [], 0))
+        for hook, nth in (("entry", 3), ("entry", 4), ("fstat", 3), ("fstat", 4), ("count", 1), ("count", 4)):
+            out = run_scan(self.home, late={"hook": hook, "nth": nth, "what": "late"})
+            db, wal = self.arts(out)
+            self.assertEqual((out["res"]["scope_finished"], out["res"]["run"]), (False, ["time_budget_reached"]), (hook, nth))
+            self.assertEqual((db["traversal_finished"], wal["traversal_finished"]), (True, True), (hook, nth))
+            self.assertEqual((db["occurrences"]["provider-key-prefix"], wal["occurrences"]["provider-key-prefix"]), (1, 1))
+            self.assertEqual((out["fd_delta"], out["stderr"]), (0, ""), (hook, nth))
+            self.assertIn("NOT FINISHED", out["text"])
+
+    def test_expired_budget_starts_no_further_open(self):
+        self.two_files()
+        out = run_scan(self.home, late={"hook": "entry", "nth": 1, "what": "late"})             # expires at the first identity check
+        db, wal = self.arts(out)
+        self.assertEqual((out["res"]["scope_finished"], out["res"]["run"]), (False, ["time_budget_reached"]))
+        self.assertEqual((db["bytes_read"], wal["bytes_read"], wal["status"], out["fd_delta"]), (0, 0, "not_reached", 0))
+        self.assertGreater(db["extent_bytes"], 0)                # the open already under way is completed
+        self.assertEqual(wal["extent_bytes"], 0)                 # the next one is never started
+
+    def test_failures_after_an_open_and_during_cleanup_leak_no_descriptor(self):
+        """A descriptor is registered as soon as it is open, and each artifact's end check stands alone."""
+        self.two_files()
+        text = NEIGHBOUR + key(9)
+        out = run_scan(self.home, late={"hook": "fstat", "nth": 1, "what": "oserror", "text": text})    # fails right after the first open
+        db, wal = self.arts(out)
+        self.assertEqual((db["status"], wal["status"], out["fd_delta"], out["res"]["scope_finished"]), ("unreadable", "scanned", 0, False))
+        for hook, nth in (("entry", 3), ("entry", 4)):                                                 # an unexpected error inside one end check
+            out = run_scan(self.home, late={"hook": hook, "nth": nth, "what": "crash", "text": text})
+            self.assertEqual((out["res"]["scope_finished"], out["res"]["run"], out["fd_delta"]), (False, ["internal_error"], 0), (hook, nth))
+            self.assertNotIn(NEIGHBOUR, out["text"] + json.dumps(out["res"]) + out["stderr"])
+        out = run_scan(self.home, late={"hook": "count", "nth": 2, "what": "crash", "text": text})      # and inside the final counting
+        self.assertEqual((out["res"]["scope_finished"], out["res"]["run"], out["fd_delta"]), (False, ["internal_error"], 0))
+        self.assertNotIn(NEIGHBOUR, out["text"] + json.dumps(out["res"]) + out["stderr"])
 
 
 class NoLeak(DB):
     def vocabulary(self):
         r = subprocess.run([sys.executable, "-c", "import sys, json; sys.path.insert(0, %r); import history_scan as h; "
-                            "r = {'artifacts': {n: h._new_artifact() for n in h.ARTIFACTS}, 'contract': h.ARTIFACT_CONTRACT, 'run': [], "
-                            "'combined_distinct_candidates': {c: 0 for c in h.CATEGORIES if c != 'private-key-header'}, 'scope_finished': False, 'snapshot_established': False}; "
-                            "print(h.render_artifacts(r) + json.dumps(r) + ' '.join(h.ARTIFACT_STATUS + h.ARTIFACT_CHANGES + h.ARTIFACT_RUN_LABELS))" % REPO],
+                            "r = h._new_artifact_result(); low = h._new_artifact_result(); low['distinct_counts_are_lower_bounds'] = True\n"
+                            "for a in low['artifacts'].values(): a['distinct_is_lower_bound'] = True\n"
+                            "print(h.render_artifacts(r) + h.render_artifacts(low) + json.dumps(r) + ' '.join(h.ARTIFACT_STATUS + h.ARTIFACT_CHANGES + h.ARTIFACT_RUN_LABELS))" % REPO],
                            capture_output=True, text=True)
         return set(re.findall(r"[A-Za-z_]+", r.stdout + " yes no true false finished partial inconclusive result")) | {"db", "wal", "state"}
 
@@ -777,32 +915,46 @@ class Evidence(DB):
         self.assertTrue(control["write_opens"] or control["shm"], control)
 
     def test_writer_is_measured_against_a_baseline(self):
-        """A concurrent synthetic writer, with and without the scanner. Numbers are reported, not asserted
-        equal: this is a measurement, and it is not proof of non-interference."""
+        """A synthetic writer that keeps writing for the whole life of three scanner processes, against the
+        same writer alone. Recorded for every passive checkpoint: the blocked flag, the frames in the
+        log and the frames checkpointed. This is a measurement on one fixture. It is not proof that a
+        scan cannot disturb a writer."""
         c = self.connect(autocheckpoint=0)
         for i in range(300):
             c.execute("INSERT INTO messages(session_id, role, content) VALUES ('s','u',?)", ("x" * 2000 + key(i),))
 
-        def burst():
-            errors, busy, t0 = 0, 0, time.monotonic()
-            for i in range(120):
+        def burst(procs=()):
+            errors, checkpoints, i, t0, w0 = 0, [], 0, time.monotonic(), time.time()
+            while i < 120 or (any(p.poll() is None for p in procs) and i < 200000):
                 try:
                     c.execute("INSERT INTO messages(session_id, role, content) VALUES ('s','u',?)", ("y" * 800,))
                     if i % 20 == 19:
-                        busy += c.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()[0]
+                        checkpoints.append(tuple(c.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()))   # (blocked, log frames, checkpointed frames)
                 except sqlite3.Error:
                     errors += 1
-            return errors, busy, time.monotonic() - t0
+                i += 1
+            return {"errors": errors, "checkpoints": checkpoints, "inserts": i, "seconds": time.monotonic() - t0, "window": (w0, time.time())}
         base = burst()
+        w_start = time.time()
         scanners = [subprocess.Popen([sys.executable, "-c", RUNNER], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                      env={**os.environ, "SG_TEST_OPTS": json.dumps({"home": self.home, "repo": REPO}), "PYTHONDONTWRITEBYTECODE": "1"})
                     for _ in range(3)]
-        with_scan = burst()
+        with_scan = burst(scanners)
         results = [json.loads(p.communicate(timeout=120)[0]) for p in scanners]
-        self.assertEqual((base[0], base[1], with_scan[0], with_scan[1]), (0, 0, 0, 0))   # no writer error, no blocked checkpoint
+        for run in (base, with_scan):
+            self.assertEqual(run["errors"], 0)
+            self.assertTrue(run["checkpoints"])
+            for blocked, log, done in run["checkpoints"]:
+                self.assertEqual(blocked, 0)                      # the checkpoint was not blocked
+                self.assertEqual(log, done)                       # and it moved every frame in the log, not just some
+        for r in results:                                         # every scan ran inside the writer's window: the two did overlap
+            self.assertLessEqual(w_start, r["window"][0]); self.assertLessEqual(r["window"][1], with_scan["window"][1])
         self.assertEqual(c.execute("PRAGMA integrity_check").fetchone()[0], "ok")       # a check of the fixture, not a claim by the scanner
-        sys.stderr.write("\n[measurement] writer burst: %.3fs alone, %.3fs with 3 scanners; scans finished: %s\n"
-                         % (base[2], with_scan[2], [r["res"]["scope_finished"] for r in results]))
+        sys.stderr.write("\n[measurement] writer alone: %d inserts, %d checkpoints, %.3fs. With 3 scanners: %d inserts, %d checkpoints, %.3fs; "
+                         "scans that saw a change: %d of 3; scans finished: %s\n"
+                         % (base["inserts"], len(base["checkpoints"]), base["seconds"], with_scan["inserts"], len(with_scan["checkpoints"]),
+                            with_scan["seconds"], sum(1 for r in results if "source_change_observed" in r["res"]["run"]),
+                            [r["res"]["scope_finished"] for r in results]))
         c.close()
 
 

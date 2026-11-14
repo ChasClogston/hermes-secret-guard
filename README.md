@@ -263,8 +263,9 @@ CPU; it is not "zero impact".
   its prefix starts, with no rule about the byte before it, because a stored value sits
   directly against the bytes of its neighbouring fields. So a message that is exactly a key
   is found even though its role text comes right before it. The byte after a match must still
-  not be a key character. Matches never overlap: the leftmost wins and the search resumes
-  after it, and the result does not depend on where the read chunks fall.
+  not be a key character. Within each category, matches never overlap: the leftmost wins and
+  the search resumes after it, and the result does not depend on where the read chunks fall.
+  Categories are searched separately; one category does not suppress another.
 - **This is not a complete fix.** A key character right after the value hides it. Letters or
   digits right after it lengthen the match, so what is counted is not the stored value. A
   value longer than the shape allows is not matched. Two adjacent columns can form a key
@@ -291,18 +292,24 @@ Each is read up to its size at open; a growing log is not chased. Fixed limits: 
 file, 6 GiB for both, and 200,000 distinct candidates for both together in one map. There
 are two separate cooperative time budgets: 120 seconds for text and 600 seconds for this
 scope. They are checked between bounded steps and cannot interrupt a stalled system call, so
-they are not a hard limit on wall-clock time. The artifact scope has its own byte and time
+they are not a hard limit on wall-clock time. The artifact budget is looked at once more
+after the end-of-scan checks, the closes and the counting, so time lost in any of them
+cannot end in a finished scope. The artifact scope has its own byte and time
 allowance, so the text scope cannot starve it; `state.db` is read before the log, and a log
 that was not reached says `not_reached`. The author measured roughly 100 MiB per second on
 one development machine; that is a report, not a guarantee.
 
 **One home for both scopes.** The command opens the home folder once and both scopes read
-through that handle, so they read the same folder even if the path is re-pointed mid-run. If
+through that handle, so they read the same folder even if the path is re-pointed mid-run.
+If that first open fails, the command stops with `home_unavailable` and runs neither scope. If
 the path no longer names that folder at the end, the run adds `home_path_changed_during_run`
 and is not finished. The check is made at one moment: a path re-pointed and restored in
 between is not seen. Neither scope claims a snapshot.
 
-**Counting.** Occurrences and distinct candidates are shown per file. One combined figure is
+**Counting.** Occurrences and distinct candidates are shown per file. If the 200,000 limit is
+reached, occurrences stay exact and every distinct figure is marked as a lower bound: "at
+least N" in the printed summary, and `distinct_is_lower_bound` per file and
+`distinct_counts_are_lower_bounds` for the scope in the JSON. One combined figure is
 shown: the number of different matched byte strings across both files. It is not a pair, a
 row count or a count of confirmed secrets. Text-scope counts stay separate.
 

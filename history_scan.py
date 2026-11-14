@@ -35,8 +35,8 @@ OPTIONAL SECOND SCOPE, off unless you ask: --database-artifacts   (contract "art
     - Detection differs from the text scope in one way. A provider-key shape is matched wherever
       its prefix starts, with no rule about the byte before it, because inside a database record
       a stored value sits directly against the bytes of its neighbouring fields. The byte after
-      a match must still not be a key character. Matches never overlap: the leftmost wins, then
-      the search resumes after it. This is not a complete fix. A following key character, a
+      a match must still not be a key character. Within each category, matches never overlap:
+      the leftmost wins, then the search resumes after it. Categories are searched separately. This is not a complete fix. A following key character, a
       value longer than the shape allows, or a split across pages still hides or shortens a
       match, and accidental matches inside binary data are more likely than in text. The
       bot-token shape has no distinctive prefix and keeps its left-hand rule here.
@@ -50,6 +50,8 @@ OPTIONAL SECOND SCOPE, off unless you ask: --database-artifacts   (contract "art
     - Linux system-call traces back the "no write, no lock" statements in the tests. No such
       trace has been taken on macOS.
   Fixed limits: 4 GiB per file, 6 GiB for both, 200,000 distinct candidates for both together.
+  When that last limit is reached, occurrences stay exact and every distinct figure is marked as
+  a lower bound, in the printed summary and in the JSON.
   Two separate cooperative time budgets: 120 seconds for text, 600 seconds for this scope. They
   are checked between bounded steps and cannot interrupt a stalled system call, so they are not
   a hard limit on wall-clock time.
@@ -365,19 +367,29 @@ def _new_artifact() -> dict:
     return {"status": "not_reached", "traversal_finished": False, "source_change_observed": False,
             "snapshot_established": False, "bytes_read": 0, "extent_bytes": 0, "changes": [],
             "occurrences": {c: 0 for c in CATEGORIES}, "low_variety_also_counted": 0,
-            "distinct_candidates": {c: 0 for c, _p, d in DETECTORS if d}}
+            "distinct_candidates": {c: 0 for c, _p, d in DETECTORS if d}, "distinct_is_lower_bound": False}
+
+
+def _new_artifact_result() -> dict:
+    return {"contract": ARTIFACT_CONTRACT, "artifacts": {name: _new_artifact() for name in ARTIFACTS},
+            "combined_distinct_candidates": {c: 0 for c, _p, d in DETECTORS if d},
+            "distinct_counts_are_lower_bounds": False,
+            "snapshot_established": False, "run": [], "scope_finished": False}
+
+
+def _count_flag(digests: dict, bit: int) -> int:
+    """How many remembered candidates were seen in the artifact with this membership bit."""
+    return sum(1 for f in digests.values() if f & bit)
 
 
 def scan_artifacts(home: str, text_cancelled: bool = False, home_fd=None) -> dict:
-    """Contract artifact-bytes-v1: read state.db and state.db-wal of one home as plain bytes.
+    """The artifact scope (contract in ARTIFACT_CONTRACT): read state.db and state.db-wal of one home as plain bytes.
 
     Never raises. Imports and uses no SQLite. Given an open directory descriptor, it reads through that
     and leaves it open for the caller. Both files are opened first and checked again after
     both have been read, so the change check spans the whole read. Extent is each file's size at
     open. One digest map with a membership flag per artifact holds the distinct candidates."""
-    res = {"contract": ARTIFACT_CONTRACT, "artifacts": {name: _new_artifact() for name in ARTIFACTS},
-           "combined_distinct_candidates": {c: 0 for c, _p, d in DETECTORS if d},
-           "snapshot_established": False, "run": [], "scope_finished": False}
+    res = _new_artifact_result()
     art = res["artifacts"]
 
     def note(label):
@@ -394,7 +406,7 @@ def scan_artifacts(home: str, text_cancelled: bool = False, home_fd=None) -> dic
     seen = {c: {} for c in res["combined_distinct_candidates"]}      # category -> {digest: membership flags}
     state = {"total": 0, "distinct": 0, "overflow": False}
     deadline = time.monotonic() + ART_TIME_BUDGET_S
-    opened, owns_home = {}, home_fd is None
+    opened, fds, owns_home = {}, [], home_fd is None      # fds: every descriptor this call opened, closed at the end whatever happens
 
     def tick():
         if time.monotonic() > deadline:
@@ -409,6 +421,7 @@ def scan_artifacts(home: str, text_cancelled: bool = False, home_fd=None) -> dic
                 return res
         # --- open both first, so the change check covers the whole read
         for name in ARTIFACTS:
+            tick()                                 # an expired budget starts no further opens
             a = art[name]
             ident = _entry_identity(home_fd, name)
             if ident == "absent":
@@ -427,9 +440,14 @@ def scan_artifacts(home: str, text_cancelled: bool = False, home_fd=None) -> dic
                                else "absent" if exc.errno == errno.ENOENT else "unreadable")
                 opened[name] = (None, None, ident)
                 continue
-            st = os.fstat(fd)
+            fds.append(fd)                         # registered before anything else can fail
+            try:
+                st = os.fstat(fd)
+            except OSError:
+                a["status"] = "unreadable"
+                opened[name] = (None, None, ident)
+                continue
             if not stat.S_ISREG(st.st_mode):
-                os.close(fd)
                 a["status"] = "not_a_regular_file"
                 opened[name] = (None, None, ident)
                 continue
@@ -500,11 +518,12 @@ def scan_artifacts(home: str, text_cancelled: bool = False, home_fd=None) -> dic
     except BaseException:
         note("internal_error")
     finally:
-        # --- end checks on both, whatever happened: entry identity and open descriptor, start against end
-        try:
-            for name in ARTIFACTS:
-                if name not in opened or home_fd is None:
-                    continue
+        # --- end checks, whatever happened: entry identity and open descriptor, start against end. Each
+        # artifact is checked on its own, so a failure on one cannot skip the other or the closes below.
+        for name in ARTIFACTS:
+            if name not in opened or home_fd is None:
+                continue
+            try:
                 fd, st, ident0 = opened[name]
                 a = art[name]
                 ident1 = _entry_identity(home_fd, name)
@@ -527,24 +546,38 @@ def scan_artifacts(home: str, text_cancelled: bool = False, home_fd=None) -> dic
                             a["changes"].append("replaced")
                     except OSError:
                         a["changes"].append("modified")
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
                 a["source_change_observed"] = bool(a["changes"])
-            if home_fd is not None and owns_home:
-                os.close(home_fd)
-        except BaseException:
-            note("internal_error")
-    for name_flag, name in enumerate(ARTIFACTS):
+            except KeyboardInterrupt:
+                note("cancelled")
+            except BaseException:
+                note("internal_error")
+        for fd in fds + ([home_fd] if (home_fd is not None and owns_home) else []):
+            try:
+                os.close(fd)
+            except BaseException:
+                pass
+    try:
+        for name_flag, name in enumerate(ARTIFACTS):
+            for c in seen:
+                art[name]["distinct_candidates"][c] = _count_flag(seen[c], 1 << name_flag)
         for c in seen:
-            art[name]["distinct_candidates"][c] = sum(1 for f in seen[c].values() if f & (1 << name_flag))
-    for c in seen:
-        res["combined_distinct_candidates"][c] = len(seen[c])
+            res["combined_distinct_candidates"][c] = len(seen[c])
+    except KeyboardInterrupt:
+        note("cancelled")
+    except BaseException:
+        note("internal_error")
     if state["overflow"]:
-        note("distinct_limit_reached")             # distinct counts, per file and combined, are lower bounds
+        note("distinct_limit_reached")             # occurrences stay exact; every distinct count is a lower bound
+        res["distinct_counts_are_lower_bounds"] = True
+        for name in ARTIFACTS:
+            art[name]["distinct_is_lower_bound"] = True
     if any(art[n]["source_change_observed"] for n in ARTIFACTS):
         note("source_change_observed")
+    # The deadline is looked at once more here, after the end checks, the closes and the counting, so
+    # time lost in any of them cannot end in a finished scope. It is still cooperative: it is seen when
+    # a slow step returns, and it cannot interrupt one.
+    if time.monotonic() > deadline:
+        note("time_budget_reached")
     db, wal = art["state.db"], art["state.db-wal"]
     if db["status"] == "absent" and "home_unavailable" not in res["run"]:
         note("database_absent")                    # a missing database is not a successful database scan
@@ -580,12 +613,16 @@ def render_artifacts(res: dict) -> str:
                       "yes (" + ", ".join(a["changes"]) + ")" if a["changes"] else "no"))
         for c in CATEGORIES:
             distinct = a["distinct_candidates"].get(c)
-            out.append("    %-22s occurrences %d, %s" % (c, a["occurrences"][c], "distinct %d" % distinct if distinct is not None
+            word = "distinct at least %d (limit reached: a lower bound)" if a["distinct_is_lower_bound"] else "distinct %d"
+            out.append("    %-22s occurrences %d, %s" % (c, a["occurrences"][c], word % distinct if distinct is not None
                                                           else "distinct not counted (header only)"))
         out.append("    of those, low-variety (also counted) %d" % a["low_variety_also_counted"])
     out.append("different matched byte strings across both files (not a verified pair, not rows, not confirmed secrets):")
+    low = res["distinct_counts_are_lower_bounds"]
     for c, n in res["combined_distinct_candidates"].items():
-        out.append("    %-22s %d" % (c, n))
+        out.append("    %-22s %s%d%s" % (c, "at least " if low else "", n, " (limit reached: a lower bound)" if low else ""))
+    if low:
+        out.append("The distinct-candidate limit was reached. Occurrences are exact; every distinct figure above is a lower bound.")
     out.append("artifact run notes: " + (", ".join(res["run"]) if res["run"] else "none"))
     out.append("Artifact scope " + ("finished." if res["scope_finished"] else "NOT FINISHED: this is a partial or inconclusive result."))
     out.append("The two files were not read as a coordinated snapshot. Seeing no change does not show they were stable.")
@@ -643,7 +680,20 @@ def main(argv=None) -> int:
         try:
             pinned = os.open(args.home, _DIR)       # one handle for the whole run; both scopes read through it
         except OSError:
-            pinned = None                           # each scope then reports home_unavailable itself
+            pinned = None
+        if pinned is None:
+            # Fail closed. Neither scope is run: left to open the path themselves, they could read two
+            # different folders and report one finished run.
+            res = _new_result()
+            res["run"].append("home_unavailable")
+            text = render(res)
+            if args.database_artifacts:
+                art = _new_artifact_result()
+                art["run"].append("home_unavailable")
+                res = {"text_scope": res, "artifact_scope": art, "run": [], "complete": False}
+                text += "\n" + render_artifacts(art) + "\n\nBoth scopes NOT both finished."
+            print(json.dumps(res, indent=2, sort_keys=True) if args.json else text)
+            return 1
         res = scan(args.home, home_fd=pinned)
         finished = res["complete"]
         text = render(res)
