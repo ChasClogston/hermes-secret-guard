@@ -228,9 +228,16 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   prod.env`, `tr a b < prod.env`, `mv prod.env x.txt` and `F=prod.env` are refused for any
   program, because names like `prod.env` and `id_rsa` can only be files. Names that are also
   ordinary words (`credentials`, `token`, `secret`) are refused for the listed reader programs
-  always, and for other programs only when such a file exists in the folder the command line is
-  using (a `cd` earlier in the same line is followed). In a shell that kept its folder from an
+  always, and for other programs only when such a file exists in a folder the command line
+  may be using. In a shell that kept its folder from an
   earlier call, `rev credentials` is therefore not caught.
+- **Folder changes inside one command line are followed, cautiously.** A `cd` at the top level,
+  not after `&&`, `||` or `|`, not piped, backgrounded or inside `if`/`while`/`{ }`, moves where
+  relative names are looked up. Any other `cd` (in a subshell, a pipeline, a substitution, a
+  conditional) may or may not take effect, so the new folder is added and the old ones are kept;
+  later commands are checked under every candidate, and a block under any of them blocks. More
+  than eight candidates refuses the line. A folder named at run time (`cd "$DIR"`) cannot be
+  followed, and neither can a folder change made in an earlier call.
 - **Command parsing is a small grammar, not a shell.** Quotes, `;`, `|`, `&&`, `$(...)`,
   backticks, `sh -c` and `eval` are handled. Here-documents, aliases, functions, variables holding
   command names and scripts on disk are not. Whether a `grep` call is recursive, and

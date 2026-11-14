@@ -301,6 +301,44 @@ class ReviewFindings(Fixture):
             ("ordinary file", T("cd sub && rev ../notes.txt"), "allowed"),
         ])
 
+    def test_r6_folder_changes_keep_every_candidate(self):
+        """A cd may be local to a subshell or pipeline, or never run. Later commands are checked
+        under every folder the line may be in."""
+        many = "; ".join("(cd %s)" % d for d in ("sub", "clean", "hidden_only", "nested", "nprod", "tokdir", "proj", "placeholder", "deps"))
+        self.run_rows([
+            ("plain tar (control)", T("tar -cf - hidden_only"), "blocked"),
+            ("R6: (cd clean); tar", T("(cd clean); tar -cf - hidden_only"), "blocked"),
+            ("R6: (cd clean); grep -r", T("(cd clean); grep -r drill hidden_only"), "blocked"),
+            ("R6: cd clean | cat; tar", T("cd clean | cat; tar -cf - hidden_only"), "blocked"),
+            ("R6: nested subshells", T("((cd clean)); grep -r drill hidden_only"), "blocked"),
+            ("R6: nested subshell with two cds", T("(cd clean; (cd src)); grep -r drill hidden_only"), "blocked"),
+            ("R6: cd on the untaken side of &&", T("false && cd clean; grep -r drill hidden_only"), "blocked"),
+            ("R6: cd on the untaken side of ||", T("true || cd clean; tar -cf - hidden_only"), "blocked"),
+            ("R6: cd that fails", T("cd no-such-folder 2>/dev/null; grep -r drill hidden_only"), "blocked"),
+            ("R6: cd in a command substitution", T("x=$(cd clean; pwd); grep -r drill hidden_only"), "blocked"),
+            ("R6: cd in a backgrounded command", T("cd clean & grep -r drill hidden_only"), "blocked"),
+            ("genuine sequential cd", T("cd clean && tar -cf - ../hidden_only"), "blocked"),
+            ("two sequential cds", T("cd clean && cd src && grep -r drill ../../hidden_only"), "blocked"),
+            ("cd away and back", T("cd clean; cd ..; grep -r drill hidden_only"), "blocked"),
+            ("cd into the folder, then search .", T("cd sub; cd ../hidden_only; grep -r drill ."), "blocked"),
+            ("pushd then popd", T("pushd clean >/dev/null; popd >/dev/null; grep -r drill hidden_only"), "blocked"),
+            ("bare name after a scoped cd elsewhere", T("(cd clean); cd aws; rev credentials"), "blocked"),
+            ("bare prod.env after a scoped cd", T("(cd clean); cd sub; rev prod.env"), "blocked"),
+            ("more folder changes than can be tracked", T(many + "; ls"), "blocked"),
+            ("R6: cd inside if/then", T("if true; then cd clean; fi; grep -r drill hidden_only"), "blocked"),
+            ("R6: cd inside a brace group after &&", T("true && { cd clean; }; tar -cf - hidden_only"), "blocked"),
+            ("R6: cd to a folder named at run time", T("cd \"$DIR\" && grep -r drill hidden_only"), "blocked"),
+            ("R6: cd - returns to an earlier folder", T("cd clean; cd -; grep -r drill hidden_only"), "blocked"),
+            ("control: a certain cd moves the lookup: grep -r .", T("cd clean && grep -r print ."), "allowed"),
+            ("control: cd with a redirect is still followed", T("cd clean 2>/dev/null; grep -r print src"), "allowed"),
+            ("control: cd X || exit", T("cd clean || exit 1; grep -r print src"), "allowed"),
+            ("control: newline-separated", T("cd clean\ngrep -r print ."), "allowed"),
+            ("control: cd clean && grep -r src", T("cd clean && grep -r print src"), "allowed"),
+            ("control: (cd clean); grep -r clean", T("(cd clean); grep -r print clean"), "allowed"),
+            ("control: cd clean/src && cat app.py", T("cd clean/src && cat app.py"), "allowed"),
+            ("control: cd clean && ls", T("cd clean && ls -la"), "allowed"),
+        ])
+
     def test_03_search_globs_are_path_aware(self):
         w = self.w
         S = lambda **a: ("search_files", {"pattern": "X", "path": w, **a})
@@ -488,6 +526,21 @@ class Differential(Fixture):
         if shutil.which("diff"):
             cmds += ["diff -r -- -data -other", "diff -r ./-data ./-other", "diff -ru -- -data -other",
                      "diff -r -- -clean clean/src"]
+        # R6: a cd that is scoped, piped, untaken or failed must not move where the gate looks
+        cmds += ["tar -cf - hidden_only", "(cd clean); tar -cf - hidden_only", "(cd clean); grep -r drill hidden_only",
+                 "cd clean | cat; tar -cf - hidden_only", "((cd clean)); grep -r drill hidden_only",
+                 "(cd clean; (cd src)); grep -r drill hidden_only", "false && cd clean; grep -r drill hidden_only",
+                 "true || cd clean; tar -cf - hidden_only", "cd no-such-folder 2>/dev/null; grep -r drill hidden_only",
+                 "x=$(cd clean; pwd); grep -r drill hidden_only", "cd clean & grep -r drill hidden_only",
+                 "cd clean && tar -cf - ../hidden_only", "cd clean && cd src && grep -r drill ../../hidden_only",
+                 "cd clean; cd ..; grep -r drill hidden_only", "cd sub; cd ../hidden_only; grep -r drill .",
+                 "(cd clean); cd aws; rev credentials | rev", "(cd clean); cd sub; rev prod.env | rev",
+                 "cd clean && grep -r print src", "(cd clean); grep -r print clean",
+                 "if true; then cd clean; fi; grep -r drill hidden_only", "true && { cd clean; }; tar -cf - hidden_only",
+                 "cd clean; cd -; grep -r drill hidden_only", "cd clean && grep -r print .",
+                 "cd clean 2>/dev/null; grep -r drill ../hidden_only", "cd clean || exit 1; grep -r drill ../hidden_only",
+                 "cd hidden_only && grep -r drill .", "cd clean; (cd ../hidden_only && grep -r drill .)",
+                 "cd clean; cd ../hidden_only; tar -cf - .", "(cd hidden_only; tar -cf - .)", "cd hidden_only | cat; grep -r drill ."]
         # a secret file named without a folder, read by programs outside the reader list
         cmds += ["cd sub && rev prod.env | rev", "cd sub && fold prod.env", "cd sub && tr a a < prod.env",
                  "cd sub && tr a a <prod.env", "cd sub && F=prod.env; cat $F", "cd sub && cp prod.env /dev/stdout",
@@ -497,6 +550,22 @@ class Differential(Fixture):
         if not cmds:
             self.skipTest("no tar, zip or diff")
         self.assertGreater(self.check(cmds), 3)
+
+    def test_generated_folder_change_matrix(self):
+        """Every folder-change form in front of every read, really run. Where the read printed the
+        synthetic value, the gate must have blocked the whole line."""
+        if not (shutil.which("tar") and shutil.which("grep")):
+            self.skipTest("no tar or grep")
+        prefixes = ["", "(cd clean); ", "cd clean | cat; ", "false && cd clean; ", "true || cd clean; ",
+                    "cd clean; cd ..; ", "cd clean && cd .. && ", "x=$(cd clean); ", "cd clean & ",
+                    "{ cd clean; }; cd ..; ", "cd clean; (cd ..); cd ..; ", "cd sub; cd ../clean; cd ..; ",
+                    "(cd clean; cd src); ", "cd clean; cd - >/dev/null; ", "if true; then cd clean; fi; cd ..; ",
+                    "cd no-such 2>/dev/null; ", "cd clean; cd src; cd ../..; ", "((cd clean)); ", "cd . && "]
+        reads = ["tar -cf - hidden_only", "grep -r drill hidden_only", "grep -r drill .", "tar -cf - -- -data",
+                 "cd hidden_only && grep -r drill .", "(cd sub && tr a a < prod.env)", "cd aws; fold credentials",
+                 "grep -r print clean"]
+        n = self.check([p + r for p in prefixes for r in reads])
+        self.assertGreater(n, 60)
 
     def test_copy_effects_imply_block(self):
         """cp and rsync print nothing: the effect is the copy. Run each into a scratch folder outside

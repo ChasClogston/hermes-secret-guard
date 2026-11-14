@@ -228,6 +228,7 @@ BENIGN_DIR_NAMES = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model"
 SCAN_MAX_DEPTH, SCAN_MAX_ENTRIES, SCAN_MAX_SECONDS = 12, 20000, 2.0
 GLOB_MAX_MATCHES = 2000
 SHELL_MAX_DEPTH = 3
+MAX_CWDS = 8
 SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
 GREP_FAMILY = frozenset({"grep", "egrep", "fgrep"})
 HIDDEN_SKIPPERS = frozenset({"rg", "ag"})          # skip dotfiles unless told otherwise
@@ -667,30 +668,39 @@ def _is_secrets_helper(token: str, cwd: Optional[str]) -> bool:
     return "/secrets-provider/" in full or full.endswith("/secret_guard/emit-secrets.sh")
 
 
-def _split_commands(command: str) -> list[str]:
+def _split_records(command: str) -> list:
     """Split a command line into simple commands at ; | & newline ( ) and around $( ... ) and
     backticks, respecting quotes: nothing inside single quotes splits, and inside double quotes
-    only a command substitution does (its body is then read as unquoted shell)."""
-    parts, buf, quote, i, n = [], [], "", 0, len(command)
-    stack: list = []                            # (opener, quote state to restore) per open substitution
+    only a command substitution does (its body is then read as unquoted shell).
 
-    def flush():
+    Each record is (text, depth, prev, next): how deeply the command sits inside parentheses or
+    substitutions, and the operator before and after it. That is the only shell structure kept;
+    it is what lets a `cd` be told apart as certain (top level, unconditional, not piped or
+    backgrounded) or merely possible."""
+    recs, buf, quote, i, n = [], [], "", 0, len(command)
+    stack: list = []                            # (opener, quote state to restore) per open substitution
+    state = {"paren": 0, "last": None}
+
+    def flush(op):
         seg = "".join(buf).strip()
-        if seg and seg != '""':
-            parts.append(seg)
         buf.clear()
+        if seg and seg != '""':
+            recs.append([seg, len(stack) + state["paren"], state["last"], op])
+        elif recs and op is not None and recs[-1][3] in (")", None):
+            pass
+        state["last"] = op if op is not None else state["last"]
 
     def enter(opener: str):
         nonlocal quote
         if quote == '"':
             buf.append('"')                     # close the open quote so the outer piece still parses
-        flush()
+        flush("$(")
         stack.append((opener, quote))
         quote = ""
 
     def leave():
         nonlocal quote
-        flush()
+        flush(")")
         _opener, quote = stack.pop()
         if quote == '"':
             buf.append('"')
@@ -718,25 +728,36 @@ def _split_commands(command: str) -> list[str]:
             quote = c; buf.append(c)
         elif c == ")" and stack and stack[-1][0] == "$(":
             leave()
-        elif c in ";|&\n()":
-            flush()
+        elif c == "(":
+            flush("(")
+            state["paren"] += 1
+        elif c == ")":
+            flush(")")
+            state["paren"] = max(0, state["paren"] - 1)
+        elif c in "|&" and i + 1 < n and command[i + 1] == c:
+            flush(c + c); i += 1
+        elif c in ";|&\n":
+            flush(";" if c == "\n" else c)
         else:
             buf.append(c)
         i += 1
-    flush()
-    return parts
+    flush(None)
+    return [tuple(r) for r in recs]
+
+
+def _split_commands(command: str) -> list[str]:
+    return [r[0] for r in _split_records(command)]
+
+
+def _tokens(seg: str) -> list:
+    try:
+        return shlex.split(seg, posix=True)
+    except ValueError:
+        return seg.split()
 
 
 def _segments(command: str) -> list[list[str]]:
-    out = []
-    for seg in _split_commands(command):
-        try:
-            toks = shlex.split(seg, posix=True)
-        except ValueError:
-            toks = seg.split()
-        if toks:
-            out.append(toks)
-    return out
+    return [t for t in (_tokens(seg) for seg in _split_commands(command)) if t]
 
 
 def check_command(command: str, cwd: Optional[str] = None, _depth: int = 0) -> Optional[str]:
@@ -755,120 +776,173 @@ def _check_command(command: str, cwd: Optional[str], _depth: int) -> Optional[st
     if _SUBST_READ_RE.search(command):
         return "reads a file list produced by another command; name the files instead"
     guarded = _guarded_names()
-    for toks in _segments(command):
-        # skip leading VAR=value assignments and wrappers
-        i = 0
-        # a wrapper counts only when something follows it: a bare `env` is an environment dump
-        while i + 1 < len(toks) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[i]) or toks[i] in ("sudo", "env", "command", "exec", "nohup", "time")):
-            i += 1
-        if i >= len(toks):
+    cwds = [cwd]                                 # every folder this command line may be working in
+    seen = [cwd]                                 # every folder it has ever been in (for popd, cd -)
+    for seg, depth, prev, nxt in _split_records(command):
+        toks = _tokens(seg)
+        if not toks:
             continue
-        prog = os.path.basename(toks[i])
-        args = toks[i + 1:]
-        # a `cd` earlier in the same command line moves where relative names are looked up
-        if prog in ("cd", "pushd") and len(args) == 1 and "$" not in args[0] and args[0] != "-":
-            target = _abs(args[0], cwd)
-            if os.path.isdir(target):
-                cwd = target
+        step = _cd_args(toks)
+        if step is not None:
+            args, conditional = step
+            # Certain: at the top level, not after && / || / |, not piped or backgrounded, not inside
+            # if/while/{...}. Then the folder really changes for what follows. Anything else may or
+            # may not take effect, so the new folder is added and the old ones stay. Later commands
+            # are checked under every candidate; a block under any of them blocks.
+            certain = (depth == 0 and not conditional and prev in (None, ";") and nxt in (None, ";", "&&", "||"))
+            if toks[-1] == "popd" or args == ["-"]:
+                cwds = list(seen)                # back to some earlier folder: any of them
+            elif len(args) <= 1 and not (args and ("$" in args[0] or "`" in args[0])):
+                target = args[0] if args else os.path.expanduser("~")
+                moved, stayed = [], []
+                for base in cwds:
+                    cand = _abs(target, base)
+                    (moved if os.path.isdir(cand) else stayed).append(cand if os.path.isdir(cand) else base)
+                # where the target does not exist the cd fails and the line carries on where it was
+                cwds = list(dict.fromkeys((moved + stayed) if certain else (cwds + moved)))
+            # a target built at run time ($DIR) cannot be followed: the candidates stay as they are
+            for c in cwds:
+                if c not in seen:
+                    seen.append(c)
+            if len(cwds) > MAX_CWDS or len(seen) > 4 * MAX_CWDS:
+                return "changes folder too many times to check; run the commands separately"
             continue
-        # 00. any argument that names a secret-shaped file, whatever the program: `rev prod.env`,
-        # `tr a b < prod.env`, `mv prod.env x.txt`, `F=prod.env`, `dd if=prod.env`
-        after_terminator = False
-        for t in toks:
-            if t == "--":
-                after_terminator = True
-                continue
-            bare = t.lstrip("<>")
-            for cand in ([bare, bare.rsplit("=", 1)[1]] if "=" in bare else [bare]):
-                if cand and "://" not in cand and names_secret_file(cand, cwd, literal=after_terminator):
-                    return f"names a secret-shaped file ({os.path.basename(cand)})"
-        # 0. a shell given its command as a string: check that string as a command too
-        payloads = []
-        if prog in SHELLS:
-            for j, a in enumerate(args):
-                if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", a):
-                    rest = [x for x in args[j + 1:] if not x.startswith("-")]
-                    payloads.append(rest[0] if rest else "")
-                    break
-        elif prog == "eval" and args:
-            payloads.append(" ".join(args))
-        for payload in payloads:
-            if _depth >= SHELL_MAX_DEPTH:
-                return "nests shell commands too deeply to check"
-            if not payload or re.fullmatch(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$[@*0-9]", payload.strip()):
-                return "runs a command string built at run time, which cannot be checked"
-            reason = check_command(payload, cwd, _depth + 1) or check_code(payload)
+        for where in cwds:
+            reason = _check_tokens(toks, where, guarded, _depth)
             if reason:
                 return reason
-        # 1. the keychain printing a value
-        if prog == "security":
-            joined = " ".join(args)
-            if re.search(r"\bfind-(generic|internet)-password\b", joined) and re.search(r"(^|\s)-[a-zA-Z]*[wg]", joined):
-                return "asks the keychain to print a secret value (security find-*-password -w/-g)"
-            if "dump-keychain" in joined:
-                return "dumps the keychain"
-        # 2. running or sourcing a secrets helper prints every secret
-        if prog in ("source", ".", "sh", "bash", "zsh") and args and _is_secrets_helper(args[-1] if prog in ("source", ".") else args[0], cwd):
-            return "runs a secrets helper script, which prints every secret"
-        if "/" in toks[i] and _is_secrets_helper(toks[i], cwd):
-            return "runs a secrets helper script, which prints every secret"
-        # 3. inspection commands known to print stored credentials unmasked
-        if prog == "openclaw" and args[:2] == ["mcp", "show"]:
-            return "openclaw mcp show prints stored headers unmasked; use openclaw mcp doctor"
-        if prog in ("printenv", "env") and not [a for a in args if not a.startswith("-")]:
-            return "dumps the whole environment, which holds live keys"
-        if prog == "set" and not args:
-            return "dumps every shell variable, which holds live keys"
-        if prog in ("export", "declare", "typeset") and not [a for a in args if not a.startswith("-")] \
-                and (prog == "export" or any("p" in a or "x" in a for a in args)):
-            return "dumps exported shell variables, which hold live keys"
-        if prog == "printenv":
-            for a in args:
-                if a in guarded:
-                    return f"prints a guarded variable ({a})"
-        if prog in ("echo", "printf", "print"):
-            for a in args:
-                for name in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", a):
-                    if name in guarded:
-                        return f"prints a guarded variable ({name})"
-        # 3b. a file list built at run time: find -exec READER, xargs READER
-        if prog == "find":
-            for j, a in enumerate(args[:-1]):
-                if a in ("-exec", "-execdir", "-ok") and os.path.basename(args[j + 1]) in READERS:
-                    for root in list(dict.fromkeys(_find_roots(args, cwd) + _folder_tokens(args[:j], cwd))):
-                        reason = _folder_reason(root)
-                        if reason:
-                            return reason
-                    break
-        if prog == "xargs" and any(os.path.basename(a) in READERS for a in args):
-            reason = _folder_reason(_abs(".", cwd))
-            if reason:
-                return reason
-        # 4. a reader pointed at a secret-shaped file
-        if prog in READERS:
-            walk = _recursive_folders(prog, args, cwd)
-            if walk:
-                for folder in walk[0]:
-                    reason = _folder_reason(folder, include_hidden=walk[1], skip_dirs=walk[2])
+    return None
+
+
+_SHELL_KEYWORDS = ("then", "do", "else", "elif", "if", "while", "until", "{", "!", "time")
+
+
+def _cd_args(toks: list) -> Optional[tuple]:
+    """(arguments, conditional) of a cd/pushd/popd command, or None if the tokens are some other
+    command. `conditional` is True when it follows a shell keyword such as `then` or `do`."""
+    i, conditional = 0, False
+    while i + 1 < len(toks) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[i]) or toks[i] in ("command", "builtin")
+                                 or toks[i] in _SHELL_KEYWORDS):
+        conditional = conditional or toks[i] in _SHELL_KEYWORDS
+        i += 1
+    if i < len(toks) and toks[i] in ("cd", "pushd", "popd"):
+        args = [a for a in toks[i + 1:] if a not in ("--", "-P", "-L", "-e", "-@", ";", "}", "fi", "done")
+                and not re.match(r"^\d*[<>]", a) and not re.match(r"^&?\d*$", a)]
+        if toks[i] == "popd":
+            return (["-"], conditional)
+        return (args, conditional)
+    return None
+
+
+def _check_tokens(toks: list, cwd: Optional[str], guarded: frozenset, _depth: int) -> Optional[str]:
+    """One simple command, checked as if run in `cwd`."""
+    # skip leading VAR=value assignments and wrappers
+    i = 0
+    # a wrapper counts only when something follows it: a bare `env` is an environment dump
+    while i + 1 < len(toks) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[i]) or toks[i] in ("sudo", "env", "command", "exec", "nohup", "time")):
+        i += 1
+    if i >= len(toks):
+        return None
+    prog = os.path.basename(toks[i])
+    args = toks[i + 1:]
+    # 00. any argument that names a secret-shaped file, whatever the program: `rev prod.env`,
+    # `tr a b < prod.env`, `mv prod.env x.txt`, `F=prod.env`, `dd if=prod.env`
+    after_terminator = False
+    for t in toks:
+        if t == "--":
+            after_terminator = True
+            continue
+        bare = t.lstrip("<>")
+        for cand in ([bare, bare.rsplit("=", 1)[1]] if "=" in bare else [bare]):
+            if cand and "://" not in cand and names_secret_file(cand, cwd, literal=after_terminator):
+                return f"names a secret-shaped file ({os.path.basename(cand)})"
+    # 0. a shell given its command as a string: check that string as a command too
+    payloads = []
+    if prog in SHELLS:
+        for j, a in enumerate(args):
+            if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", a):
+                rest = [x for x in args[j + 1:] if not x.startswith("-")]
+                payloads.append(rest[0] if rest else "")
+                break
+    elif prog == "eval" and args:
+        payloads.append(" ".join(args))
+    for payload in payloads:
+        if _depth >= SHELL_MAX_DEPTH:
+            return "nests shell commands too deeply to check"
+        if not payload or re.fullmatch(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$[@*0-9]", payload.strip()):
+            return "runs a command string built at run time, which cannot be checked"
+        reason = check_command(payload, cwd, _depth + 1) or check_code(payload)
+        if reason:
+            return reason
+    # 1. the keychain printing a value
+    if prog == "security":
+        joined = " ".join(args)
+        if re.search(r"\bfind-(generic|internet)-password\b", joined) and re.search(r"(^|\s)-[a-zA-Z]*[wg]", joined):
+            return "asks the keychain to print a secret value (security find-*-password -w/-g)"
+        if "dump-keychain" in joined:
+            return "dumps the keychain"
+    # 2. running or sourcing a secrets helper prints every secret
+    if prog in ("source", ".", "sh", "bash", "zsh") and args and _is_secrets_helper(args[-1] if prog in ("source", ".") else args[0], cwd):
+        return "runs a secrets helper script, which prints every secret"
+    if "/" in toks[i] and _is_secrets_helper(toks[i], cwd):
+        return "runs a secrets helper script, which prints every secret"
+    # 3. inspection commands known to print stored credentials unmasked
+    if prog == "openclaw" and args[:2] == ["mcp", "show"]:
+        return "openclaw mcp show prints stored headers unmasked; use openclaw mcp doctor"
+    if prog in ("printenv", "env") and not [a for a in args if not a.startswith("-")]:
+        return "dumps the whole environment, which holds live keys"
+    if prog == "set" and not args:
+        return "dumps every shell variable, which holds live keys"
+    if prog in ("export", "declare", "typeset") and not [a for a in args if not a.startswith("-")] \
+            and (prog == "export" or any("p" in a or "x" in a for a in args)):
+        return "dumps exported shell variables, which hold live keys"
+    if prog == "printenv":
+        for a in args:
+            if a in guarded:
+                return f"prints a guarded variable ({a})"
+    if prog in ("echo", "printf", "print"):
+        for a in args:
+            for name in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", a):
+                if name in guarded:
+                    return f"prints a guarded variable ({name})"
+    # 3b. a file list built at run time: find -exec READER, xargs READER
+    if prog == "find":
+        for j, a in enumerate(args[:-1]):
+            if a in ("-exec", "-execdir", "-ok") and os.path.basename(args[j + 1]) in READERS:
+                for root in list(dict.fromkeys(_find_roots(args, cwd) + _folder_tokens(args[:j], cwd))):
+                    reason = _folder_reason(root)
                     if reason:
                         return reason
-            after_terminator = False
-            for a in args:
-                if a == "--":
-                    after_terminator = True
-                    continue
-                if (after_terminator or not a.startswith("-")) and _has_magic(a):
-                    for m in expand_glob(a, cwd):
-                        if is_secret_path(m, cwd):
-                            return f"glob matches a secret-shaped file ({os.path.basename(m)})"
-                if after_terminator and is_secret_path(a, cwd, literal=True):
-                    return f"reads a secret-shaped file ({os.path.basename(a)})"
-                if is_secret_path(a, cwd):
-                    return f"reads a secret-shaped file ({os.path.basename(a.strip(QUOTES))})"
-                # inline code (python -c, perl -e, node -e) naming a secret file
-                for inner in re.findall(r"[\w./~-]+", a) if len(a) > 40 or " " in a else ():
-                    if is_secret_path(inner, cwd):
-                        return f"inline code references a secret-shaped file ({os.path.basename(inner)})"
+                break
+    if prog == "xargs" and any(os.path.basename(a) in READERS for a in args):
+        reason = _folder_reason(_abs(".", cwd))
+        if reason:
+            return reason
+    # 4. a reader pointed at a secret-shaped file
+    if prog in READERS:
+        walk = _recursive_folders(prog, args, cwd)
+        if walk:
+            for folder in walk[0]:
+                reason = _folder_reason(folder, include_hidden=walk[1], skip_dirs=walk[2])
+                if reason:
+                    return reason
+        after_terminator = False
+        for a in args:
+            if a == "--":
+                after_terminator = True
+                continue
+            if (after_terminator or not a.startswith("-")) and _has_magic(a):
+                for m in expand_glob(a, cwd):
+                    if is_secret_path(m, cwd):
+                        return f"glob matches a secret-shaped file ({os.path.basename(m)})"
+            if after_terminator and is_secret_path(a, cwd, literal=True):
+                return f"reads a secret-shaped file ({os.path.basename(a)})"
+            if is_secret_path(a, cwd):
+                return f"reads a secret-shaped file ({os.path.basename(a.strip(QUOTES))})"
+            # inline code (python -c, perl -e, node -e) naming a secret file
+            for inner in re.findall(r"[\w./~-]+", a) if len(a) > 40 or " " in a else ():
+                if is_secret_path(inner, cwd):
+                    return f"inline code references a secret-shaped file ({os.path.basename(inner)})"
     return None
 
 
