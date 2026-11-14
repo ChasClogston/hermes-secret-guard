@@ -213,9 +213,12 @@ PATH_KEYS = frozenset({"path", "file_path", "filepath", "filename", "file", "pat
                        "source_path", "image_path", "video_path", "workdir_file"})
 
 # --- 1.1: reads that reach a secret file without naming it
-# Folder scans use every name pattern, with one exception: names like tokenizer.json, which the
-# "*token*" pattern would otherwise turn into a block on most machine-learning repositories.
-BENIGN_DIR_NAMES = ("*tokeniz*",)
+# Folder scans use every name pattern, with a short list of exceptions for names that would
+# otherwise block a recursive search in most repositories: tokenizer files, compiled Python
+# (credential_files.cpython-314.pyc) and placeholder env files (.env.example). A direct read of
+# any of these is still blocked by the path rule.
+BENIGN_DIR_NAMES = ("*tokeniz*", "*.pyc", "*.pyo", "*.env.example", "*.env.sample", "*.env.template",
+                    "*.env.dist", ".env.example", ".env.sample", ".env.template", ".env.dist")
 # rg and ag skip dotfiles and honour ignore files. These folders are assumed ignored for those two
 # tools only; grep -r, tar, zip, cp -r and search_files are scanned without exclusions.
 IGNORED_BY_RG = frozenset({"node_modules", "__pycache__", "venv"})

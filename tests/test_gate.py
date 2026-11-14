@@ -36,6 +36,7 @@ class GateMatrix(unittest.TestCase):
         os.makedirs(cls.deep)
         files = {".env": "DRILL_FAKE_KEY=" + VALUE + "\n", "notes.txt": "hello\n", "sub/prod.env": "X=1\n",
                  "clean/src/app.py": "print(1)\n", "clean/tokenizer.json": "{}\n", "clean/readme.md": "x\n",
+                 "clean/.env.example": "KEY=changeme\n", "clean/src/credential_files.cpython-314.pyc": "x",
                  "hidden_only/.env": "X=1\n", "hidden_only/a.txt": "x\n", "nested/a/b/c/d/e/f/g/x.txt": "x\n",
                  "nprod/prod.env": "X=1\n", "tokdir/access-token.txt": "x\n",
                  "proj/node_modules/pkg/prod.env": "X=1\n", "proj/src/a.py": "x\n"}
@@ -142,7 +143,8 @@ class GateMatrix(unittest.TestCase):
             ("search_files file_glob=*.py over secret folder", ("search_files", {"pattern": "x", "path": w, "file_glob": "*.py"}), "allowed"),
             ("search_files names only", ("search_files", {"pattern": "*.env", "path": w, "target": "files"}), "allowed"),
             ("search_files single ordinary file", ("search_files", {"pattern": "h", "path": w + "/notes.txt"}), "allowed"),
-            ("grep -r clean folder (tokenizer.json present)", T("grep -r print clean"), "allowed"),
+            ("grep -r clean folder (tokenizer.json, .env.example, credential .pyc present)", T("grep -r print clean"), "allowed"),
+            ("direct read of .env.example is still blocked", T("cat clean/.env.example"), "blocked"),
             ("grep without -r on a file", T("grep hello notes.txt"), "allowed"),
             ("grep -r in an 8-level clean folder", T("grep -r x nested"), "allowed"),
             ("rg in hidden_only (dotfiles skipped)", T("rg X hidden_only"), "allowed"),

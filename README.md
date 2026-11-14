@@ -202,9 +202,11 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
 - **Folder reads are checked by file name, within limits.** One tool call gets one work budget
   for all its folder scans and glob expansions: 20,000 entries, 12 levels and two seconds. Past
   that, or when a folder cannot be listed, the call is blocked. Symlinked folders are not followed,
-  so `grep -R`, `rg -L` or `cp -L` can read further than the scan looked. Names like
-  `tokenizer.json` are not treated as secrets in a folder scan (a direct read of one is still
-  blocked); `access-token.txt` is. A secret in an ordinarily named file is not seen.
+  so `grep -R`, `rg -L` or `cp -L` can read further than the scan looked. Tokenizer files,
+  compiled Python (`*.pyc`) and placeholder env files (`.env.example`, `.env.sample`,
+  `.env.template`, `.env.dist`) are not treated as secrets in a folder scan, so a recursive
+  search of an ordinary repository still works; a direct read of one is still blocked, and a real
+  key left in `.env.example` is not protected from a folder search. `access-token.txt` is. A secret in an ordinarily named file is not seen.
 - **The scan follows each tool's own reach, approximately.** `grep -r`, `tar`, `zip`, `cp -r` and
   `search_files` are scanned in full, including `.git` and `node_modules`. `rg` and `ag` are
   assumed to skip dotfiles, `node_modules`, `venv` and `__pycache__` unless `--hidden`, `-uu`,
