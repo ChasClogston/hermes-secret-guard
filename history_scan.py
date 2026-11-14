@@ -17,6 +17,26 @@ NOT COVERED, and said so on every run
   - assignments to secret-looking names, and generic high-entropy strings
   - values registered with Secret Guard (that would need the keychain; this tool has no access)
 
+OPTIONAL SECOND SCOPE, off unless you ask: --database-artifacts   (contract "artifact-bytes-v1")
+  After the text scope, also read two files of the home as plain bytes: state.db and state.db-wal.
+  This is NOT a read of the conversations. It looks for contiguous secret-shaped byte strings in
+  two database files, with no SQLite involved: no connection, no lock protocol, and no write to
+  the database or its side files by this tool. state.db-shm is never read.
+    - A match is physical neighbouring bytes, not a stored value. A value split across cells,
+      overflow pages or log frames is not put back together. UTF-16 text is not matched.
+      Neighbouring bytes can hide, shorten or lengthen a match, or form an accidental one.
+    - Matches can come from deleted, superseded or uncommitted content. They are not row counts.
+    - The two files are never read as a coordinated snapshot, and are never presented as a pair.
+      Any change seen while reading makes the artifact scope not finished. Seeing no change does
+      not show the files were stable: a log reset and regrown to the same size can go unseen.
+    - Each file is read up to its size when opened; a growing log is not chased.
+    - Zero matches does not show the database holds no secrets. Nothing here speaks to the
+      database's health.
+    - Run it as its own process. It refuses to run in a process that has loaded sqlite3, and
+      must never be imported into a running Hermes.
+  Fixed limits: 4 GiB per file, 6 GiB for both, 200,000 distinct candidates for both together,
+  600 seconds (cooperative) for this scope on top of 120 for text: 720 seconds at most per run.
+
 So a finished run is a finished scan of that text scope. It is not a scan of the home's whole
 history, and zero findings does not show the history holds no secrets.
 
@@ -104,6 +124,19 @@ KINDS = tuple(k for k, _f, _p in COVERAGE)
 # Every label this tool can print about a file or a run. Nothing else is ever printed about input.
 FILE_LABELS = ("symlink_not_followed", "not_a_regular_file", "unreadable", "repeated_file", "read_error",
                "truncated_at_size_cap", "changed_during_scan", "hard_linked", "not_covered_entry")
+ARTIFACT_CONTRACT = "artifact-bytes-v1"
+ARTIFACTS = ("state.db", "state.db-wal")        # read in this order; state.db-shm is never read
+ART_MAX_FILE_BYTES = 4 * 1024 ** 3
+ART_MAX_TOTAL_BYTES = 6 * 1024 ** 3
+ART_MAX_DISTINCT = 200_000                      # one map for both artifacts and all categories
+ART_TIME_BUDGET_S = 600.0                       # cooperative; its own allowance, so text cannot starve it
+ARTIFACT_STATUS = ("scanned", "absent", "symlink_not_followed", "not_a_regular_file", "unreadable", "read_error",
+                   "not_reached")
+ARTIFACT_CHANGES = ("grew", "shrank", "modified", "replaced", "disappeared", "appeared")
+ARTIFACT_RUN_LABELS = ("refused_sqlite_loaded_in_process", "home_unavailable", "database_absent",
+                       "truncated_at_size_cap", "total_byte_limit_reached", "time_budget_reached",
+                       "distinct_limit_reached", "source_change_observed", "cancelled", "internal_error",
+                       "skipped_text_scope_cancelled")
 RUN_LABELS = ("home_unavailable", "location_absent", "location_is_a_symlink", "location_unavailable",
               "entry_limit_reached", "file_limit_reached", "total_byte_limit_reached", "time_budget_reached",
               "distinct_limit_reached",
@@ -290,6 +323,228 @@ def scan(home: str) -> dict:
     return res
 
 
+def _entry_identity(home_fd: int, name: str):
+    """(dev, ino) of a directory entry without following a link, 'absent', or 'unreadable'."""
+    try:
+        st = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
+        return (st.st_dev, st.st_ino)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unreadable"
+
+
+def _new_artifact() -> dict:
+    return {"status": "not_reached", "traversal_finished": False, "source_change_observed": False,
+            "snapshot_established": False, "bytes_read": 0, "extent_bytes": 0, "changes": [],
+            "occurrences": {c: 0 for c in CATEGORIES}, "low_variety_also_counted": 0,
+            "distinct_candidates": {c: 0 for c, _p, d in DETECTORS if d}}
+
+
+def scan_artifacts(home: str, text_cancelled: bool = False) -> dict:
+    """Contract artifact-bytes-v1: read state.db and state.db-wal of one home as plain bytes.
+
+    Never raises. Imports and uses no SQLite. Both files are opened first and checked again after
+    both have been read, so the change check spans the whole read. Extent is each file's size at
+    open. One digest map with a membership flag per artifact holds the distinct candidates."""
+    res = {"contract": ARTIFACT_CONTRACT, "artifacts": {name: _new_artifact() for name in ARTIFACTS},
+           "combined_distinct_candidates": {c: 0 for c, _p, d in DETECTORS if d},
+           "snapshot_established": False, "run": [], "scope_finished": False}
+    art = res["artifacts"]
+
+    def note(label):
+        if label not in res["run"]:
+            res["run"].append(label)
+
+    if text_cancelled:
+        note("skipped_text_scope_cancelled")
+        return res
+    if "sqlite3" in sys.modules or "_sqlite3" in sys.modules:
+        note("refused_sqlite_loaded_in_process")      # closing our descriptor could cancel that library's locks
+        return res
+    key = os.urandom(32)
+    seen = {c: {} for c in res["combined_distinct_candidates"]}      # category -> {digest: membership flags}
+    state = {"total": 0, "distinct": 0, "overflow": False}
+    deadline = time.monotonic() + ART_TIME_BUDGET_S
+    opened, home_fd = {}, None
+
+    def tick():
+        if time.monotonic() > deadline:
+            raise _Stop("time_budget_reached")
+
+    try:
+        try:
+            home_fd = os.open(home, _DIR)
+        except OSError:
+            note("home_unavailable")
+            return res
+        # --- open both first, so the change check covers the whole read
+        for name in ARTIFACTS:
+            a = art[name]
+            ident = _entry_identity(home_fd, name)
+            if ident == "absent":
+                a["status"] = "absent"
+                opened[name] = (None, None, ident)
+                continue
+            if ident == "unreadable":
+                a["status"] = "unreadable"
+                opened[name] = (None, None, ident)
+                continue
+            try:
+                fd = os.open(name, _FILE, dir_fd=home_fd)
+            except OSError as exc:
+                a["status"] = ("symlink_not_followed" if exc.errno in (errno.ELOOP, errno.EMLINK)
+                               else "not_a_regular_file" if exc.errno in (errno.ENXIO, errno.EISDIR, errno.ENOTDIR)
+                               else "absent" if exc.errno == errno.ENOENT else "unreadable")
+                opened[name] = (None, None, ident)
+                continue
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                os.close(fd)
+                a["status"] = "not_a_regular_file"
+                opened[name] = (None, None, ident)
+                continue
+            a["extent_bytes"] = st.st_size
+            opened[name] = (fd, st, ident)
+        # --- read each, in the fixed order, to its extent at open
+        for flag, name in enumerate(ARTIFACTS):
+            fd, st, _ident = opened[name]
+            a = art[name]
+            if fd is None:
+                continue
+            tick()
+            extent, carry, lead, read = st.st_size, b"", 0, 0
+            try:
+                while True:
+                    tick()
+                    allowed = min(CHUNK, extent - read, ART_MAX_FILE_BYTES - read, ART_MAX_TOTAL_BYTES - state["total"])
+                    chunk = os.read(fd, allowed) if allowed > 0 else b""
+                    read += len(chunk); state["total"] += len(chunk); a["bytes_read"] += len(chunk)
+                    final = not chunk
+                    buf = carry + chunk
+                    cutoff = len(buf) if final else max(0, len(buf) - OVERLAP)
+                    for category, pattern, distinct in DETECTORS:
+                        for m in pattern.finditer(buf):
+                            if m.start() < lead:
+                                continue
+                            if m.start() >= cutoff:
+                                break
+                            token = m.group(0)
+                            a["occurrences"][category] += 1
+                            if distinct:
+                                if len(set(token[-24:])) < LOW_VARIETY_CHARS:
+                                    a["low_variety_also_counted"] += 1
+                                digest = hmac.new(key, token, hashlib.sha256).digest()
+                                flags = seen[category].get(digest)
+                                if flags is None:
+                                    if state["distinct"] >= ART_MAX_DISTINCT:
+                                        state["overflow"] = True
+                                        continue
+                                    state["distinct"] += 1
+                                    flags = 0
+                                seen[category][digest] = flags | (1 << flag)
+                    if final:
+                        break
+                    lead = 1 if cutoff > 0 else 0
+                    carry = buf[cutoff - lead:]
+            except OSError:
+                a["status"] = "read_error"
+                continue
+            a["status"] = "scanned"
+            if read >= extent:
+                a["traversal_finished"] = True
+            elif read >= ART_MAX_FILE_BYTES:
+                note("truncated_at_size_cap")
+            elif state["total"] >= ART_MAX_TOTAL_BYTES:
+                raise _Stop("total_byte_limit_reached")
+            # read < extent with allowance left: the file shrank under us; the end check records it
+        tick()
+    except _Stop as stop:
+        note(stop.label)
+    except KeyboardInterrupt:
+        note("cancelled")
+    except BaseException:
+        note("internal_error")
+    finally:
+        # --- end checks on both, whatever happened: entry identity and open descriptor, start against end
+        try:
+            for name in ARTIFACTS:
+                if name not in opened or home_fd is None:
+                    continue
+                fd, st, ident0 = opened[name]
+                a = art[name]
+                ident1 = _entry_identity(home_fd, name)
+                if ident0 == "absent" and ident1 != "absent":
+                    a["changes"].append("appeared")
+                elif ident0 != "absent" and ident1 == "absent":
+                    a["changes"].append("disappeared")
+                elif ident0 != ident1:
+                    a["changes"].append("replaced")
+                if fd is not None:
+                    try:
+                        end = os.fstat(fd)
+                        if end.st_size > st.st_size:
+                            a["changes"].append("grew")
+                        elif end.st_size < st.st_size:
+                            a["changes"].append("shrank")
+                        elif end.st_mtime_ns != st.st_mtime_ns:
+                            a["changes"].append("modified")
+                        if isinstance(ident0, tuple) and ident0 != (st.st_dev, st.st_ino) and "replaced" not in a["changes"]:
+                            a["changes"].append("replaced")
+                    except OSError:
+                        a["changes"].append("modified")
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                a["source_change_observed"] = bool(a["changes"])
+            if home_fd is not None:
+                os.close(home_fd)
+        except BaseException:
+            note("internal_error")
+    for name_flag, name in enumerate(ARTIFACTS):
+        for c in seen:
+            art[name]["distinct_candidates"][c] = sum(1 for f in seen[c].values() if f & (1 << name_flag))
+    for c in seen:
+        res["combined_distinct_candidates"][c] = len(seen[c])
+    if state["overflow"]:
+        note("distinct_limit_reached")             # distinct counts, per file and combined, are lower bounds
+    if any(art[n]["source_change_observed"] for n in ARTIFACTS):
+        note("source_change_observed")
+    db, wal = art["state.db"], art["state.db-wal"]
+    if db["status"] == "absent" and "home_unavailable" not in res["run"]:
+        note("database_absent")                    # a missing database is not a successful database scan
+    ok_db = db["status"] == "scanned" and db["traversal_finished"]
+    ok_wal = wal["status"] == "absent" or (wal["status"] == "scanned" and wal["traversal_finished"])
+    res["scope_finished"] = bool(ok_db and ok_wal and not res["run"])
+    return res
+
+
+def render_artifacts(res: dict) -> str:
+    out = ["", "Database-artifact byte scan: contract %s (asked for with --database-artifacts)" % res["contract"],
+           "  NOT a read of the conversations. Contiguous byte matches in two files, read without SQLite.",
+           "  Values split across pages or log frames are not put back together. UTF-16 text is not matched.",
+           "  Matches can come from deleted, superseded or uncommitted content. state.db-shm is never read."]
+    for name in ARTIFACTS:
+        a = res["artifacts"][name]
+        out.append("%s: status %s, %d of %d byte(s) read, traversal finished %s, change observed %s, snapshot established no"
+                   % (name, a["status"], a["bytes_read"], a["extent_bytes"], "yes" if a["traversal_finished"] else "no",
+                      "yes (" + ", ".join(a["changes"]) + ")" if a["changes"] else "no"))
+        for c in CATEGORIES:
+            distinct = a["distinct_candidates"].get(c)
+            out.append("    %-22s occurrences %d, %s" % (c, a["occurrences"][c], "distinct %d" % distinct if distinct is not None
+                                                          else "distinct not counted (header only)"))
+        out.append("    of those, low-variety (also counted) %d" % a["low_variety_also_counted"])
+    out.append("different matched byte strings across both files (not a verified pair, not rows, not confirmed secrets):")
+    for c, n in res["combined_distinct_candidates"].items():
+        out.append("    %-22s %d" % (c, n))
+    out.append("artifact run notes: " + (", ".join(res["run"]) if res["run"] else "none"))
+    out.append("Artifact scope " + ("finished." if res["scope_finished"] else "NOT FINISHED: this is a partial or inconclusive result."))
+    out.append("The two files were not read as a coordinated snapshot. Seeing no change does not show they were stable.")
+    out.append("Zero matches does not show the database holds no secrets. Nothing here speaks to the database's health.")
+    return "\n".join(out)
+
+
 def render(res: dict) -> str:
     out = ["Secret Guard history scan: summary only",
            "coverage contract %s (%s)" % (res["contract"], res["baseline"]),
@@ -325,6 +580,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="history_scan", description="Summary-only scan of one Hermes home's text records.")
     ap.add_argument("--home", required=True, help="the one Hermes home to scan (no default)")
     ap.add_argument("--json", action="store_true", help="print the same counters as JSON")
+    ap.add_argument("--database-artifacts", action="store_true",
+                    help="after the text scope, also read state.db and state.db-wal as plain bytes (not a read of the conversations)")
     args = ap.parse_args(argv)
     try:
         attached = sys.stdin.isatty() and sys.stdout.isatty()
@@ -335,8 +592,15 @@ def main(argv=None) -> int:
         return 2
     try:
         res = scan(args.home)
-        print(json.dumps(res, indent=2, sort_keys=True) if args.json else render(res))
-        return 0 if res["complete"] else 1
+        finished = res["complete"]
+        text = render(res)
+        if args.database_artifacts:                 # only on request: the default run opens no database content
+            art = scan_artifacts(args.home, text_cancelled="cancelled" in res["run"])
+            res = {"text_scope": res, "artifact_scope": art, "complete": bool(finished and art["scope_finished"])}
+            finished = res["complete"]
+            text += "\n" + render_artifacts(art) + "\n\nBoth scopes " + ("finished." if finished else "NOT both finished.")
+        print(json.dumps(res, indent=2, sort_keys=True) if args.json else text)
+        return 0 if finished else 1
     except KeyboardInterrupt:
         sys.stderr.write("history_scan: cancelled; no result.\n")
         return 1

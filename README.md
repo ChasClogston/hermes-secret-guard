@@ -241,6 +241,68 @@ an internal error gives the same.
 
 `python tests/test_history_scan.py` runs on synthetic homes with synthetic keys.
 
+### Optional second scope: database-artifact byte scan
+
+```bash
+python3 history_scan.py --home ~/.hermes/profiles/<one-profile> --database-artifacts
+```
+
+Off unless you ask for it. Without the switch the scanner opens no database content, exactly
+as before. With it, after the text scope, the tool reads two files of the home as plain bytes:
+`state.db` and `state.db-wal` (contract `artifact-bytes-v1`). `state.db-shm` is never read.
+
+**This is not a read of the conversations.** It looks for contiguous secret-shaped byte
+strings in two database files, with no SQLite involved: no connection, no lock protocol, and
+no write to the database or its side files by this tool. Reading still uses disk, memory and
+CPU; it is not "zero impact".
+
+**What a result means.**
+- A match is physical neighbouring bytes, not a stored value. A value split across cells,
+  overflow pages or log frames is not put back together. UTF-16 text is not matched.
+- Neighbouring bytes change what matches. A message that is exactly a key sits right after
+  its role text in the record, so the detector's boundary rule hides it. Two adjacent columns
+  can also form a key shape that is no stored value at all. Both are shown in the tests.
+- Matches can come from deleted, superseded or uncommitted content. They are not row counts.
+- No miss rate is given, because none has been established. Some layouts could hide every
+  copy of a value.
+- **Zero matches does not show the database holds no secrets.** Nothing here speaks to the
+  database's health.
+
+**Status.** Each file reports a status (`scanned`, `absent`, `symlink_not_followed`,
+`not_a_regular_file`, `unreadable`, `read_error`, `not_reached`), whether its byte traversal
+finished, and whether a change was observed. "Snapshot established" is always no: the two
+files are never read as a coordinated snapshot and are never presented as a verified pair. A
+missing `state.db` is not a finished scan. A missing log is normal and does not block. Any
+observed change (grew, shrank, modified, replaced, disappeared, appeared) makes the artifact
+scope not finished. Seeing no change does not show the files were stable; a log reset and
+regrown to the same size can go unseen.
+
+**Extent and limits.** Both files are opened first and checked again after both are read.
+Each is read up to its size at open; a growing log is not chased. Fixed limits: 4 GiB per
+file, 6 GiB for both, 200,000 distinct candidates for both together in one map, and 600
+seconds (cooperative) for this scope on top of the text scope's 120, so 720 seconds at most
+per run. The artifact scope has its own byte and time allowance, so the text scope cannot
+starve it; `state.db` is read before the log, and a log that was not reached says
+`not_reached`. On the development machine the scan ran at roughly 100 MiB per second.
+
+**Counting.** Occurrences and distinct candidates are shown per file. One combined figure is
+shown: the number of different matched byte strings across both files. It is not a pair, a
+row count or a count of confirmed secrets. Text-scope counts stay separate.
+
+**Run it as its own process.** The scope refuses to run in a process that has loaded
+`sqlite3`, and the script must never be imported into a running Hermes: closing a file
+descriptor in a process that also holds a SQLite connection to the same file can cancel that
+connection's locks.
+
+`python tests/test_artifact_scan.py` builds synthetic databases and runs every scan in its own
+process. It compares the scanner with a whole-file pass (physical bytes) and with the stored
+values (logical), and lists what the byte scan misses by mechanism. Evidence for "no SQLite, no
+locks, no writes" comes in layers, each with a positive control: a Python audit hook, an
+operating-system trace on Linux (no tracer is available on macOS without changing system
+protection, so that layer is absent there), and a measurement of a concurrent writer against
+a baseline. None of these is a sandbox or a proof.
+
+
 ## How keys reach your profiles
 
 Secret Guard is a Hermes **secret source** (`ctx.register_secret_source`), the same mechanism as
