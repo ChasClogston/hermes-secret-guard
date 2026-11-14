@@ -224,6 +224,13 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
 - **The scan uses the folder Hermes runs in** when a command gives a relative path. A tool with
   its own working folder, a remote backend or a container may be reading somewhere the scan did
   not look. This is a real gap, not a formality.
+- **A secret file named without a folder is recognised by name, with one exception.** `rev
+  prod.env`, `tr a b < prod.env`, `mv prod.env x.txt` and `F=prod.env` are refused for any
+  program, because names like `prod.env` and `id_rsa` can only be files. Names that are also
+  ordinary words (`credentials`, `token`, `secret`) are refused for the listed reader programs
+  always, and for other programs only when such a file exists in the folder the command line is
+  using (a `cd` earlier in the same line is followed). In a shell that kept its folder from an
+  earlier call, `rev credentials` is therefore not caught.
 - **Command parsing is a small grammar, not a shell.** Quotes, `;`, `|`, `&&`, `$(...)`,
   backticks, `sh -c` and `eval` are handled. Here-documents, aliases, functions, variables holding
   command names and scripts on disk are not. Whether a `grep` call is recursive, and

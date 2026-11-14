@@ -198,6 +198,10 @@ SECRET_PATTERNS = ("*.env", "*.env.*", ".env", "openclaw.json", "*credential*", 
                    "*secret*", "*.pem", "*.pfx", "*.ppk", "id_rsa", "id_ed25519", "*-keys.json",
                    "auth.json")
 SAFE_EXTENSIONS = (".sh", ".py", ".md")  # code and docs; a *secret*.log is still blocked
+# Patterns that can only be a file name. A bare argument matching one (prod.env, id_rsa) is
+# treated as a secret file for any program. The other three patterns are also ordinary words
+# (token, secret, credential), so a bare match counts only when such a file exists.
+WORD_PATTERNS = ("*credential*", "*token*", "*secret*")
 QUOTES = "\"'"
 READERS = frozenset({"cat", "bat", "less", "more", "head", "tail", "sed", "awk", "gawk", "grep",
                      "egrep", "fgrep", "rg", "ag", "strings", "xxd", "od", "hexdump", "base64",
@@ -317,6 +321,19 @@ def is_secret_path(token: str, cwd: Optional[str] = None, literal: bool = False)
         full = _abs(token, cwd)
         return any(full == r or full.startswith(r + os.sep) for r in _hermes_roots())
     return False
+
+
+def names_secret_file(token: str, cwd: Optional[str], literal: bool = False) -> bool:
+    """True when a bare argument names a secret-shaped file: by name alone for file-only patterns,
+    and for the word-like patterns only when that file exists in the folder being used."""
+    if not is_secret_path(token, cwd, literal):
+        return False
+    name = os.path.basename(token.strip("\"'").rstrip("/")).lower()
+    if any(fnmatch.fnmatch(name, p) for p in SECRET_PATTERNS if p not in WORD_PATTERNS):
+        return True
+    if name == "config.yaml" or name.startswith(("config.yaml.", "config.yaml~")):
+        return True                              # is_secret_path already tied it to a Hermes root
+    return os.path.isfile(_abs(token.strip("\"'"), cwd))
 
 
 class _ScanTooBig(Exception):
@@ -514,6 +531,20 @@ def _guarded_names() -> frozenset:
         return frozenset()
 
 
+def _folder_tokens(args: list, cwd: Optional[str]) -> list:
+    """Every argument that is an existing folder, whatever its role and whether or not it starts
+    with a dash (after a `--`, `-data` is a folder). Globs are expanded. Shared by every recursive
+    reader so they cannot apply different operand rules."""
+    out = []
+    for tok in args:
+        if tok == "--":
+            continue
+        for m in (expand_glob(tok, cwd) if _has_magic(tok) else [_abs(tok, cwd)]):
+            if os.path.isdir(m):
+                out.append(m)
+    return out
+
+
 def _parse_search_args(prog: str, args: list) -> dict:
     """Options and operands of a grep/rg/ag call. `understood` is False when an option is not in
     the tables, so its value could be mistaken for a pattern or a path."""
@@ -601,17 +632,13 @@ def _recursive_folders(prog: str, args: list, cwd: Optional[str]) -> Optional[tu
                     named_existing = True
                 elif os.path.exists(m):
                     named_existing = True
-        for tok in args:                         # and every token that is a folder, whatever its role
-            if tok == "--":
-                continue
-            for m in (expand_glob(tok, cwd) if _has_magic(tok) else [_abs(tok, cwd)]):
-                if os.path.isdir(m):
-                    folders.append(m)
+        folders.extend(_folder_tokens(args, cwd))    # and every token that is a folder, whatever its role
         if not named_existing or not parsed["understood"]:
             folders.append(here)
         return list(dict.fromkeys(folders)), hidden, frozenset()
-    flags = [a for a in args if a.startswith("-")]
-    pos = [a for a in args if not a.startswith("-")]
+    # tar, zip, rsync, cp, scp, diff. Flags are read from every dash token, so a folder such as
+    # -data can at worst be misread as flags, which only adds scanning.
+    flags = [a for a in args if a.startswith("-") and a != "--"]
     short = "".join(f[1:] for f in flags if not f.startswith("--"))
     if prog in ALWAYS_RECURSIVE:
         recursive = True
@@ -623,12 +650,7 @@ def _recursive_folders(prog: str, args: list, cwd: Optional[str]) -> Optional[tu
         recursive = False
     if not recursive:
         return None
-    folders = []
-    for p in pos:
-        for m in (expand_glob(p, cwd) if _has_magic(p) else [_abs(p, cwd)]):
-            if os.path.isdir(m):
-                folders.append(m)
-    return list(dict.fromkeys(folders)), True, frozenset()
+    return list(dict.fromkeys(_folder_tokens(args, cwd))), True, frozenset()
 
 
 def _find_roots(args: list, cwd: Optional[str]) -> list:
@@ -743,6 +765,23 @@ def _check_command(command: str, cwd: Optional[str], _depth: int) -> Optional[st
             continue
         prog = os.path.basename(toks[i])
         args = toks[i + 1:]
+        # a `cd` earlier in the same command line moves where relative names are looked up
+        if prog in ("cd", "pushd") and len(args) == 1 and "$" not in args[0] and args[0] != "-":
+            target = _abs(args[0], cwd)
+            if os.path.isdir(target):
+                cwd = target
+            continue
+        # 00. any argument that names a secret-shaped file, whatever the program: `rev prod.env`,
+        # `tr a b < prod.env`, `mv prod.env x.txt`, `F=prod.env`, `dd if=prod.env`
+        after_terminator = False
+        for t in toks:
+            if t == "--":
+                after_terminator = True
+                continue
+            bare = t.lstrip("<>")
+            for cand in ([bare, bare.rsplit("=", 1)[1]] if "=" in bare else [bare]):
+                if cand and "://" not in cand and names_secret_file(cand, cwd, literal=after_terminator):
+                    return f"names a secret-shaped file ({os.path.basename(cand)})"
         # 0. a shell given its command as a string: check that string as a command too
         payloads = []
         if prog in SHELLS:
@@ -796,7 +835,7 @@ def _check_command(command: str, cwd: Optional[str], _depth: int) -> Optional[st
         if prog == "find":
             for j, a in enumerate(args[:-1]):
                 if a in ("-exec", "-execdir", "-ok") and os.path.basename(args[j + 1]) in READERS:
-                    for root in _find_roots(args, cwd):
+                    for root in list(dict.fromkeys(_find_roots(args, cwd) + _folder_tokens(args[:j], cwd))):
                         reason = _folder_reason(root)
                         if reason:
                             return reason
