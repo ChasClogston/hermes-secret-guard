@@ -144,13 +144,16 @@ of overwriting. `hermes secret doctor` lists any variable your old source still 
    `grep -r`, `rg`, `tar`, `zip`, `cp -r`, `find -exec` or `xargs` over a folder that holds one; a
    shell glob that matches one; a reader fed by `$(...)` or backticks; a `file://` address;
    `printenv NAME` or `echo $NAME` for a guarded variable; and `set`, `export -p` or printing
-   `os.environ`. A blocked folder read tells the agent to name the files it needs.
+   `os.environ`. The same checks apply inside `sh -c '...'`, `bash -lc`, `eval` and command
+   substitutions, up to three levels deep. A blocked folder read tells the agent to name the
+   files it needs. A folder that is too large, or cannot be listed, is refused, not passed.
 2. **Value redaction.** Every registered value is pushed into Hermes's own model-egress scrub, the
    same exact-value registry Hermes uses for browser-vault passwords. That registry applies even
    when `security.redact_secrets` is off. Backup `transform_*` hooks scrub tool results, terminal
    output and replies too; if a backup hook itself fails, it withholds the output instead of
    passing it through. Since 1.1 these hooks also redact each value's base64 (any alignment, both
-   alphabets, wrapped or not), hex and percent-encoded forms.
+   alphabets, wrapped or not, for every accepted value of 8 bytes or more), hex and
+   percent-encoded forms.
 3. **Inbound block** (`pre_llm_call`). An exact registered value, or a string shaped like a known
    key (`sk-`, `ghp_`, `xoxb-`, `AKIA`, `AIza`, Telegram bot tokens, …), stops the turn before any
    inference.
@@ -196,16 +199,29 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   Hermes's own model-egress scrub still matches the exact value only. `xxd` and `hexdump` output
   with offsets and column groups is not matched; `xxd -p` is. Redaction is the safety net; the
   path gate and key entry outside chat are what keep keys from being read in the first place.
-- **Folder reads are checked by file name, within limits.** The scan stops at 12 levels or 20,000
-  entries and then blocks the call. It skips `.git`, `node_modules` and virtual-environment
-  folders and does not follow symlinked folders. It ignores `*token*` names, so a repository with
-  `tokenizer.json` stays searchable; a direct read of such a file is still blocked. A secret in an
-  ordinarily named file is not seen. The scan uses the folder Hermes runs in when a command gives
-  a relative path, which can differ from a tool's own working folder.
-- **Some ordinary commands are now refused.** `cat $(...)`, `find . -exec grep ...` and
-  `grep -r` in a project that keeps a `.env` file are blocked; name the files or a subfolder
-  instead. `rg` and `ag` skip dotfiles by default, so a hidden `.env` does not block them unless
-  `--hidden` is used.
+- **Folder reads are checked by file name, within limits.** One tool call gets one work budget
+  for all its folder scans and glob expansions: 20,000 entries, 12 levels and two seconds. Past
+  that, or when a folder cannot be listed, the call is blocked. Symlinked folders are not followed,
+  so `grep -R`, `rg -L` or `cp -L` can read further than the scan looked. Names like
+  `tokenizer.json` are not treated as secrets in a folder scan (a direct read of one is still
+  blocked); `access-token.txt` is. A secret in an ordinarily named file is not seen.
+- **The scan follows each tool's own reach, approximately.** `grep -r`, `tar`, `zip`, `cp -r` and
+  `search_files` are scanned in full, including `.git` and `node_modules`. `rg` and `ag` are
+  assumed to skip dotfiles, `node_modules`, `venv` and `__pycache__` unless `--hidden`, `-uu`,
+  `--no-ignore` or a `--glob` is given; a config file or alias that changes those defaults is not
+  seen. A search tool's file filter is honoured only when it can be modelled exactly (`*.py`,
+  `src/**/*.py`); exclusions and brace patterns are ignored, which can only block more.
+- **The scan uses the folder Hermes runs in** when a command gives a relative path. A tool with
+  its own working folder, a remote backend or a container may be reading somewhere the scan did
+  not look. This is a real gap, not a formality.
+- **Command parsing is a small grammar, not a shell.** Quotes, `;`, `|`, `&&`, `$(...)`,
+  backticks, `sh -c` and `eval` are handled. Here-documents, aliases, functions, variables holding
+  command names and scripts on disk are not. An option the tables do not know makes a `grep`/`rg`
+  call "not understood", and the working folder is then scanned as well as any folder named.
+- **Some ordinary commands are now refused.** `cat $(...)`, `find . -exec grep ...`,
+  `sh -c "$CMD"` and `grep -r` in a project that keeps a `.env` file are blocked; name the files
+  or a subfolder instead. `rg` skips dotfiles by default, so a hidden `.env` does not block it
+  unless `--hidden` or `-uu` is used.
 - **Using a guarded variable is allowed; printing it is not.** `curl -H "Authorization: Bearer
   $KEY"` runs. `echo $KEY` is blocked. A script that prints the variable some other way is caught
   only by redaction.
@@ -270,7 +286,9 @@ quietly overclaim).
 `python tests/test_gate.py` needs no Hermes and no keychain, and runs on any platform. It holds the
 1.1 matrix: named secret files, folder-wide reads, globs, command substitution, environment reads,
 `file://` addresses, the ordinary commands that must keep working, the encoded forms that are
-redacted, and the known limits that are not.
+redacted, and the known limits that are not. It also holds a regression for each finding of the
+independent review of the first 1.1 candidate (option parsing, path-aware search filters, shell
+wrappers, bounded work, scan errors, mixed wrapped output and short values).
 
 `tests/e2e_canary.sh` runs the same attacks against a real Hermes agent in a throwaway home and
 throwaway keychain, and requires positive evidence for each result. See the script header for setup.
