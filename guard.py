@@ -302,9 +302,12 @@ def _abs(token: str, cwd: Optional[str]) -> str:
     return os.path.realpath(t)
 
 
-def is_secret_path(token: str, cwd: Optional[str] = None) -> bool:
-    name = os.path.basename(token.strip("\"'").rstrip("/")).lower()
-    if not name or name.startswith("-"):
+def is_secret_path(token: str, cwd: Optional[str] = None, literal: bool = False) -> bool:
+    """`literal` means the token is known to be a path (it follows a `--` terminator), so a
+    leading dash does not make it an option. A dash inside a path (dir/-prod.env) never does."""
+    stripped = token.strip("\"'")
+    name = os.path.basename(stripped.rstrip("/")).lower()
+    if not name or (stripped.startswith("-") and not literal):
         return False
     if name.endswith(SAFE_EXTENSIONS):
         return False
@@ -572,10 +575,10 @@ def _recursive_folders(prog: str, args: list, cwd: Optional[str]) -> Optional[tu
     understood, or names no existing path, the working folder is included."""
     here = _abs(".", cwd)
     if prog in GREP_FAMILY or prog in HIDDEN_SKIPPERS:
-        # Recursion, dotfile reach and candidate folders are read from the raw tokens, so an option
-        # value mistaken for something else can only add scanning, never remove it.
-        end = args.index("--") if "--" in args else len(args)
-        raw_opts = [a for a in args[:end] if a.startswith("-") and len(a) > 1]
+        # Recursion, dotfile reach and candidate folders are read from every raw token, so a token
+        # whose role is misjudged can only add scanning, never remove it. A "--" is not trusted as
+        # the end of options here: in `-e -- -r` it is the pattern, and -r still applies.
+        raw_opts = [a for a in args if a.startswith("-") and len(a) > 1 and a != "--"]
         raw_short = "".join(a[1:] for a in raw_opts if not a.startswith("--"))
         raw_long = [a[2:].partition("=")[0] for a in raw_opts if a.startswith("--")]
         if prog in GREP_FAMILY and not (any(c in raw_short for c in "rRd") or "recursive" in raw_long
@@ -590,14 +593,16 @@ def _recursive_folders(prog: str, args: list, cwd: Optional[str]) -> Optional[tu
                       or (prog == "rg" and "g" in raw_short)
                       or raw_short.count("u") >= (2 if prog == "rg" else 1)
                       or raw_long.count("unrestricted") >= (2 if prog == "rg" else 1))
-        named_existing = False
-        for p in paths:
+        folders, named_existing = [], False
+        for p in paths:                          # the parsed path operands, dash-prefixed ones included
             for m in (expand_glob(p, cwd) if _has_magic(p) else [_abs(p, cwd)]):
-                if os.path.exists(m):
+                if os.path.isdir(m):
+                    folders.append(m)
                     named_existing = True
-        folders = []
-        for tok in args:                         # every token that is a folder, wherever it sits
-            if tok.startswith("-"):
+                elif os.path.exists(m):
+                    named_existing = True
+        for tok in args:                         # and every token that is a folder, whatever its role
+            if tok == "--":
                 continue
             for m in (expand_glob(tok, cwd) if _has_magic(tok) else [_abs(tok, cwd)]):
                 if os.path.isdir(m):
@@ -808,11 +813,17 @@ def _check_command(command: str, cwd: Optional[str], _depth: int) -> Optional[st
                     reason = _folder_reason(folder, include_hidden=walk[1], skip_dirs=walk[2])
                     if reason:
                         return reason
+            after_terminator = False
             for a in args:
-                if not a.startswith("-") and _has_magic(a):
+                if a == "--":
+                    after_terminator = True
+                    continue
+                if (after_terminator or not a.startswith("-")) and _has_magic(a):
                     for m in expand_glob(a, cwd):
                         if is_secret_path(m, cwd):
                             return f"glob matches a secret-shaped file ({os.path.basename(m)})"
+                if after_terminator and is_secret_path(a, cwd, literal=True):
+                    return f"reads a secret-shaped file ({os.path.basename(a)})"
                 if is_secret_path(a, cwd):
                     return f"reads a secret-shaped file ({os.path.basename(a.strip(QUOTES))})"
                 # inline code (python -c, perl -e, node -e) naming a secret file

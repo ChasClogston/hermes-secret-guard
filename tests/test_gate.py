@@ -31,13 +31,16 @@ class Fixture(unittest.TestCase):
         cls.base = os.path.realpath(tempfile.mkdtemp(prefix="sg-gate-"))
         w = cls.w = os.path.join(cls.base, "work")
         for d in ("sub", "clean/src", "hidden_only", "nested/a/b/c/d/e/f/g", "nprod", "tokdir",
-                  "proj/node_modules/pkg", "proj/src", "placeholder", "deps/venv", "deps/__pycache__"):
+                  "proj/node_modules/pkg", "proj/src", "placeholder", "deps/venv", "deps/__pycache__",
+                  "dd", "-data", "-clean", "dashfile"):
             os.makedirs(os.path.join(w, d))
         cls.deep = os.path.join(cls.base, "deep", *"abcdefghijklmn")   # beyond the scan depth
         os.makedirs(cls.deep)
         S = "DRILL_FAKE_KEY=" + VALUE + "\n"
         files = {".env": S, "notes.txt": "hello\n", "sub/prod.env": S, "patfile": "drill\n",
                  "placeholder/.env.example": S, "placeholder/a.txt": "x\n", "deps/venv/prod.env": S,
+                 "dd/.env": "DD=--" + VALUE + "\n", "-data/.env": S, "-clean/a.txt": "print\n",
+                 "dashfile/-prod.env": S, "dashfile/a.txt": "x\n",
                  "deps/__pycache__/prod.env": S, "clean/src/tokenized-secrets.py": "x\n",
                  "clean/src/app.py": "print(1)\n", "clean/tokenizer.json": "{}\n", "clean/readme.md": "x\n",
                  "clean/src/credential_files.cpython-314.pyc": "x",
@@ -219,6 +222,23 @@ class ReviewFindings(Fixture):
             ("R1: a swallowed folder is still scanned", T("grep -r --frob hidden_only X notes.txt"), "blocked"),
             ("placeholder env file blocks a folder search", T("grep -r x placeholder"), "blocked"),
             ("tokenized-secrets.json is not exempt", T("grep -r x tokdir"), "blocked"),
+            ("R4: -e -- then -r", T("grep -e -- -r dd"), "blocked"),
+            ("R4: rg -e -- then --hidden", T("rg -e -- --hidden dd"), "blocked"),
+            ("R4: -- then a dash-prefixed folder", T("grep -r drill -- -data"), "blocked"),
+            ("R4: --regexp=-- -r", T("grep --regexp=-- -r dd"), "blocked"),
+            ("R4: --regexp -- -r", T("grep --regexp -- -r dd"), "blocked"),
+            ("R4: -r after an explicit pattern", T("grep -e drill -r dd"), "blocked"),
+            ("R4: rg -uu after an explicit pattern", T("rg -e drill dd -uu"), "blocked"),
+            ("R4: rg -- PATTERN -data with --hidden", T("rg --hidden -- drill -data"), "blocked"),
+            ("R4: two folders after --, one dash-prefixed", T("grep -r -e drill -- clean -data"), "blocked"),
+            ("R4: a secret file whose name starts with a dash, in a folder scan", T("grep -r drill dashfile"), "blocked"),
+            ("R4: the same, named with a folder", T("cat dashfile/-prod.env"), "blocked"),
+            ("R4: the same, after a terminator", T("cd dashfile && cat -- -prod.env"), "blocked"),
+            ("R4: the same, through a glob", T("cat dashfile/*"), "blocked"),
+            ("R4: search_files over that folder", ("search_files", {"pattern": "drill", "path": self.w + "/dashfile"}), "blocked"),
+            ("R4 control: -- then a clean dash-prefixed folder", T("grep -r print -- -clean"), "allowed"),
+            ("R4 control: an option that looks like a secret name", T("ls -secret"), "allowed"),
+            ("R4 control: -e -- -r in a clean folder", T("grep -e -- -r clean"), "allowed"),
             ("R1 control: grep --color -r in a clean folder", T("grep --color -r print clean"), "allowed"),
             ("R1 control: grep --color=always -rn clean", T("grep --color=always -rn print clean"), "allowed"),
             ("R1 control: grep -C 2 -r clean", T("grep -C 2 -r print clean"), "allowed"),
@@ -376,6 +396,13 @@ class Differential(Fixture):
             "grep -r drill placeholder", "grep -rl drill . | head -1; grep -r drill sub",
             "sh -c 'grep --color -r drill hidden_only'", "egrep -r drill hidden_only", "fgrep -r drill hidden_only",
             "grep --color drill notes.txt", "grep -r print clean", "grep --color -r print clean",
+            # R4: a double hyphen as the pattern, and as a real terminator before dash-prefixed folders
+            "grep -e -- -r dd", "grep -e '--' -r dd", "grep --regexp=-- -r dd", "grep --regexp -- -r dd",
+            "grep -r -e -- dd", "grep -e -- -R dd", "grep -e drill -r dd", "grep -r drill -- -data",
+            "grep -r -- drill -data", "grep -r -e drill -- -data", "grep -r -e drill -- clean -data",
+            "grep -rn drill -- -data nprod", "grep --color -r drill -- -data", "grep -r print -- -clean",
+            "grep -e -- -r clean", "grep -r drill dashfile", "cat dashfile/-prod.env", "cat dashfile/*",
+            "cd dashfile && cat -- -prod.env", "cd dashfile && grep drill -- -prod.env", "head -n 1 -- dashfile/-prod.env",
         ])
         self.assertGreater(n, 10, "the grep here printed the value for too few rows to mean anything")
 
@@ -395,6 +422,11 @@ class Differential(Fixture):
             "rg --max-depth 5 drill", "rg -t py drill", "rg --type-not py drill sub", "rg -- drill sub",
             "rg -u drill hidden_only", "rg drill hidden_only", "rg print clean", "rg drill placeholder",
             "rg --hidden drill placeholder", "sh -c 'rg -uu drill hidden_only'",
+            # R4
+            "rg -e -- --hidden dd", "rg -e '--' --hidden dd", "rg --regexp=-- --hidden dd", "rg --regexp -- -uu dd",
+            "rg --hidden -e -- dd", "rg -e -- -uu dd", "rg -e drill dd --hidden", "rg -e drill dd -uu",
+            "rg --hidden drill -- -data", "rg --hidden -- drill -data", "rg -uu -e drill -- -data",
+            "rg --hidden -e drill -- clean -data", "rg print -- -clean",
         ])
         self.assertGreater(n, 10)
 
