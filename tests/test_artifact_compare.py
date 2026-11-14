@@ -1,14 +1,16 @@
-"""Artifact comparison tests (contract artifact-compare-v1). Synthetic byte files and dummy helpers only.
+"""Artifact comparison tests (contract artifact-compare-v2). Synthetic byte files and a dummy fetch program only.
 
     python tests/test_artifact_compare.py
 
-Every "secret" here is made up in this file and every helper is a throwaway script that prints them.
-No keychain, no real helper and no real credential is touched. Nothing here imports sqlite3.
+Every "value" here is made up in this file. The program the tool would run on a Mac, /usr/bin/security, is
+never run: the tests point the tool at a throwaway script that prints made-up values from a temp folder.
+No keychain and no real credential is touched. Nothing here imports sqlite3.
 """
 import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import subprocess
@@ -28,15 +30,23 @@ CANARY = "neighbour-canary-text-4471"
 
 
 def fake(i, n=48):
-    """A made-up key body with upper, lower and digits."""
     raw = hashlib.sha256(b"c%d" % i).hexdigest() * 4
     return "".join(c.upper() if j % 3 == 0 else c for j, c in enumerate(raw))[:n - 2] + "Zq"
 
 
-K1 = "sk-" + fake(1)                       # an sk- shaped value
-K2 = "plain-token-" + fake(2, 30)          # no listed shape at all
+K1 = "sk-" + fake(1)
+K2 = "plain-token-" + fake(2, 30)
 K3 = "ghp_" + fake(3, 36)
-OLD = "sk-" + fake(4)                      # in the files, not printed by the helper
+OLD = "sk-" + fake(4)                      # in the files, never supplied
+
+
+def fds():
+    return len(os.listdir("/dev/fd"))
+
+
+def text_of(path):
+    with open(path) as fh:
+        return fh.read()
 
 
 class Home(unittest.TestCase):
@@ -44,26 +54,41 @@ class Home(unittest.TestCase):
         self.base = os.path.realpath(tempfile.mkdtemp(prefix="sg-cmp-"))
         self.home = os.path.join(self.base, "home"); os.makedirs(self.home)
         self.db, self.wal = os.path.join(self.home, "state.db"), os.path.join(self.home, "state.db-wal")
-        self.marker = os.path.join(self.base, "helper-ran")
+        self.store = os.path.join(self.base, "bin", "store"); os.makedirs(self.store)
+        self.marker = os.path.join(self.base, "fetch-ran")
+        self.tool = self.script("dummy-security", [
+            "echo run >> %s" % shlex.quote(self.marker),
+            '[ "$1" = find-generic-password ] && [ "$2" = -w ] && [ "$3" = -s ] && [ "$5" = -a ] && [ $# -eq 6 ] || exit 64',
+            'f=%s/"$4"' % shlex.quote(self.store),
+            '[ -f "$f" ] || { echo "%s no such item" >&2; exit 44; }' % CANARY,
+            'cat "$f"; echo'])
+        real = ac.check_tool
+        self.patches = [mock.patch.object(ac, "SECURITY_BIN", self.tool), mock.patch.object(ac, "TOOL_OWNER_UID", os.geteuid()),
+                        mock.patch.object(ac, "check_tool", lambda path, uid, stop="/": real(path, uid, stop=self.base))]
+        for p in self.patches:
+            p.start()
 
     def tearDown(self):
+        for p in self.patches:
+            p.stop()
         shutil.rmtree(self.base, ignore_errors=True)
+
+    def script(self, name, lines, mode=0o700):
+        path = os.path.join(self.base, "bin", name)
+        with open(path, "w") as fh:
+            fh.write("#!/bin/sh\n" + "\n".join(lines) + "\n")
+        os.chmod(path, mode)
+        return path
+
+    def item(self, name, value):
+        with open(os.path.join(self.store, name), "wb") as fh:
+            fh.write(value if isinstance(value, bytes) else value.encode())
 
     def put(self, db=None, wal=None):
         for path, data in ((self.db, db), (self.wal, wal)):
             if data is not None:
                 with open(path, "wb") as fh:
                     fh.write(data)
-
-    def helper(self, pairs=(), body=None, mode=0o700, name="helper.sh"):
-        """A throwaway helper that leaves a marker when it runs and prints the given NAME=VALUE lines."""
-        path = os.path.join(self.base, name)
-        lines = ["#!/bin/sh", ": > %s" % shlex.quote(self.marker)]
-        lines += [body] if body is not None else ["printf '%%s\\n' %s" % shlex.quote("%s=%s" % p) for p in pairs]
-        with open(path, "w") as fh:
-            fh.write("\n".join(lines) + "\n")
-        os.chmod(path, mode)
-        return path
 
     def run_compare(self, values):
         fd = os.open(self.home, hs._DIR)
@@ -75,100 +100,269 @@ class Home(unittest.TestCase):
     def standard(self):
         self.put(db=b"\x00" * 100 + b'key "' + K1.encode() + b'" x' + K2.encode() + b"y role" + K1.encode() + b"\x00 old " + OLD.encode() + b" end",
                  wal=b"w " + K2.encode() + b" " + K2.encode() + b"\n")
-        return {K1.encode(): ["OPENAI_API_KEY", "VOICE_KEY"], K2.encode(): ["OTHER_TOKEN"], K3.encode(): ["GITHUB_TOKEN"],
-                b"short": ["SHORT"], b"some-long-value-under-a-bad-name": [None]}
+        return {K1.encode(): ["openai-item", "voice-item"], K2.encode(): ["other-item"], K3.encode(): ["github-item"]}
 
     def by_names(self, res):
-        return {tuple(s["names"]): (s["occurrences"]["state.db"], s["occurrences"]["state.db-wal"]) for s in res["secrets"]}
+        return {tuple(s["names"]): (s["occurrences"]["state.db"], s["occurrences"]["state.db-wal"]) for s in res["supplied"]}
+
+    def ran(self):
+        return os.path.exists(self.marker) and len(text_of(self.marker).split())
 
 
-class Helper(Home):
-    def test_output_is_parsed_like_the_dotenv_reader(self):
-        path = self.helper(body="printf '%s\\n' 'A_KEY=value-one-0123456789' 'B_KEY=value-one-0123456789' 'C_KEY=\"quoted value 0123456789\"' "
-                                "'D_KEY=' 'no equals sign here' '=nameless' 'lower=some-lowercase-named-value' 'E_KEY=has=equals=inside-0123' "
-                                "\"F_KEY='single quoted 0123456789'\"; printf 'G_KEY=crlf-value-0123456789\\r\\n'")
-        values, label = ac.run_helper(path)
-        self.assertIsNone(label)
-        self.assertEqual(values, {b"value-one-0123456789": ["A_KEY", "B_KEY"], b"quoted value 0123456789": ["C_KEY"],
-                                  b"some-lowercase-named-value": [None], b"has=equals=inside-0123": ["E_KEY"],
-                                  b"single quoted 0123456789": ["F_KEY"], b"crlf-value-0123456789": ["G_KEY"]})
+class ToolTrust(unittest.TestCase):
+    """check_tool on its own, on folders this test builds. `stop` limits how far up it looks, for the test only."""
 
-    def test_helpers_that_are_refused_without_being_run(self):
-        good = self.helper([("A_KEY", "value-one-0123456789")])
-        cases = [("helper.sh", "helper_path_not_absolute"), (os.path.join(self.base, "missing"), "helper_unavailable"),
-                 (self.base, "helper_not_a_regular_file"), (self.helper([], mode=0o720, name="g.sh"), "helper_writable_by_others"),
-                 (self.helper([], mode=0o702, name="o.sh"), "helper_writable_by_others")]
-        for path, want in cases:
-            self.assertEqual(ac.run_helper(path), ({}, want), path)
-        self.assertFalse(os.path.exists(self.marker))
-        with mock.patch.object(os, "geteuid", lambda: os.stat(good).st_uid + 1):
-            self.assertEqual(ac.run_helper(good), ({}, "helper_not_owned_by_you"))
-        self.assertFalse(os.path.exists(self.marker))
-        self.assertEqual(ac.run_helper(good)[1], None); self.assertTrue(os.path.exists(self.marker))
+    def setUp(self):
+        self.base = os.path.realpath(tempfile.mkdtemp(prefix="sg-tool-"))
+        self.dir = os.path.join(self.base, "a", "b"); os.makedirs(self.dir)
+        self.tool = os.path.join(self.dir, "tool")
+        with open(self.tool, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(self.tool, 0o755)
+        self.uid = os.geteuid()
 
-    def test_helpers_that_fail_time_out_or_print_too_much(self):
-        text = CANARY + K1
-        self.assertEqual(ac.run_helper(self.helper(body="echo %s >&2; printf 'A_KEY=%s\\n'; exit 3" % (text, K1))), ({}, "helper_failed"))
-        self.assertEqual(ac.run_helper(self.helper(body="echo nothing useful")), ({}, "helper_printed_no_usable_value"))
-        self.assertEqual(ac.run_helper(self.helper(body="exit 0")), ({}, "helper_printed_no_usable_value"))
-        with mock.patch.object(ac, "HELPER_MAX_OUTPUT", 200):
-            self.assertEqual(ac.run_helper(self.helper(body="printf 'A_KEY=%%s\\n' %s" % ("x" * 400))), ({}, "helper_output_too_large"))
-        t0 = time.monotonic()
-        with mock.patch.object(ac, "HELPER_TIMEOUT_S", 0.5):
-            self.assertEqual(ac.run_helper(self.helper(body="printf 'A_KEY=%s\\n'; sleep 30" % K1)), ({}, "helper_timed_out"))
-        self.assertLess(time.monotonic() - t0, 10)
-        with mock.patch.object(ac, "MAX_VALUES", 3):
-            values, label = ac.run_helper(self.helper([("K%d_KEY" % i, "value-number-%d-0123456789" % i) for i in range(6)]))
-        self.assertEqual((len(values), label), (3, "value_limit_reached"))
+    def tearDown(self):
+        os.chmod(self.dir, 0o755); os.chmod(os.path.dirname(self.dir), 0o755)
+        shutil.rmtree(self.base, ignore_errors=True)
 
-    def test_the_helper_is_run_directly_with_no_shell_and_no_input(self):
-        tricky = self.helper([("A_KEY", "value-one-0123456789")], name="has space; touch INJECTED.sh")
+    def check(self, path=None, uid=None):
+        return ac.check_tool(path or self.tool, self.uid if uid is None else uid, stop=self.base)
+
+    def test_a_sound_tool_and_each_refusal(self):
+        ident, label = self.check()
+        st = os.stat(self.tool)
+        self.assertEqual((ident, label), ((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns), None))
+        self.assertEqual(self.check("tool"), (None, "tool_path_not_absolute"))
+        self.assertEqual(self.check(self.dir + "/../b/tool"), (None, "tool_path_not_absolute"))       # not in plain form
+        self.assertEqual(self.check(self.tool + "-missing"), (None, "tool_unavailable"))
+        self.assertEqual(self.check(self.dir), (None, "tool_not_a_regular_file"))
+        self.assertEqual(self.check(uid=self.uid + 1), (None, "tool_owner_not_allowed"))
+        link = os.path.join(self.dir, "link"); os.symlink(self.tool, link)
+        self.assertEqual(self.check(link), (None, "tool_is_a_link"))
+        for mode in (0o775, 0o757):
+            os.chmod(self.tool, mode)
+            self.assertEqual(self.check(), (None, "tool_writable_by_others"), oct(mode))
+        os.chmod(self.tool, 0o755)
+
+    def test_every_folder_above_the_tool_is_checked(self):
+        for folder in (self.dir, os.path.dirname(self.dir), self.base):
+            for mode in (0o775, 0o757, 0o1777):                                      # a sticky shared folder is refused too
+                os.chmod(folder, mode)
+                self.assertEqual(self.check(), (None, "tool_folder_writable_by_others"), (folder, oct(mode)))
+            os.chmod(folder, 0o755)
+        self.assertEqual(self.check()[1], None)
+        moved = os.path.join(self.base, "a", "real-b"); os.rename(self.dir, moved); os.symlink(moved, self.dir)
+        self.assertEqual(self.check(), (None, "tool_is_a_link"))                     # a linked folder in the chain
+        os.remove(self.dir); os.rename(moved, self.dir)
+        real = os.lstat
+
+        def lstat(path, *a, **k):
+            st = real(path, *a, **k)
+            if path == os.path.dirname(self.dir):                                   # pretend this folder belongs to someone else
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1, st.st_gid, st.st_size, 0, 0, 0))
+            return st
+        with mock.patch.object(os, "lstat", lstat):
+            self.assertEqual(self.check(), (None, "tool_folder_owner_not_allowed"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "the real program path exists only on macOS")
+    def test_the_real_program_path_passes_the_check_on_a_mac(self):
+        ident, label = ac.check_tool("/usr/bin/security", 0)                         # looked at, never run
+        self.assertEqual(label, None); self.assertEqual(len(ident), 4)
+
+
+class Fetch(Home):
+    ENV = {"PATH": "/usr/bin:/bin", "HOME": "/", "USER": "u", "LANG": "C"}
+
+    def one(self, lines, name="t.sh"):
+        before = fds()
+        out = ac.fetch_one([self.script(name, lines)], self.ENV)
+        self.assertEqual(fds(), before)
+        with self.assertRaises(ChildProcessError):                                  # nothing left to reap
+            os.waitpid(-1, os.WNOHANG)
+        return out
+
+    def test_value_newline_status_and_discarded_errors(self):
+        self.assertEqual(self.one(["printf '%s\\n' " + shlex.quote(K1)]), (K1.encode(), "fetched"))
+        self.assertEqual(self.one(["printf '%s' " + shlex.quote(K1)]), (K1.encode(), "fetched"))
+        self.assertEqual(self.one(["printf '%s\\n\\n' " + shlex.quote(K1)]), ((K1 + "\n").encode(), "fetched"))      # only one newline is taken off
+        self.assertEqual(self.one(["echo %s%s >&2" % (CANARY, K1), "printf '%s\\n' " + shlex.quote(K1), "exit 44"]), (None, "item_unavailable"))
+        self.assertEqual(self.one(["printf '%s\\n' short"]), (None, "value_too_short"))
+        self.assertEqual(self.one(["printf '%s\\n' " + "a" * 15]), (None, "value_too_short"))
+        self.assertEqual(self.one(["printf '%s\\n' " + "a" * 16])[1], "fetched")
+        self.assertEqual(self.one(["printf '%s\\n' " + "a" * 4096])[1], "fetched")
+        self.assertEqual(self.one(["printf '%s\\n' " + "a" * 4097]), (None, "value_too_long"))
+        self.assertEqual(ac.fetch_one([os.path.join(self.base, "missing")], self.ENV), (None, "fetch_failed"))
+
+    def test_the_output_limit_is_enforced_while_reading(self):
+        """C2. The program is stopped as soon as one byte past the limit arrives, while it is still running."""
+        fill = "head -c %d /dev/zero | tr '\\\\0' a"
+        self.assertEqual(self.one([fill % 8192]), (None, "value_too_long"))             # exactly at the limit: read whole, then judged by length
+        for lines, label in (([fill % 8193, "sleep 30"], "cap+1 then still running"), ([fill % 100000], "finite oversize"),
+                             (["while :; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; done"], "never stops")):
+            t0 = time.monotonic()
+            self.assertEqual(self.one(lines), (None, "fetch_output_too_large"), label)
+            self.assertLess(time.monotonic() - t0, 5, label)
+        real, real_select, watched, got = os.read, select.select, set(), []
+
+        def selecting(r, w, x, t):
+            watched.update(r); return real_select(r, w, x, t)
+
+        def reading(fd, size):
+            data = real(fd, size)
+            if fd in watched:
+                got.append((size, len(data)))
+            return data
+        with mock.patch.object(os, "read", reading), mock.patch.object(select, "select", selecting):
+            self.one(["while :; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; done"], name="u.sh")
+        self.assertLessEqual(max(size for size, _n in got), ac.FETCH_MAX_OUTPUT + 1)    # never asks for more than one byte past the limit
+        self.assertEqual(sum(n for _size, n in got), ac.FETCH_MAX_OUTPUT + 1)           # and takes in exactly that much before stopping
+
+    def test_timeout_a_held_pipe_and_cancellation(self):
+        with mock.patch.object(ac, "FETCH_TIMEOUT_S", 0.6):
+            t0 = time.monotonic()
+            self.assertEqual(self.one(["printf '%s\\n' " + shlex.quote(K1), "sleep 30"]), (None, "fetch_timed_out"))
+            pidfile = os.path.join(self.base, "pid")
+            # the program exits at once but leaves a child holding the pipe open
+            self.assertEqual(self.one(["sleep 30 & echo $! > %s" % shlex.quote(pidfile), "printf '%s\\n' " + shlex.quote(K1)], name="h.sh"),
+                             (None, "fetch_timed_out"))
+            self.assertLess(time.monotonic() - t0, 8)
+        time.sleep(0.2)
+        state = subprocess.run(["ps", "-o", "stat=", "-p", text_of(pidfile).strip()], capture_output=True, text=True).stdout.strip()
+        self.assertTrue(state == "" or state.startswith("Z"), state)                   # the child it started was stopped too
+        real, n = select.select, {"n": 0}
+
+        def selecting(*a):
+            n["n"] += 1
+            if n["n"] == 1:
+                raise KeyboardInterrupt()
+            return real(*a)
+        before = fds()
+        with mock.patch.object(select, "select", selecting), self.assertRaises(KeyboardInterrupt):
+            ac.fetch_one([self.script("k.sh", ["printf '%s\\n' " + shlex.quote(K1), "sleep 30"])], self.ENV)
+        self.assertEqual(fds(), before)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(-1, os.WNOHANG)
+
+    def test_exact_command_no_shell_small_environment(self):
+        self.item("openai-item", K1)
         real, seen = subprocess.Popen, []
 
         def popen(argv, **kw):
-            seen.append((argv, kw.get("shell", False), kw.get("stdin"), kw.get("stderr")))
+            seen.append((list(argv), kw.get("shell", False), kw.get("stdin"), kw.get("stderr"), kw.get("cwd"), dict(kw.get("env") or {})))
             return real(argv, **kw)
-        with mock.patch.object(subprocess, "Popen", popen):
-            values, label = ac.run_helper(tricky)
-        self.assertEqual((values, label), ({b"value-one-0123456789": ["A_KEY"]}, None))
-        self.assertEqual(seen, [([tricky], False, subprocess.DEVNULL, subprocess.DEVNULL)])
-        self.assertFalse(os.path.exists(os.path.join(self.base, "INJECTED.sh")))
+        with mock.patch.object(subprocess, "Popen", popen), mock.patch.dict(os.environ, {"SECRET_IN_ENV": CANARY, "HOME": "/somewhere"}):
+            values, items, label = ac.fetch_items(["openai-item"], "someone")
+        self.assertEqual((values, items, label), ({K1.encode(): ["openai-item"]}, {"openai-item": "fetched"}, None))
+        self.assertEqual(seen, [([self.tool, "find-generic-password", "-w", "-s", "openai-item", "-a", "someone"], False, subprocess.DEVNULL,
+                                 subprocess.DEVNULL, "/", {"PATH": "/usr/bin:/bin", "HOME": "/somewhere", "USER": "someone", "LANG": "C"})])
+
+
+class Items(Home):
+    def test_names_must_be_plain_and_unique(self):
+        self.item("openai-item", K1)
+        self.assertEqual(ac.fetch_items([], "me"), ({}, {}, "no_item_named"))
+        self.assertEqual(ac.fetch_items(["i%d" % i for i in range(9)], "me")[2], "too_many_items")
+        for bad in ("-w", "has space", "a/b", "../x", "", "x" * 65, "né", "a;b", "$(id)"):
+            self.assertEqual(ac.fetch_items(["openai-item", bad], "me"), ({}, {}, "item_name_not_allowed"), bad)       # and not echoed back
+        self.assertEqual(ac.fetch_items(["openai-item", "openai-item"], "me")[2], "item_named_twice")                  # C3
+        for bad in ("", "-a", "two words"):
+            self.assertEqual(ac.fetch_items(["openai-item"], bad)[2], "account_name_not_allowed", bad)
+        with mock.patch.object(ac, "disable_core_dumps", lambda: False):
+            self.assertEqual(ac.fetch_items(["openai-item"], "me")[2], "core_dump_limit_not_set")
+        self.assertFalse(self.ran())                                                                                   # nothing was run for any of these
+
+    def test_all_or_nothing(self):
+        self.item("openai-item", K1); self.item("short-item", "abc"); self.item("long-item", "L" * 5000)
+        for names, status in ((["openai-item", "absent-item"], {"openai-item": "fetched", "absent-item": "item_unavailable"}),
+                              (["short-item", "openai-item"], {"short-item": "value_too_short", "openai-item": "fetched"}),
+                              (["long-item"], {"long-item": "value_too_long"})):
+            self.assertEqual(ac.fetch_items(names, "me"), ({}, status, "an_item_could_not_be_used"))
+        self.item("voice-item", K1); self.item("other-item", K2)
+        values, items, label = ac.fetch_items(["openai-item", "other-item", "voice-item"], "me")
+        self.assertEqual((values, label), ({K1.encode(): ["openai-item", "voice-item"], K2.encode(): ["other-item"]}, None))   # same value, two names
+
+    def test_a_typed_name_and_a_fetched_value_must_not_overlap(self):
+        """C1. The only names ever printed are the ones typed. If a typed name carries a value, or a value carries
+        a typed name, the run stops before anything is read."""
+        self.item("a" * 20, "a" * 16)                                                  # the value lies inside the name
+        self.assertEqual(ac.fetch_items(["a" * 20], "me")[::2], ({}, "a_name_and_a_value_overlap"))
+        self.item("openai-item", "prefix-openai-item-suffix-0123456789")               # the name lies inside the value
+        self.assertEqual(ac.fetch_items(["openai-item"], "me")[::2], ({}, "a_name_and_a_value_overlap"))
+        self.item("first-item", K1); self.item("second-item", "zz-first-item-zz-0123456789")   # another item's name inside a value
+        self.assertEqual(ac.fetch_items(["first-item", "second-item"], "me")[::2], ({}, "a_name_and_a_value_overlap"))
+
+    def test_the_program_is_looked_at_before_and_after_every_run(self):
+        """C4. Two looks at the path, and the result is discarded if the file changed in between."""
+        self.item("openai-item", K1)
+        real = ac.fetch_one
+
+        def swapping(argv, env):
+            out = real(argv, env)
+            with open(self.tool + ".new", "w") as fh:
+                fh.write("#!/bin/sh\necho replaced-value-0123456789\n")
+            os.chmod(self.tool + ".new", 0o700); os.replace(self.tool + ".new", self.tool)
+            return out
+        with mock.patch.object(ac, "fetch_one", swapping):
+            self.assertEqual(ac.fetch_items(["openai-item"], "me"), ({}, {"openai-item": "not_fetched"}, "tool_changed_during_run"))
+        os.chmod(self.tool, 0o770)
+        self.assertEqual(ac.fetch_items(["openai-item"], "me")[2], "tool_writable_by_others")
+        os.chmod(self.tool, 0o700); os.chmod(os.path.dirname(self.tool), 0o777)
+        self.assertEqual(ac.fetch_items(["openai-item"], "me")[2], "tool_folder_writable_by_others")
+        os.chmod(os.path.dirname(self.tool), 0o755)
+
+    def test_core_dumps_are_off_here_and_in_what_is_started(self):
+        code = ("import sys, resource, subprocess; sys.path.insert(0, %r); import artifact_compare as c; "
+                "print(c.disable_core_dumps(), resource.getrlimit(resource.RLIMIT_CORE), "
+                "subprocess.run(['/bin/sh', '-c', 'ulimit -c'], capture_output=True, text=True).stdout.strip())" % REPO)
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "True (0, 0) 0")
 
 
 class Compare(Home):
-    def test_counts_by_secret_and_classes_by_match(self):
+    def test_counts_by_item_and_classes_by_match(self):
         res = self.run_compare(self.standard())
-        self.assertEqual(self.by_names(res), {("OPENAI_API_KEY", "VOICE_KEY"): (2, 0), ("OTHER_TOKEN",): (1, 2), ("GITHUB_TOKEN",): (0, 0),
-                                              (): (0, 0)})                           # the value under a name that is not printed
-        self.assertEqual(res["not_compared"], [{"names": ["SHORT"], "reason": "shorter_than_16_bytes"}])
-        self.assertEqual((res["values_from_helper"], res["values_compared"], res["names_not_printed"]), (5, 4, 1))
+        self.assertEqual(self.by_names(res), {("openai-item", "voice-item"): (2, 0), ("other-item",): (1, 2), ("github-item",): (0, 0)})
         m = res["matches"]
-        self.assertEqual((m["equals_a_current_secret"], m["no_current_secret"]),
-                         ({"distinct": 1, "names": ["OPENAI_API_KEY", "VOICE_KEY"]}, {"distinct": 1, "names": []}))    # K1 twice is one string; OLD is the other
-        self.assertEqual((m["contains_a_current_secret"]["distinct"], m["inside_a_current_secret"]["distinct"]), (0, 0))
-        self.assertEqual((res["finished"], res["run"]), (True, []))
+        self.assertEqual((m["equals_a_supplied_value"], m["no_supplied_value"]),
+                         ({"distinct": 1, "names": ["openai-item", "voice-item"]}, {"distinct": 1, "names": []}))
+        self.assertEqual((m["contains_a_supplied_value"]["distinct"], m["inside_a_supplied_value"]["distinct"]), (0, 0))
+        self.assertEqual((res["finished"], res["run"], res["values_compared"]), (True, [], 3))
 
-    def test_contains_and_inside_classes(self):
-        longer = (K1 + "extraTAIL9").encode()                                  # the match runs on past the value
-        self.put(db=b" " + longer + b" and " + K3.encode()[:30] + b" ")        # 30 bytes of K3 are not a gh match at all
-        res = self.run_compare({K1.encode(): ["OPENAI_API_KEY"], K3.encode(): ["GITHUB_TOKEN"]})
-        self.assertEqual(res["matches"]["contains_a_current_secret"], {"distinct": 1, "names": ["OPENAI_API_KEY"]})
-        self.assertEqual(self.by_names(res)[("OPENAI_API_KEY",)], (1, 0))        # the value itself is there, inside the longer run
+    def test_nothing_is_read_unless_every_value_is_usable(self):
+        self.standard()
+        real, n = os.read, {"n": 0}
+
+        def reading(fd, size):
+            n["n"] += 1; return real(fd, size)
+        with mock.patch.object(os, "read", reading):
+            for values in ({}, {b"short": ["x-item"]}, {K1.encode(): ["a-item"], b"L" * 5000: ["b-item"]}):
+                res = self.run_compare(values)
+                self.assertEqual((res["finished"], res["run"], res["files"]["state.db"]["status"]), (False, ["an_item_could_not_be_used"], "not_reached"))
+        self.assertEqual(n["n"], 0)
+
+    def test_class_precedence_when_a_match_relates_to_several_values(self):
+        inner = K1[3:25].encode()                                                   # 22 bytes that lie inside K1
+        longer = (K1 + "extraTAIL9").encode()
+        self.put(db=b" " + K1.encode() + b" and " + longer + b" ")
+        res = self.run_compare({K1.encode(): ["whole-item"], inner: ["inner-item"], (K1 + "extraTAIL9-and-more!").encode(): ["outer-item"]})
+        m = res["matches"]
+        self.assertEqual(m["equals_a_supplied_value"], {"distinct": 1, "names": ["whole-item"]})          # equal wins; inner-item and outer-item are not listed for it
+        self.assertEqual(m["contains_a_supplied_value"], {"distinct": 1, "names": ["inner-item", "whole-item"]})   # the longer match: contains wins over inside
+        self.assertEqual(m["inside_a_supplied_value"], {"distinct": 0, "names": []})
         self.put(db=b" " + K1.encode() + b" ")
-        res = self.run_compare({(K1 + "-and-more-after-it").encode() + b"!": ["WRAPPED_KEY"]})   # the stored value is longer than the match
-        self.assertEqual(res["matches"]["inside_a_current_secret"], {"distinct": 1, "names": ["WRAPPED_KEY"]})
-        self.assertEqual(self.by_names(res)[("WRAPPED_KEY",)], (0, 0))
+        res = self.run_compare({(K1 + "-and-more-after-it!").encode(): ["wrapped-item"]})
+        self.assertEqual(res["matches"]["inside_a_supplied_value"], {"distinct": 1, "names": ["wrapped-item"]})
+        self.assertEqual(self.by_names(res)[("wrapped-item",)], (0, 0))
+        self.assertIn("each in the first class that fits", ac.render(res))
 
-    def test_overlapping_and_boundary_length_values(self):
-        self.put(db=b"x" + b"a" * 20 + b"x" + b"B" * 15 + b"x" + b"c" * 4096 + b"x" + b"d" * 4097)
-        res = self.run_compare({b"a" * 16: ["SIXTEEN_A"], b"B" * 15: ["FIFTEEN_B"], b"c" * 4096: ["MAX_C"], b"d" * 4097: ["OVER_D"]})
-        self.assertEqual(self.by_names(res), {("SIXTEEN_A",): (5, 0), ("MAX_C",): (1, 0)})       # five overlapping starts in twenty
-        self.assertEqual(res["not_compared"], [{"names": ["OVER_D"], "reason": "longer_than_4096_bytes"},
-                                               {"names": ["FIFTEEN_B"], "reason": "shorter_than_16_bytes"}])
+    def test_overlapping_occurrences_and_boundary_lengths(self):
+        self.put(db=b"x" + b"a" * 20 + b"x" + b"c" * 4096 + b"x")
+        res = self.run_compare({b"a" * 16: ["sixteen-item"], b"c" * 4096: ["max-item"]})
+        self.assertEqual(self.by_names(res), {("sixteen-item",): (5, 0), ("max-item",): (1, 0)})
 
     def test_results_do_not_depend_on_where_chunks_fall(self):
-        vals = {("value-%03d-" % i + fake(i, 20 + i % 40)).encode(): ["V%d_KEY" % i] for i in range(30)}
-        vals[b"L" * 700] = ["LONG_KEY"]
+        vals = {("value-%03d-" % i + fake(i, 20 + i % 40)).encode(): ["v%d-item" % i] for i in range(30)}
+        vals[b"L" * 700] = ["long-item"]
         keys, parts = list(vals), []
         for i in range(600):
             parts.append(b"\x00" * (1 + (i * 41) % 700)); parts.append(keys[i % len(keys)])
@@ -180,29 +374,36 @@ class Compare(Home):
             with mock.patch.object(hs, "CHUNK", chunk), mock.patch.object(hs, "OVERLAP", overlap):
                 res = self.run_compare(vals)
             self.assertTrue(res["finished"], chunk)
-            seen.add(json.dumps([res["secrets"], res["matches"]], sort_keys=True))
+            seen.add(json.dumps([res["supplied"], res["matches"]], sort_keys=True))
         self.assertEqual(len(seen), 1)
         got = self.by_names(res)
         for i in range(30):
-            self.assertEqual(got[("V%d_KEY" % i,)], (20 if i < 11 else 19, 0), i)       # 600 placements over 31 values
-        self.assertEqual(got[("LONG_KEY",)], (19, 0))
-        self.assertEqual(res["matches"]["no_current_secret"]["distinct"], 86)
+            self.assertEqual(got[("v%d-item" % i,)], (20 if i < 11 else 19, 0), i)
+        self.assertEqual((got[("long-item",)], res["matches"]["no_supplied_value"]["distinct"]), ((19, 0), 86))
 
     def test_no_value_and_no_file_byte_reaches_any_output(self):
         vals = self.standard()
-        self.put(db=CANARY.encode() + open(self.db, "rb").read() + CANARY.encode())
+        with open(self.db, "rb") as fh:
+            data = fh.read()
+        self.put(db=CANARY.encode() + data + CANARY.encode())
         res = self.run_compare(vals)
-        allowed = set(re.findall(r"[A-Za-z_]+", ac.render(ac._new_result()) + json.dumps(ac._new_result()) + " ".join(ac.MATCH_CLASSES + ac.STATUS + ac.RUN_LABELS)
-                                 + " FOUND found names occurrences reason distinct at least shorter_than_ bytes _bytes longer_than_ true false yes no name not printed"
-                                 + " OPENAI_API_KEY VOICE_KEY OTHER_TOKEN GITHUB_TOKEN SHORT"))
+        res["items"] = {n: "fetched" for names in vals.values() for n in names}
+        allowed = set(re.findall(r"[A-Za-z_]+", ac.render(ac._new_result()) + json.dumps(ac._new_result())
+                                 + " ".join(ac.MATCH_CLASSES + ac.STATUS + ac.RUN_LABELS + ac.ITEM_STATUS)
+                                 + " FOUND found not names occurrences distinct at least true false yes no item openai voice other github"
+                                 + " every named was compared against both files in full"))
         for out in (ac.render(res), json.dumps(res)):
-            for secret in (K1, K2, K3, OLD, fake(1), fake(2, 30), fake(4), CANARY, "some-long-value", self.base, K1[:12], K2[-10:]):
+            for secret in (K1, K2, K3, OLD, fake(1), fake(2, 30), fake(4), CANARY, self.base, K1[:12], K2[-10:]):
                 self.assertNotIn(secret, out)
             self.assertEqual(sorted(set(re.findall(r"[A-Za-z_]+", out)) - allowed), [])
             self.assertIsNone(re.search(r"[0-9a-f]{12,}", out))
-        self.assertIn("FOUND  [OPENAI_API_KEY, VOICE_KEY]  state.db 2  state.db-wal 0", ac.render(res))
+        text = ac.render(res)
+        self.assertIn("FOUND      [openai-item, voice-item]  state.db 2  state.db-wal 0", text)
+        self.assertIn("not found  [github-item]  state.db 0  state.db-wal 0", text)
+        self.assertIn("Nothing ties them to this home or to what Hermes uses", text)
+        self.assertNotIn("current", text)
 
-    def test_only_the_two_files_are_opened_and_nothing_is_written(self):
+    def test_only_the_two_files_are_opened_and_nothing_is_started_or_written(self):
         vals = self.standard()
         with open(self.db + "-shm", "wb") as fh:
             fh.write(K1.encode())
@@ -222,7 +423,7 @@ class Compare(Home):
         r = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import artifact_compare; "
                             "print(sorted(m for m in sys.modules if m.split('.')[0] in ('sqlite3', '_sqlite3', 'socket', 'ssl', 'urllib', 'http')))" % REPO],
                            capture_output=True, text=True)
-        self.assertEqual(r.stdout.strip(), "[]")                                    # the tool loads no database or network module
+        self.assertEqual(r.stdout.strip(), "[]")
 
 
 class Status(Home):
@@ -237,7 +438,7 @@ class Status(Home):
         return mock.patch.object(os, "read", reading)
 
     def test_missing_database_symlink_and_changes(self):
-        vals = {K1.encode(): ["OPENAI_API_KEY"]}
+        vals = {K1.encode(): ["openai-item"]}
         res = self.run_compare(vals)
         self.assertEqual((res["finished"], res["run"]), (False, ["database_absent"]))
         self.put(db=b"harmless " * 400)
@@ -248,7 +449,7 @@ class Status(Home):
             with open(self.wal, "wb") as fh:
                 fh.write(K1.encode())
         with self.acting(1, create):
-            res = self.run_compare(vals)                                           # a log that appears is never a finished run
+            res = self.run_compare(vals)
         self.assertEqual((res["finished"], res["run"], res["files"]["state.db-wal"]["change_observed"]), (False, ["source_change_observed"], True))
         os.remove(self.wal)
 
@@ -263,15 +464,15 @@ class Status(Home):
             fh.write(K1.encode())
         os.symlink(target, self.wal)
         res = self.run_compare(vals)
-        self.assertEqual((res["finished"], res["files"]["state.db-wal"]["status"], self.by_names(res)), (False, "symlink_not_followed", {("OPENAI_API_KEY",): (0, 0)}))
+        self.assertEqual((res["finished"], res["files"]["state.db-wal"]["status"], self.by_names(res)), (False, "symlink_not_followed", {("openai-item",): (0, 0)}))
 
     def test_limits_late_deadline_and_errors(self):
         self.put(db=b"".join(b" sk-" + fake(i).encode() + b" " for i in range(40)) + K1.encode())
-        vals = {K1.encode(): ["OPENAI_API_KEY"]}
+        vals = {K1.encode(): ["openai-item"]}
         with mock.patch.object(ac, "MAX_DISTINCT", 10):
             res = self.run_compare(vals)
         self.assertEqual((res["finished"], res["run"], res["distinct_counts_are_lower_bounds"]), (False, ["distinct_limit_reached"], True))
-        self.assertEqual(self.by_names(res), {("OPENAI_API_KEY",): (2, 0)})            # part 1 stays exact: fake(1) is K1's body
+        self.assertEqual(self.by_names(res), {("openai-item",): (2, 0)})               # part 1 stays exact
         self.assertIn("at least ", ac.render(res))
         with mock.patch.object(ac, "TIME_BUDGET_S", -1.0):
             res = self.run_compare(vals)
@@ -280,14 +481,14 @@ class Status(Home):
 
         def fstat(fd):
             state["n"] += 1
-            if state["n"] == 2:                                                     # the end check on the one file
+            if state["n"] == 2:
                 state["jump"] = 100000.0
             return real_fstat(fd)
-        before = len(os.listdir("/dev/fd"))
+        before = fds()
         with mock.patch.object(os, "fstat", fstat), mock.patch("time.monotonic", lambda: real_clock() + state["jump"]):
             res = self.run_compare(vals)
         self.assertEqual((res["finished"], res["run"], res["files"]["state.db"]["traversal_finished"]), (False, ["time_budget_reached"], True))
-        self.assertEqual(len(os.listdir("/dev/fd")), before)
+        self.assertEqual(fds(), before)
         for exc, label in ((OSError(5, CANARY + K1), None), (RuntimeError(CANARY + K1), "internal_error"), (KeyboardInterrupt(), "cancelled")):
             def reading(fd, size, exc=exc):
                 raise exc
@@ -296,15 +497,18 @@ class Status(Home):
             self.assertFalse(res["finished"])
             self.assertEqual(res["run"] if label else res["files"]["state.db"]["status"], [label] if label else "read_error")
             self.assertNotIn(CANARY, ac.render(res) + json.dumps(res)); self.assertNotIn(K1, ac.render(res) + json.dumps(res))
-            self.assertEqual(len(os.listdir("/dev/fd")), before)
+            self.assertEqual(fds(), before)
 
 
 class Invocation(Home):
-    def cli(self, *args, cmd=None):
+    def cli(self, *args, pre="", plain=False):
+        """Run the command at a pseudo-terminal, pointed at the dummy fetch program unless `plain`."""
         import pty
+        setup = "" if plain else ("real = c.check_tool\nc.SECURITY_BIN = %r\nc.TOOL_OWNER_UID = %d\n"
+                                  "c.check_tool = lambda path, uid, stop='/': real(path, uid, stop=%r)\n" % (self.tool, os.geteuid(), self.base))
+        code = "%simport os, sys; sys.path.insert(0, %r); import artifact_compare as c\n%ssys.exit(c.main(%r))\n" % (pre, REPO, setup, list(args))
         master, slave = pty.openpty()
-        p = subprocess.Popen(cmd or [sys.executable, os.path.join(REPO, "artifact_compare.py"), *args], stdin=slave, stdout=slave,
-                             stderr=subprocess.PIPE, close_fds=True)
+        p = subprocess.Popen([sys.executable, "-c", code], stdin=slave, stdout=slave, stderr=subprocess.PIPE, close_fds=True)
         os.close(slave); chunks = []
         while True:
             try:
@@ -317,72 +521,90 @@ class Invocation(Home):
         err = p.stderr.read().decode(); p.stderr.close(); os.close(master)
         return p.wait(timeout=60), b"".join(chunks).decode().replace("\r\n", "\n"), err
 
-    def test_end_to_end_at_a_terminal_with_a_dummy_helper(self):
+    def test_end_to_end_at_a_terminal_with_the_dummy_program(self):
         self.standard()
-        helper = self.helper([("OPENAI_API_KEY", K1), ("VOICE_KEY", K1), ("OTHER_TOKEN", K2), ("GITHUB_TOKEN", K3), ("SHORT", "abc")])
-        code, out, err = self.cli("--home", self.home, "--secrets-command", helper)
+        self.item("openai-item", K1); self.item("voice-item", K1); self.item("other-item", K2); self.item("github-item", K3)
+        args = ["--home", self.home, "--keychain-account", "me"] + [x for n in ("openai-item", "voice-item", "other-item", "github-item") for x in ("--keychain-service", n)]
+        code, out, err = self.cli(*args)
         self.assertEqual((code, err), (0, ""))
-        self.assertIn("FOUND  [OPENAI_API_KEY, VOICE_KEY]  state.db 2  state.db-wal 0", out)
-        self.assertIn("FOUND  [OTHER_TOKEN]  state.db 1  state.db-wal 2", out)
-        self.assertIn("equals_a_current_secret      1  [OPENAI_API_KEY, VOICE_KEY]", out)
-        self.assertIn("Comparison finished.", out)
+        self.assertIn("item [openai-item]: fetched", out)
+        self.assertIn("FOUND      [openai-item, voice-item]  state.db 2  state.db-wal 0", out)
+        self.assertIn("FOUND      [other-item]  state.db 1  state.db-wal 2", out)
+        self.assertIn("not found  [github-item]  state.db 0  state.db-wal 0", out)
+        self.assertIn("equals_a_supplied_value      1  [openai-item, voice-item]", out)
+        self.assertIn("Comparison finished: every named item was compared against both files in full.", out)
         for secret in (K1, K2, K3, OLD):
             self.assertNotIn(secret, out)
-        code, out, err = self.cli("--home", self.home, "--secrets-command", helper, "--json")
-        self.assertEqual(json.loads(out)["matches"]["no_current_secret"]["distinct"], 1)
+        code, out, err = self.cli(*args, "--json")
+        data = json.loads(out)
+        self.assertEqual((data["matches"]["no_supplied_value"]["distinct"], data["finished"], self.ran()), (1, True, 8))    # four fetches per run
 
-    def test_the_helper_is_not_run_unless_everything_else_is_in_order(self):
-        self.standard()
-        helper = self.helper([("OPENAI_API_KEY", K1)])
-        r = subprocess.run([sys.executable, os.path.join(REPO, "artifact_compare.py"), "--home", self.home, "--secrets-command", helper],
-                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
-        self.assertEqual((r.returncode, r.stdout), (2, "")); self.assertIn("run this yourself at a terminal", r.stderr)   # not a terminal
-        code, out, err = self.cli("--home", os.path.join(self.base, "missing"), "--secrets-command", helper)
-        self.assertEqual(code, 1); self.assertIn("run notes: home_unavailable", out)                                     # no home
+    def test_nothing_is_fetched_unless_everything_else_is_in_order(self):
+        self.standard(); self.item("openai-item", K1)
+        base = ["--home", self.home, "--keychain-service", "openai-item", "--keychain-account", "me"]
+        r = subprocess.run([sys.executable, os.path.join(REPO, "artifact_compare.py"), *base], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        self.assertEqual((r.returncode, r.stdout), (2, "")); self.assertIn("run this yourself at a terminal", r.stderr)      # not a terminal
+        code, out, err = self.cli("--home", os.path.join(self.base, "missing"), *base[2:])
+        self.assertEqual(code, 1); self.assertIn("run notes: home_unavailable", out)                                         # no home
+        code, out, err = self.cli(*base, pre="import sqlite3\n")
+        self.assertEqual(code, 1); self.assertIn("run notes: refused_sqlite_loaded_in_process", out)                         # sqlite3 loaded
         code, out, err = self.cli("--home", self.home)
-        self.assertEqual(code, 2)                                                                                        # no helper named
-        wrapper = "import sqlite3, sys; sys.path.insert(0, %r); import artifact_compare as c; sys.exit(c.main(['--home', %r, '--secrets-command', %r]))" % (REPO, self.home, helper)
-        code, out, err = self.cli(cmd=[sys.executable, "-c", wrapper])
-        self.assertEqual(code, 1); self.assertIn("run notes: refused_sqlite_loaded_in_process", out)                     # sqlite3 loaded
-        self.assertFalse(os.path.exists(self.marker))
-        bad = self.helper([("OPENAI_API_KEY", K1)], mode=0o722, name="bad.sh")
-        code, out, err = self.cli("--home", self.home, "--secrets-command", bad)
-        self.assertEqual(code, 1); self.assertIn("run notes: helper_writable_by_others", out)
-        self.assertIn("state.db: status not_reached, 0 of 0 byte(s) read", out)                                          # and then nothing is read
-        self.assertFalse(os.path.exists(self.marker))
-        code, out, err = self.cli("--home", self.home, "--secrets-command", helper)
-        self.assertEqual(code, 0); self.assertTrue(os.path.exists(self.marker))
+        self.assertEqual(code, 1); self.assertIn("run notes: no_item_named", out)                                            # nothing named
+        self.assertFalse(self.ran())
+        code, out, err = self.cli(*base)
+        self.assertEqual((code, self.ran()), (0, 1))
 
-    def test_a_failed_helper_reads_nothing_and_a_moved_home_is_not_finished(self):
-        self.standard()
-        failing = self.helper(body="echo %s >&2; exit 2" % (CANARY + K1), name="fail.sh")
-        code, out, err = self.cli("--home", self.home, "--secrets-command", failing)
-        self.assertEqual((code, err), (1, "")); self.assertIn("run notes: helper_failed", out)
-        self.assertIn("state.db: status not_reached, 0 of 0 byte(s) read", out); self.assertNotIn(CANARY, out)
-        helper = self.helper([("OPENAI_API_KEY", K1)])
+    def test_an_item_that_cannot_be_used_means_nothing_is_read(self):
+        self.standard(); self.item("openai-item", K1)
+        code, out, err = self.cli("--home", self.home, "--keychain-account", "me", "--keychain-service", "openai-item", "--keychain-service", "absent-item")
+        self.assertEqual((code, err), (1, ""))
+        self.assertIn("item [absent-item]: item_unavailable", out); self.assertIn("item [openai-item]: fetched", out)
+        self.assertIn("run notes: an_item_could_not_be_used", out); self.assertIn("Nothing was read from the home.", out)
+        self.assertIn("state.db: status not_reached, 0 of 0 byte(s) read", out)
+        self.assertNotIn(CANARY, out); self.assertNotIn(K1, out)
+        code, out, err = self.cli("--home", self.home, "--keychain-account", "me", "--keychain-service", "openai-item", "--keychain-service", "EVIL$(id)")
+        self.assertEqual(code, 1); self.assertIn("run notes: item_name_not_allowed", out)
+        self.assertNotIn("EVIL", out); self.assertNotIn("openai-item", out)                 # a refused command line echoes no name at all
+
+    def test_what_the_program_prints_is_only_ever_a_value(self):
+        """C1. Text shaped like NAME=VALUE from the fetch program is a value and nothing else. No name can come from it."""
+        payload = "EVIL_NAME=" + fake(7, 30)
+        self.item("openai-item", payload)
+        self.put(db=b"x " + payload.encode() + b" y")
+        code, out, err = self.cli("--home", self.home, "--keychain-account", "me", "--keychain-service", "openai-item", "--json")
+        data = json.loads(out)
+        self.assertEqual((code, data["supplied"]), (0, [{"names": ["openai-item"], "occurrences": {"state.db": 1, "state.db-wal": 0}}]))
+        self.assertNotIn("EVIL_NAME", out); self.assertNotIn(fake(7, 30), out)
+
+    def test_a_moved_home_is_not_finished(self):
+        self.standard(); self.item("openai-item", K1)
         os.makedirs(self.home + ".other")
-        wrapper = ("import os, sys; sys.path.insert(0, %r); import artifact_compare as c\n"
-                   "real, home, n = os.read, %r, {'n': 0}\n"
-                   "def reading(fd, size):\n"
-                   "    data = real(fd, size); n['n'] += 1\n"
-                   "    if n['n'] == 1:\n"
-                   "        os.rename(home, home + '.moved'); os.rename(home + '.other', home)\n"
-                   "    return data\n"
-                   "os.read = reading\n"
-                   "sys.exit(c.main(['--home', home, '--secrets-command', %r, '--json']))\n" % (REPO, self.home, helper))
-        code, out, err = self.cli(cmd=[sys.executable, "-c", wrapper])
+        pre = ("import os, stat\nreal_read, n = os.read, {'n': 0}\n"
+               "def reading(fd, size):\n"
+               "    data = real_read(fd, size)\n"
+               "    if stat.S_ISREG(os.fstat(fd).st_mode):\n"                     # the first read of a database file, not of a fetch pipe
+               "        n['n'] += 1\n"
+               "        if n['n'] == 1:\n"
+               "            os.rename(%r, %r); os.rename(%r, %r)\n"
+               "    return data\n"
+               "os.read = reading\n" % (self.home, self.home + ".moved", self.home + ".other", self.home))
+        code, out, err = self.cli("--home", self.home, "--keychain-account", "me", "--keychain-service", "openai-item", "--json", pre=pre)
         data = json.loads(out)
         self.assertEqual((code, data["finished"], data["run"]), (1, False, ["home_path_changed_during_run"]))
-        self.assertEqual(data["secrets"][0]["occurrences"]["state.db"], 2)             # the folder opened at the start
+        self.assertEqual(data["supplied"][0]["occurrences"]["state.db"], 2)
 
     def test_documented_limits_and_labels_are_the_code(self):
         doc = ac.__doc__
-        for word in ac.MATCH_CLASSES + ("shorter than 16 bytes", "longer than\n      4,096 bytes", "30 second", "1 MiB", "2,000\n  values",
-                                        "900 second", "THIS TOOL HANDLES LIVE CREDENTIALS", "never through a shell", "Read the helper before naming it",
-                                        "A count of zero does not show", "no_current_secret does not show a match is harmless"):
+        for word in ac.MATCH_CLASSES + ("/usr/bin/security find-generic-password -w -s NAME -a ACCOUNT", "at most 8", "8,192 bytes", "10 second",
+                                        "16 to 4,096 bytes", "900 second", "THIS TOOL HANDLES LIVE CREDENTIALS", "It runs no program you supply",
+                                        "not a lock", "Core dumps are turned off", "never \"current secret\"", "ALL OR NOTHING",
+                                        "the first class that fits", "A count of zero does not show", "no_supplied_value does not show a match is harmless"):
             self.assertIn(word, doc)
-        self.assertEqual((ac.MIN_VALUE_BYTES, ac.MAX_VALUE_BYTES, ac.HELPER_TIMEOUT_S, ac.HELPER_MAX_OUTPUT, ac.MAX_VALUES, ac.TIME_BUDGET_S),
-                         (16, 4096, 30.0, 1024 * 1024, 2000, 900.0))
+        self.assertEqual((ac.SECURITY_BIN if False else "/usr/bin/security", ac.MAX_ITEMS, ac.MIN_VALUE_BYTES, ac.MAX_VALUE_BYTES, ac.FETCH_MAX_OUTPUT,
+                          ac.FETCH_TIMEOUT_S, ac.TIME_BUDGET_S), ("/usr/bin/security", 8, 16, 4096, 8192, 10.0, 900.0))
+        r = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import artifact_compare as c; print(c.SECURITY_BIN, c.TOOL_OWNER_UID)" % REPO],
+                           capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "/usr/bin/security 0")                    # the unpatched program path and owner
 
 
 if __name__ == "__main__":

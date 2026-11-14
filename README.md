@@ -325,36 +325,51 @@ The script must never be imported into a running Hermes: closing a file descript
 process that also holds a SQLite connection to the same file can cancel that connection's
 locks.
 
-### One-off comparison with a home's current secrets
+### One-off comparison with Keychain items you name
 
 ```bash
-python3 artifact_compare.py --home ~/.hermes --secrets-command /absolute/path/to/helper
+python3 artifact_compare.py --home ~/.hermes --keychain-service NAME [--keychain-service NAME ...]
 ```
 
-**This tool handles live credentials.** It runs the helper you name, the same program Hermes
-runs at start-up (`secrets.command`), and holds every value it prints in memory for the run.
-It answers one question: is the current value of any of those secrets present, byte for byte,
-in `state.db` or `state.db-wal`? (Contract `artifact-compare-v1`.)
+**This tool handles live credentials.** macOS only. For each Keychain item you name (at most
+8) it runs the system program `/usr/bin/security` once and holds what that returns in memory
+until the comparison ends. It answers one question: do those bytes occur in `state.db` or
+`state.db-wal` of the home? (Contract `artifact-compare-v2`.)
 
-It prints secret names and counts and nothing else: per secret, how many times its exact
-bytes occur in each file; and, for the provider-key-shaped matches of the artifact scope, how
-many distinct strings equal a current secret, contain one, lie inside one, or match none. It
-never prints a value, a byte of either file, an offset or a digest, writes no file and opens
-no network connection.
+It prints the item names you typed, and counts: per item, how many times its exact bytes
+occur in each file; and, for the provider-key-shaped matches of the artifact scope, how many
+distinct strings equal a supplied value, contain one, lie inside one, or match none (each in
+the first class that fits). It never prints a value, a byte of either file, an offset or a
+digest, and writes no file.
 
-The helper path has no default and must be an absolute path to a regular file that you own
-and nobody else can write. It is run directly, never through a shell, with a 30 second and
-1 MiB limit, and only after the terminal, the home and the SQLite checks have passed. If it
-is refused or fails, nothing is read. Values shorter than 16 bytes or longer than 4,096 are
-not searched for and are listed by name.
+**What the values are.** What this Mac's Keychain returns now, to you, for the names you
+typed. Nothing ties them to the home you named or to what Hermes is using; `--home` only
+chooses which two files are read. The output says "supplied value", never "current secret".
 
-What it cannot tell you: a count of zero shows only that those exact bytes were not found as
-one run, not that the credential was never there (a split, re-encoded or since-rotated value
-is not found); `no_current_secret` does not show a match is harmless; and the tool cannot
-protect the values from another program running as you, or know whether the helper is safe
-to run. The output names credentials that are in the database, so treat it as sensitive.
-Every limit of the artifact scope applies. `python tests/test_artifact_compare.py` covers it
-with made-up values and throwaway helper scripts; no real helper or credential is used.
+**Controls.**
+- It runs no program you supply. The one program is a fixed path, checked before and after
+  each run: a regular file, not a link, owned by root, not writable by group or others, and
+  the same for every folder above it. If the file changed between the two looks the result is
+  discarded. That is two looks, not a lock; it closes replacement by any user who is not root.
+- Output is read a piece at a time with a hard 8,192-byte and 10-second limit per item. Past
+  either, the program and anything it started are stopped and reaped.
+- A small fixed environment, no input, error output discarded.
+- Core dumps are turned off before any value is fetched, or the tool stops.
+- All or nothing: every named item must be fetched and be 16 to 4,096 bytes, or nothing is
+  read from the home. Names must be plain, unique, and must not overlap a fetched value.
+- Nothing is fetched until the terminal, the SQLite check and the home have passed.
+
+**What it cannot do.** Zero memory, or protect a value from another program running as you.
+Say anything about what `/usr/bin/security` itself reads, writes or contacts. Find a value
+that is split across pages, re-encoded, escaped or since rotated: a count of zero is "these
+exact bytes were not found", not "never there". Clear a match: `no_supplied_value` is not
+"harmless". "Finished" means every named item was compared in full, not that every credential
+of the home was. The output says which named items are in the database, so treat it as
+sensitive. Every limit of the artifact scope applies.
+
+`python -W error -X dev tests/test_artifact_compare.py` covers it with made-up values and a
+throwaway script standing in for the system program. The real program is never run by the
+tests; on macOS one test looks at its path.
 
 `python tests/test_artifact_scan.py` builds synthetic databases and runs every scan in its own
 process. It compares the scanner with an independent hand-written whole-file pass (physical

@@ -1,70 +1,94 @@
 #!/usr/bin/env python3
-"""One-off comparison of two database files with the secrets a Hermes home is configured to use.
-Read-only. Prints secret names and counts. Never prints a secret value or any byte of the files.
+"""One-off comparison of two database files with a few Keychain items that you name.
+Read-only. Prints the item names you typed and counts. Never prints a value or any byte of the files.
 
-    python3 artifact_compare.py --home /path/to/one/hermes/home --secrets-command /path/to/helper
+    python3 artifact_compare.py --home /path/to/one/hermes/home \\
+        --keychain-service NAME [--keychain-service NAME ...]
 
-Run it yourself, at a terminal. It answers one question: is the value of any secret that this
-home's own helper hands to Hermes present, byte for byte, in state.db or state.db-wal?
+Run it yourself, at a terminal, on macOS. It answers one question: do the bytes that this Mac's
+Keychain returns right now, for each item you name, occur in state.db or state.db-wal of that home?
 
 THIS TOOL HANDLES LIVE CREDENTIALS
-  It runs the helper you name, the same program Hermes runs at start-up (secrets.command), and
-  holds every value the helper prints in this process's memory for the length of the run. That is
-  a larger exposure than the scanner or the triage, which never touch a credential. Nothing here
-  reduces it to zero. What the tool does about it:
-    - The helper path has no default. It must be an absolute path to a regular file owned by you
-      and writable by nobody else. It is run directly, never through a shell, with a 30 second
-      limit and a 1 MiB limit on its output. Its error output is discarded unread.
-    - Values are never printed, logged, written to a file, put in an error message, passed to
-      another program or sent anywhere. No digest of a value is printed either.
-    - It writes no file and opens no network connection.
-  It cannot protect against another program running as you that inspects this process, and it
-  cannot know whether the helper itself is safe to run. Read the helper before naming it.
+  For each item you name (at most 8) it runs the system program /usr/bin/security once, as
+      /usr/bin/security find-generic-password -w -s NAME -a ACCOUNT
+  and holds what that prints in this process's memory until the comparison ends. That is a larger
+  exposure than the scanner or the triage, which touch no credential. Nothing here reduces it to
+  zero. What the tool does about it:
+    - It runs no program you supply. The one program is a fixed absolute path. Before each run the
+      tool checks that the file is a regular file, not a link, owned by root and not writable by
+      group or others, and that every folder above it is owned by root and not writable by group
+      or others. It checks the file again after the run and discards the result if the file's
+      identity, size or modification time changed. This closes replacement by any user who is not
+      root. It is two looks at a path, not a lock: it does not bind the run to the file that was
+      checked, and a change made and undone between the looks is not seen.
+    - Output from the program is read a piece at a time with a hard limit of 8,192 bytes and a
+      10 second limit per item. Past either, the program and anything it started are stopped and
+      reaped, and nothing is read from the home. Its error output is discarded unread.
+    - The program gets a small fixed environment (PATH, HOME, USER, LANG), no input, and "/" as
+      its working folder.
+    - Core dumps are turned off for this process and its children before any value is fetched. If
+      that cannot be confirmed, the tool stops.
+    - Values are never printed, logged, written to a file, put in an error message or sent
+      anywhere. No digest of a value is printed. The tool writes no file.
+  It cannot zero memory, and it cannot protect a value from another program running as you that
+  inspects this process. What /usr/bin/security itself reads, writes or contacts is that program's
+  business; "no write" and "no network" below describe this tool's own reader only.
 
 WHAT IT READS
   state.db and state.db-wal of the one home you name, as plain bytes, through one opened handle
   on the home. No SQLite: no connection, no lock protocol, no write. state.db-shm is never read.
 
-WHAT IT PRINTS (contract "artifact-compare-v1")
-  Part 1, by secret. For each value the helper printed, under the name or names the helper gave
-  it: how many times those exact bytes occur in each of the two files. A name is printed only if
-  it is capitals, digits and underscores; any other name is counted and not printed.
-    - A value shorter than 16 bytes is not searched for: short values occur by accident, and a
-      count for one would say more about the value than about the database. A value longer than
-      4,096 bytes is not searched for either. Both are listed by name as not_compared.
-    - Several names with the same value are one line. Occurrences may overlap.
+WHAT THE VALUES ARE, AND ARE NOT
+  They are what this Mac's Keychain returns now, to you, for the item names you typed. Nothing
+  ties them to the home you named or to what Hermes is using: --home only chooses which two files
+  are read. A value Hermes holds from another source, an override, or an earlier value since
+  rotated is not compared. The output therefore says "supplied value", never "current secret".
+
+WHAT IT PRINTS (contract "artifact-compare-v2")
+  The only names printed are the item names you typed on the command line. Each must be letters,
+  digits, dot, underscore or hyphen, at most 64 characters, and must not be typed twice. If a name
+  you typed contains a fetched value, or a fetched value contains a name, the tool stops before
+  reading the home.
+  Part 1, by item. For each value: how many times those exact bytes occur in each of the two
+  files. Items that return the same value are one line. Occurrences may overlap.
   Part 2, by match. The provider-key-shaped matches of the artifact scope ("artifact-bytes-v2",
   same pattern, leftmost and non-overlapping), counted as distinct byte strings in four classes:
-    equals_a_current_secret       the match is exactly a value from the helper
-    contains_a_current_secret     a value from the helper lies inside the match
-    inside_a_current_secret       the match lies inside a value from the helper
-    no_current_secret             none of the above
-  The first three classes also print the names involved.
+    equals_a_supplied_value       the match is exactly a supplied value
+    contains_a_supplied_value     a supplied value lies inside the match
+    inside_a_supplied_value       the match lies inside a supplied value
+    no_supplied_value             none of the above
+  Each match is put in the first class that fits, in that order, and only the item names for that
+  class are listed. A match that equals one value and also contains another is listed as equal,
+  with only the names of the value it equals. A substring relation is not proof that two things are the same
+  credential.
+
+ALL OR NOTHING
+  Every item you name must be fetched and must be 16 to 4,096 bytes long. If one is missing,
+  unreadable, shorter or longer, the tool says which, by the name you typed, and reads nothing
+  from the home. "Finished" therefore means: every named item was compared against both files in
+  full. It does not mean every credential of the home was compared.
 
 WHAT THE OUTPUT DISCLOSES, AND WHAT IT DOES NOT SHOW
-  - A name with a count above zero says that this credential's current value is in the home's
-    conversation database. That is the purpose, and it is sensitive: read the output before
-    sharing it.
+  - A count above zero says the bytes the Keychain returned for that item are in this home's
+    database. That is the purpose, and it is sensitive: read the output before sharing it.
   - A count of zero does not show the credential was never in the database. It shows these exact
     bytes were not found as one contiguous run. A value split across pages, stored in another
-    encoding, or stored with an escape inside it is not found. An earlier value of the same
-    credential, since rotated, is not compared at all.
-  - no_current_secret does not show a match is harmless. It may be a revoked key, a key of another
-    home or machine, a key this helper does not print, or an example from documentation.
+    encoding or with an escape inside it is not found.
+  - no_supplied_value does not show a match is harmless. It may be a revoked key, a key held
+    somewhere else, an item you did not name, or an example from documentation.
   - Matches can come from deleted or superseded content. The two files are not a snapshot.
     Nothing here speaks to the database's health.
 
 LIMITS
-  Same fixed byte limits as the artifact scope (4 GiB per file, 6 GiB for both), at most 2,000
-  values, at most 200,000 distinct matches, and a 900 second cooperative time budget that cannot
-  interrupt a stalled system call. Each of the two entries is looked at before it is opened and
-  again at the end; a file that appears, disappears, is replaced or changes makes the run not
-  finished, as does a check that cannot be made, a home path that no longer points at the opened
-  folder, a helper that fails, times out, prints too much or prints nothing usable, any limit, or
-  any error. If the home cannot be opened or the helper is refused, nothing is read. It declines
-  to run when the standard sqlite3 module is already loaded in its process; that is a rejection
-  check, not proof that no SQLite connection exists. The terminal check is friction, not proof
-  that a person started the run. No system-call trace of this tool exists on macOS.
+  Same fixed byte limits as the artifact scope (4 GiB per file, 6 GiB for both), at most 200,000
+  distinct matches, and a 900 second cooperative time budget that cannot interrupt a stalled
+  system call. Each of the two entries is looked at before it is opened and again at the end; a
+  file that appears, disappears, is replaced or changes makes the run not finished, as does a
+  check that cannot be made, a home path that no longer points at the opened folder, any limit or
+  any error. If the home cannot be opened, no item is fetched. It declines to run when the
+  standard sqlite3 module is already loaded in its process; that is a rejection check, not proof
+  that no SQLite connection exists. The terminal check is friction, not proof that a person
+  started the run. No system-call trace of this tool exists on macOS.
 """
 import argparse
 import errno
@@ -73,6 +97,9 @@ import hmac
 import json
 import os
 import re
+import resource
+import select
+import signal
 import stat
 import subprocess
 import sys
@@ -80,104 +107,189 @@ import time
 
 import history_scan as hs
 
-CONTRACT = "artifact-compare-v1"
+CONTRACT = "artifact-compare-v2"
+SECURITY_BIN = "/usr/bin/security"
+TOOL_OWNER_UID = 0
+MAX_ITEMS = 8
 MIN_VALUE_BYTES = 16
 MAX_VALUE_BYTES = 4096
-MAX_VALUES = 2000
+FETCH_MAX_OUTPUT = 8192
+FETCH_TIMEOUT_S = 10.0
 MAX_DISTINCT = 200_000
-HELPER_TIMEOUT_S = 30.0
-HELPER_MAX_OUTPUT = 1024 * 1024
 TIME_BUDGET_S = 900.0
-NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
-MATCH_CLASSES = ("equals_a_current_secret", "contains_a_current_secret", "inside_a_current_secret", "no_current_secret")
+LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+MATCH_CLASSES = ("equals_a_supplied_value", "contains_a_supplied_value", "inside_a_supplied_value", "no_supplied_value")
 STATUS = hs.ARTIFACT_STATUS
-HELPER_LABELS = ("helper_path_not_absolute", "helper_not_a_regular_file", "helper_not_owned_by_you", "helper_writable_by_others",
-                 "helper_unavailable", "helper_failed", "helper_timed_out", "helper_output_too_large", "helper_printed_no_usable_value",
-                 "value_limit_reached")
-RUN_LABELS = HELPER_LABELS + ("refused_sqlite_loaded_in_process", "home_unavailable", "home_path_changed_during_run", "database_absent",
-                              "source_change_observed", "truncated_at_size_cap", "total_byte_limit_reached", "time_budget_reached",
-                              "distinct_limit_reached", "cancelled", "internal_error")
+ITEM_STATUS = ("fetched", "not_fetched", "item_unavailable", "fetch_timed_out", "fetch_output_too_large", "fetch_failed",
+               "value_too_short", "value_too_long")
+SETUP_LABELS = ("no_item_named", "too_many_items", "item_name_not_allowed", "item_named_twice", "account_name_not_allowed",
+                "core_dump_limit_not_set", "tool_path_not_absolute", "tool_unavailable", "tool_is_a_link", "tool_not_a_regular_file",
+                "tool_owner_not_allowed", "tool_writable_by_others", "tool_folder_owner_not_allowed", "tool_folder_writable_by_others",
+                "tool_changed_during_run", "an_item_could_not_be_used", "a_name_and_a_value_overlap")
+RUN_LABELS = SETUP_LABELS + ("refused_sqlite_loaded_in_process", "home_unavailable", "home_path_changed_during_run", "database_absent",
+                             "source_change_observed", "truncated_at_size_cap", "total_byte_limit_reached", "time_budget_reached",
+                             "distinct_limit_reached", "cancelled", "internal_error")
 _PATTERN = hs.ARTIFACT_DETECTORS[1][1]
 assert hs.ARTIFACT_DETECTORS[1][0] == "provider-key-prefix"
 
 
-def check_helper(path: str):
-    """A fixed label if the helper must not be run, else None. Looks at the file; does not run it."""
-    if not os.path.isabs(path):
-        return "helper_path_not_absolute"
+def disable_core_dumps() -> bool:
+    """Turn core dumps off for this process and its children. True only if the limit reads back as zero."""
     try:
-        st = os.stat(path)
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        return resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
+    except (ValueError, OSError):
+        return False
+
+
+def check_tool(path: str, owner_uid: int, stop: str = "/"):
+    """Look at the program and every folder above it up to `stop`. Returns (identity, None) or (None, label).
+    The identity is (device, inode, size, modification time) of the file. This looks; it does not lock."""
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        return None, "tool_path_not_absolute"
+    try:
+        st = os.lstat(path)
     except OSError:
-        return "helper_unavailable"
+        return None, "tool_unavailable"
+    if stat.S_ISLNK(st.st_mode):
+        return None, "tool_is_a_link"
     if not stat.S_ISREG(st.st_mode):
-        return "helper_not_a_regular_file"
-    if st.st_uid != os.geteuid():
-        return "helper_not_owned_by_you"
+        return None, "tool_not_a_regular_file"
+    if st.st_uid != owner_uid:
+        return None, "tool_owner_not_allowed"
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        return "helper_writable_by_others"
-    return None
+        return None, "tool_writable_by_others"
+    folder = os.path.dirname(path)
+    while True:
+        try:
+            d = os.lstat(folder)
+        except OSError:
+            return None, "tool_unavailable"
+        if stat.S_ISLNK(d.st_mode) or not stat.S_ISDIR(d.st_mode):
+            return None, "tool_is_a_link"
+        if d.st_uid != owner_uid:
+            return None, "tool_folder_owner_not_allowed"
+        if d.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return None, "tool_folder_writable_by_others"
+        if folder == stop or folder == "/":
+            break
+        folder = os.path.dirname(folder)
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns), None
 
 
-def run_helper(path: str):
-    """Run the helper once and return (values, label). `values` maps a value (bytes) to the list of names the
-    helper gave it; names that are not capitals, digits and underscores are kept as None. Never raises, and
-    nothing the helper printed appears in a label."""
-    label = check_helper(path)
-    if label:
-        return {}, label
+def _stop_child(proc) -> None:
+    """Stop the program and anything it started, reap it, and close its pipe. Never raises; reads nothing more."""
     try:
-        proc = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                close_fds=True, start_new_session=True, cwd="/")
+        os.killpg(proc.pid, signal.SIGKILL)
     except OSError:
-        return {}, "helper_unavailable"
+        pass
     try:
-        out, _ = proc.communicate(timeout=HELPER_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, 9)
-        except OSError:
-            pass
-        try:
-            proc.communicate(timeout=5)
-        except BaseException:
-            pass
-        return {}, "helper_timed_out"
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=5)
     except BaseException:
-        try:
-            os.killpg(proc.pid, 9)
-        except OSError:
-            pass
-        return {}, "helper_failed"
-    if proc.returncode != 0:
-        return {}, "helper_failed"
-    if len(out) > HELPER_MAX_OUTPUT:
-        return {}, "helper_output_too_large"
-    values, label = {}, None
-    for line in out.split(b"\n"):
-        name, sep, value = line.partition(b"=")
-        if not sep or not name:
-            continue
-        value = value.rstrip(b"\r")
-        if len(value) >= 2 and value[:1] == value[-1:] and value[:1] in (b'"', b"'"):
-            value = value[1:-1]                      # the one quoting form the dotenv reader also strips
-        if not value:
-            continue
-        try:
-            shown = name.decode("ascii")
-        except UnicodeDecodeError:
-            shown = None
-        if shown is not None and not NAME_RE.match(shown):
-            shown = None
-        if value not in values:
-            if len(values) >= MAX_VALUES:
-                label = "value_limit_reached"
+        pass
+    try:
+        if proc.stdout is not None:
+            proc.stdout.close()
+    except BaseException:
+        pass
+
+
+def fetch_one(argv, env):
+    """Run one fetch and return (value or None, item status). Output is read a piece at a time: past
+    FETCH_MAX_OUTPUT bytes or FETCH_TIMEOUT_S seconds the program is stopped at once and nothing it printed
+    is kept. KeyboardInterrupt is passed on after the same clean-up."""
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                close_fds=True, start_new_session=True, cwd="/", env=env, bufsize=0)
+    except OSError:
+        return None, "fetch_failed"
+    chunks, total, status = [], 0, None
+    deadline = time.monotonic() + FETCH_TIMEOUT_S
+    try:
+        fd = proc.stdout.fileno()
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                status = "fetch_timed_out"
                 break
-            values[value] = []
-        if shown not in values[value]:
-            values[value].append(shown)
-    if not values:
-        return {}, "helper_printed_no_usable_value"
-    return values, label
+            ready, _, _ = select.select([fd], [], [], left)
+            if not ready:
+                status = "fetch_timed_out"
+                break
+            piece = os.read(fd, FETCH_MAX_OUTPUT + 1 - total)
+            if not piece:
+                break
+            total += len(piece)
+            if total > FETCH_MAX_OUTPUT:
+                status = "fetch_output_too_large"
+                break
+            chunks.append(piece)
+        if status is None:
+            try:
+                code = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                status = "fetch_timed_out"
+            else:
+                if code != 0:
+                    status = "item_unavailable"
+    except BaseException:
+        chunks = []
+        _stop_child(proc)
+        raise
+    _stop_child(proc)
+    if status is not None:
+        return None, status
+    value = b"".join(chunks)
+    if value.endswith(b"\n"):
+        value = value[:-1]
+    if len(value) < MIN_VALUE_BYTES:
+        return None, "value_too_short"
+    if len(value) > MAX_VALUE_BYTES:
+        return None, "value_too_long"
+    return value, "fetched"
+
+
+def fetch_items(labels, account):
+    """Fetch every named item. Returns (values, items, label): `values` maps a value to the list of names
+    that returned it; `items` maps each name to its status; `label` is a fixed reason nothing may be read,
+    or None. All or nothing: any item that cannot be used leaves `values` empty."""
+    items = {name: "not_fetched" for name in labels}
+    if not labels:
+        return {}, items, "no_item_named"
+    if len(labels) > MAX_ITEMS:
+        return {}, items, "too_many_items"
+    if any(not LABEL_RE.match(name) for name in labels):
+        return {}, {}, "item_name_not_allowed"            # a name that is not allowed is not echoed either
+    if len(set(labels)) != len(labels):
+        return {}, items, "item_named_twice"
+    if not LABEL_RE.match(account):
+        return {}, items, "account_name_not_allowed"
+    if not disable_core_dumps():
+        return {}, items, "core_dump_limit_not_set"
+    env = {"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME", "/"), "USER": account, "LANG": "C"}
+    values = {}
+    for name in labels:
+        before, label = check_tool(SECURITY_BIN, TOOL_OWNER_UID)
+        if label:
+            return {}, items, label
+        value, status = fetch_one([SECURITY_BIN, "find-generic-password", "-w", "-s", name, "-a", account], env)
+        after, label = check_tool(SECURITY_BIN, TOOL_OWNER_UID)
+        if label or after != before:
+            return {}, items, label or "tool_changed_during_run"
+        items[name] = status
+        if value is not None:
+            values.setdefault(value, []).append(name)
+    if any(status != "fetched" for status in items.values()):
+        return {}, items, "an_item_could_not_be_used"
+    for value in values:
+        for name in labels:
+            if name.encode() in value or value in name.encode():
+                return {}, items, "a_name_and_a_value_overlap"
+    return values, items, None
 
 
 def _new_file() -> dict:
@@ -186,18 +298,14 @@ def _new_file() -> dict:
 
 def _new_result() -> dict:
     return {"contract": CONTRACT, "scans_contract": hs.ARTIFACT_CONTRACT, "files": {n: _new_file() for n in hs.ARTIFACTS},
-            "values_from_helper": 0, "values_compared": 0, "secrets": [], "not_compared": [], "names_not_printed": 0,
+            "items": {}, "values_compared": 0, "supplied": [],
             "matches": {c: {"distinct": 0, "names": []} for c in MATCH_CLASSES},
             "distinct_counts_are_lower_bounds": False, "run": [], "finished": False}
 
 
-def _names(names):
-    return sorted(n for n in names if n is not None)
-
-
 def compare(home_fd: int, values: dict) -> dict:
     """Search both artifacts, through an open home descriptor, for the given values. Never raises; leaves the
-    descriptor open. `values` is the mapping run_helper returns."""
+    descriptor open. `values` maps each value (bytes, 16 to 4,096 long) to the list of names that supplied it."""
     res = _new_result()
 
     def note(label):
@@ -207,14 +315,12 @@ def compare(home_fd: int, values: dict) -> dict:
     if "sqlite3" in sys.modules or "_sqlite3" in sys.modules:
         note("refused_sqlite_loaded_in_process")
         return res
-    res["values_from_helper"] = len(values)
-    res["names_not_printed"] = sum(1 for names in values.values() for n in names if n is None)
-    wanted = [v for v in values if MIN_VALUE_BYTES <= len(v) <= MAX_VALUE_BYTES]
-    res["values_compared"] = len(wanted)
-    res["not_compared"] = sorted(({"names": _names(values[v]), "reason": "shorter_than_16_bytes" if len(v) < MIN_VALUE_BYTES else "longer_than_4096_bytes"}
-                                  for v in values if v not in wanted), key=lambda d: (d["reason"], d["names"]))
-    counts = {v: {n: 0 for n in hs.ARTIFACTS} for v in wanted}
-    keep = max([len(v) for v in wanted] + [1]) - 1          # bytes carried so a value across a seam is seen whole
+    if not values or any(not (MIN_VALUE_BYTES <= len(v) <= MAX_VALUE_BYTES) for v in values):
+        note("an_item_could_not_be_used")              # nothing is read unless every value is usable
+        return res
+    res["values_compared"] = len(values)
+    counts = {v: {n: 0 for n in hs.ARTIFACTS} for v in values}
+    keep = max(len(v) for v in values) - 1                  # bytes carried so a value across a seam is seen whole
     key = os.urandom(32)
     tokens = {}                                             # digest -> class index; the token itself is not kept
     involved = {c: set() for c in MATCH_CLASSES}
@@ -230,7 +336,7 @@ def compare(home_fd: int, values: dict) -> dict:
         if token in values:
             return 0, values[token]
         names, inside = [], []
-        for v in wanted:
+        for v in values:
             if v in token:
                 names += values[v]
             elif token in v:
@@ -288,7 +394,7 @@ def compare(home_fd: int, values: dict) -> dict:
                     # --- part 1: exact values. An occurrence is counted in the buffer where it starts before the cutoff.
                     buf = vcarry + chunk
                     cutoff = len(buf) if final else max(0, len(buf) - keep)
-                    for v in wanted:
+                    for v in values:
                         pos = buf.find(v)
                         while pos != -1 and pos < cutoff:
                             counts[v][name] += 1
@@ -310,7 +416,7 @@ def compare(home_fd: int, values: dict) -> dict:
                                 continue
                             cls, names = classify(token)
                             tokens[digest] = cls
-                            involved[MATCH_CLASSES[cls]].update(n for n in names if n is not None)
+                            involved[MATCH_CLASSES[cls]].update(names)
                     if final:
                         break
                     resume = max(resume, pbase + cutoff)
@@ -355,8 +461,8 @@ def compare(home_fd: int, values: dict) -> dict:
             except BaseException:
                 pass
     try:
-        res["secrets"] = sorted(({"names": _names(values[v]), "occurrences": dict(counts[v])} for v in wanted),
-                                key=lambda d: (-sum(d["occurrences"].values()), d["names"]))
+        res["supplied"] = sorted(({"names": sorted(values[v]), "occurrences": dict(counts[v])} for v in values),
+                                 key=lambda d: (-sum(d["occurrences"].values()), d["names"]))
         for i, c in enumerate(MATCH_CLASSES):
             res["matches"][c] = {"distinct": sum(1 for x in tokens.values() if x == i), "names": sorted(involved[c])}
     except BaseException:
@@ -378,42 +484,46 @@ def compare(home_fd: int, values: dict) -> dict:
 
 
 def render(res: dict) -> str:
-    out = ["Secret Guard artifact comparison: secret names and counts only (contract %s)" % res["contract"],
-           "  NOT a read of the conversations. No secret value, no byte of either file, no offset and no digest is printed.",
-           "  A name with a count above zero says that credential's current value is in this home's database. Treat this output as sensitive."]
+    out = ["Secret Guard artifact comparison: the item names you typed, and counts (contract %s)" % res["contract"],
+           "  NOT a read of the conversations. No value, no byte of either file, no offset and no digest is printed.",
+           "  Values are what this Mac's Keychain returned now for the names you typed. Nothing ties them to this home or to what Hermes uses.",
+           "  A count above zero says those bytes are in this home's database. Treat this output as sensitive."]
+    for name in sorted(res["items"]):
+        out.append("item [%s]: %s" % (name, res["items"][name]))
     for name in hs.ARTIFACTS:
         f = res["files"][name]
         out.append("%s: status %s, %d of %d byte(s) read, traversal finished %s, change observed %s"
                    % (name, f["status"], f["bytes_read"], f["extent_bytes"], "yes" if f["traversal_finished"] else "no",
                       "yes" if f["change_observed"] else "no"))
-    out.append("values from the helper: %d; compared: %d; names not printed (not capitals, digits and underscores): %d"
-               % (res["values_from_helper"], res["values_compared"], res["names_not_printed"]))
-    found = [s for s in res["secrets"] if sum(s["occurrences"].values())]
-    out.append("Part 1. Current values found as exact bytes: %d of %d compared" % (len(found), res["values_compared"]))
-    for s in found:
-        out.append("    FOUND  [%s]  state.db %d  state.db-wal %d" % (", ".join(s["names"]) or "name not printed",
-                                                                        s["occurrences"]["state.db"], s["occurrences"]["state.db-wal"]))
-    out.append("    not found as exact bytes: %d value(s)" % (res["values_compared"] - len(found)))
-    for d in res["not_compared"]:
-        out.append("    not_compared  [%s]  %s" % (", ".join(d["names"]) or "name not printed", d["reason"]))
+    found = [s for s in res["supplied"] if sum(s["occurrences"].values())]
+    out.append("Part 1. Supplied values found as exact bytes: %d of %d compared" % (len(found), res["values_compared"]))
+    for s in res["supplied"]:
+        hit = sum(s["occurrences"].values()) > 0
+        out.append("    %s  [%s]  state.db %d  state.db-wal %d" % ("FOUND    " if hit else "not found", ", ".join(s["names"]),
+                                                                    s["occurrences"]["state.db"], s["occurrences"]["state.db-wal"]))
     low = res["distinct_counts_are_lower_bounds"]
-    out.append("Part 2. Provider-key-shaped matches (%s), distinct byte strings by class:" % res["scans_contract"])
+    out.append("Part 2. Provider-key-shaped matches (%s), distinct byte strings, each in the first class that fits:" % res["scans_contract"])
     for c in MATCH_CLASSES:
         m = res["matches"][c]
         out.append("    %-28s %s%d%s" % (c, "at least " if low else "", m["distinct"], "  [%s]" % ", ".join(m["names"]) if m["names"] else ""))
     out.append("run notes: " + (", ".join(res["run"]) if res["run"] else "none"))
-    out.append("Comparison " + ("finished." if res["finished"] else "NOT FINISHED: this is a partial or inconclusive result."))
+    out.append("Comparison " + ("finished: every named item was compared against both files in full."
+                                if res["finished"] else "NOT FINISHED: this is a partial or inconclusive result."))
+    if "an_item_could_not_be_used" in res["run"]:
+        out.append("At least one named item could not be fetched or was outside 16 to 4,096 bytes. Nothing was read from the home.")
     if "home_path_changed_during_run" in res["run"]:
         out.append("The path you named no longer points at the folder that was read. The counts describe the folder opened at the start.")
     out.append("Zero does not show a credential was never in the database: only that these exact bytes were not found in one run.")
-    out.append("no_current_secret does not show a match is harmless. The two files were not read as a snapshot.")
+    out.append("no_supplied_value does not show a match is harmless, and finished does not mean every credential of the home was compared.")
     return "\n".join(out)
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="artifact_compare", description="Names-and-counts comparison of database artifacts with a home's current secrets.")
-    ap.add_argument("--home", required=True, help="the one Hermes home to read (no default)")
-    ap.add_argument("--secrets-command", required=True, help="absolute path of the helper that prints NAME=VALUE lines (no default)")
+    ap = argparse.ArgumentParser(prog="artifact_compare", description="Names-and-counts comparison of database artifacts with Keychain items you name.")
+    ap.add_argument("--home", required=True, help="the one Hermes home whose two files are read (no default)")
+    ap.add_argument("--keychain-service", action="append", default=[], metavar="NAME",
+                    help="a Keychain item (service name) to fetch and compare; repeat for up to 8 (no default)")
+    ap.add_argument("--keychain-account", default=None, help="the Keychain account of those items (default: your user name)")
     ap.add_argument("--json", action="store_true", help="print the same names and counts as JSON")
     args = ap.parse_args(argv)
     try:
@@ -423,7 +533,7 @@ def main(argv=None) -> int:
     if not attached:
         sys.stderr.write("artifact_compare: run this yourself at a terminal; it does not run unattended or into a pipe.\n")
         return 2
-    pinned = None
+    pinned, values = None, {}
     try:
         res = None
         if "sqlite3" in sys.modules or "_sqlite3" in sys.modules:
@@ -433,17 +543,23 @@ def main(argv=None) -> int:
                 pinned = os.open(args.home, hs._DIR)
             except OSError:
                 res = _new_result(); res["run"].append("home_unavailable")
-        if res is None:                                  # the home is open and usable: only now is the helper run
-            values, label = run_helper(args.secrets_command)
-            if label and not values:
-                res = _new_result(); res["run"].append(label)
+        if res is None:                                  # the home is open and usable: only now is anything fetched
+            account = args.keychain_account
+            if account is None:
+                try:
+                    import pwd
+                    account = pwd.getpwuid(os.geteuid()).pw_name
+                except Exception:
+                    account = ""
+            values, items, label = fetch_items(list(args.keychain_service), account)
+            if label:
+                values = {}
+                res = _new_result(); res["items"] = items; res["run"].append(label)
             else:
                 res = compare(pinned, values)
-                if label:
-                    res["run"].append(label); res["finished"] = False
+                res["items"] = items
                 if hs._home_moved(args.home, pinned):
                     res["run"].append("home_path_changed_during_run"); res["finished"] = False
-            values = None
         print(json.dumps(res, indent=2, sort_keys=True) if args.json else render(res))
         return 0 if res["finished"] else 1
     except KeyboardInterrupt:
@@ -453,6 +569,7 @@ def main(argv=None) -> int:
         sys.stderr.write("artifact_compare: internal error; no result.\n")
         return 1
     finally:
+        values.clear()                                   # drops the references; it does not erase memory
         if pinned is not None:
             try:
                 os.close(pinned)
