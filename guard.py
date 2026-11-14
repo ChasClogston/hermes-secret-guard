@@ -1,10 +1,15 @@
 """Leak prevention: a fail-closed path gate, value redaction, and an inbound paste block.
 
 Layer 1  pre_tool_call          block tool calls that would read a secret-shaped file, run a
-                                secrets helper, or ask the keychain to print a value.
+                                secrets helper, or ask the keychain to print a value. Since 1.1
+                                this includes reads that reach such a file without naming it:
+                                folder-wide searches and archives, shell globs, file lists built
+                                by another command, file:// addresses, and environment dumps.
 Layer 2  value redaction        register every guarded value with Hermes's own model-egress scrub
                                 (agent.redact vault registry), plus backup transform hooks that
                                 catch their own errors and withhold output rather than fail open.
+                                Since 1.1 the transform hooks also redact the base64, hex and
+                                percent-encoded forms of each guarded value.
 Layer 3  pre_llm_call           a key pasted into chat never reaches a model.
 
 Values live only in this process's memory. Nothing here logs or returns a value.
@@ -12,11 +17,14 @@ Values live only in this process's memory. Nothing here logs or returns a value.
 
 from __future__ import annotations
 
+import base64
 import fnmatch
+import glob as _glob
 import logging
 import os
 import re
 import shlex
+import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
 
@@ -106,13 +114,74 @@ def core_covers(value: str) -> bool:
         return False
 
 
+MIN_ENCODED = 12   # shortest encoded fragment worth matching; shorter ones collide with real text
+_WS_RE = re.compile(r"\s")
+_form_cache: dict[str, tuple[str, ...]] = {}   # value -> encoded forms; memory only, like the values
+
+
+def _b64_cores(raw: bytes) -> set[str]:
+    """The base64 text that `raw` produces wherever it sits in a larger stream. Base64 works in
+    3-byte groups, so the value can start at three alignments; for each, keep only the characters
+    that depend on the value alone (drop the ones shared with neighbouring bytes)."""
+    out: set[str] = set()
+    for off in (0, 1, 2):
+        enc = base64.b64encode(b"\0" * off + raw).decode("ascii").rstrip("=")
+        if (off + len(raw)) % 3:
+            enc = enc[:-1]                      # last character also carries bits of the next byte
+        core = enc[(0, 2, 3)[off]:]             # leading characters carry bits of the previous bytes
+        if len(core) >= MIN_ENCODED:
+            out.add(core)
+            out.add(core.replace("+", "-").replace("/", "_"))   # URL-safe alphabet
+    return out
+
+
+def encoded_forms(value: str) -> tuple[str, ...]:
+    """Encodings a command produces without trying: base64 (any alignment, both alphabets), hex and
+    percent-encoding. Not covered, by design: compression, encryption, reversal, splitting."""
+    cached = _form_cache.get(value)
+    if cached is not None:
+        return cached
+    raw = value.encode("utf-8")
+    forms = _b64_cores(raw)
+    hx = raw.hex()
+    if len(hx) >= MIN_ENCODED:
+        forms.update((hx, hx.upper()))
+    for quoted in (urllib.parse.quote(value, safe=""), urllib.parse.quote_plus(value)):
+        if quoted != value and len(quoted) >= MIN_ENCODED:
+            forms.add(quoted)
+            forms.add(re.sub(r"%[0-9A-F]{2}", lambda m: m.group(0).lower(), quoted))
+    forms.discard(value)
+    result = tuple(sorted(forms, key=len, reverse=True))
+    if len(_form_cache) > 512:
+        _form_cache.clear()
+    _form_cache[value] = result
+    return result
+
+
 def scrub(text: str) -> tuple[str, int]:
     values = _load_values()
     hits = 0
-    for env, v in sorted(values.items(), key=lambda kv: len(kv[1]), reverse=True):
+    ordered = sorted(values.items(), key=lambda kv: len(kv[1]), reverse=True)
+    for env, v in ordered:
         if v in text:
             hits += text.count(v)
             text = text.replace(v, f"[secret:{env} redacted]")
+    compact: Optional[str] = None
+    for env, v in ordered:
+        label = f"[secret:{env} redacted (encoded)]"
+        for form in encoded_forms(v):
+            if form in text:
+                hits += text.count(form)
+                text = text.replace(form, label)
+                compact = None
+                continue
+            # base64 and xxd -p wrap long output; match across the line breaks
+            if compact is None:
+                compact = _WS_RE.sub("", text)
+            if form in compact:
+                text, n = re.subn(r"\s*".join(re.escape(c) for c in form), label, text)
+                hits += n
+                compact = None
     return text, hits
 
 # ---------------------------------------------------------------- layer 1: path gate
@@ -135,6 +204,26 @@ COMMAND_KEYS = frozenset({"command", "cmd", "shell", "script"})
 CODE_KEYS = frozenset({"code", "js", "javascript", "expression", "source", "python"})
 PATH_KEYS = frozenset({"path", "file_path", "filepath", "filename", "file", "paths", "files",
                        "source_path", "image_path", "video_path", "workdir_file"})
+
+# --- 1.1: reads that reach a secret file without naming it
+# Folder scans use the name patterns minus "*token*": a repository with tokenizer.json must stay
+# searchable. A direct read of such a file is still blocked by SECRET_PATTERNS.
+DIR_SCAN_PATTERNS = tuple(p for p in SECRET_PATTERNS if p != "*token*")
+SKIP_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv", ".tox",
+                       ".mypy_cache", ".pytest_cache", ".ruff_cache"})
+SCAN_MAX_DEPTH, SCAN_MAX_ENTRIES = 12, 20000
+GREP_FAMILY = frozenset({"grep", "egrep", "fgrep"})
+HIDDEN_SKIPPERS = frozenset({"rg", "ag"})          # skip dotfiles unless told otherwise
+ALWAYS_RECURSIVE = HIDDEN_SKIPPERS | {"tar", "zip", "rsync"}
+PLAIN_READERS = ("cat", "bat", "less", "more", "head", "tail", "nl", "tac", "strings", "xxd", "od",
+                 "hexdump", "base64")
+_SUBST_READ_RE = re.compile(r"(?:^|[|;&\n(]\s*)(?:sudo\s+)?(?:" + "|".join(PLAIN_READERS)
+                            + r")\b[^|;&\n]*?(?:\$\(|`|<\()")
+_ENV_DUMP_RE = re.compile(r"(?:print|pprint|dumps|log|write)\s*\(\s*(?:dict\s*\(\s*)?"
+                          r"(?:os\.environ|process\.env)\s*\)?\s*[,)]")
+_FILE_URL_RE = re.compile(r"file://[^\s\"'<>)]+")
+SEARCH_GLOB_KEYS = ("file_glob", "glob", "include")
+NAME_ONLY_TARGETS = frozenset({"files", "filenames", "names"})
 _KEYCHAIN_PRINT_RE = re.compile(r"find-(?:generic|internet)-password[^\n]*?(?:^|\s|['\",])-[a-zA-Z]*[wg]\b|dump-keychain")
 
 
@@ -169,6 +258,107 @@ def is_secret_path(token: str, cwd: Optional[str] = None) -> bool:
     return False
 
 
+class _ScanTooBig(Exception):
+    pass
+
+
+def _dir_secret_name(path: str) -> bool:
+    name = os.path.basename(path).lower()
+    if name.endswith(SAFE_EXTENSIONS):
+        return False
+    if any(fnmatch.fnmatch(name, p) for p in DIR_SCAN_PATTERNS):
+        return True
+    return (name == "config.yaml" or name.startswith(("config.yaml.", "config.yaml~"))) and is_secret_path(path)
+
+
+def secret_file_under(root: str, name_glob: Optional[str] = None, include_hidden: bool = True) -> Optional[str]:
+    """First secret-shaped file under `root` (relative path), or None. Bounded: a tree deeper or
+    larger than the limits raises _ScanTooBig, and the caller blocks (never a silent pass).
+    Symlinked folders are not followed."""
+    seen = 0
+    stack = [(root, 0)]
+    while stack:
+        folder, depth = stack.pop()
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            continue
+        for e in entries:
+            seen += 1
+            if seen > SCAN_MAX_ENTRIES:
+                raise _ScanTooBig
+            if not include_hidden and e.name.startswith("."):
+                continue
+            try:
+                is_dir = e.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if is_dir:
+                if e.name in SKIP_DIRS:
+                    continue
+                if depth + 1 > SCAN_MAX_DEPTH:
+                    raise _ScanTooBig
+                stack.append((e.path, depth + 1))
+            elif (name_glob is None or fnmatch.fnmatch(e.name, name_glob)) and _dir_secret_name(e.path):
+                return os.path.relpath(e.path, root)
+    return None
+
+
+def _folder_reason(folder: str, name_glob: Optional[str] = None, include_hidden: bool = True) -> Optional[str]:
+    try:
+        hit = secret_file_under(folder, name_glob, include_hidden)
+    except _ScanTooBig:
+        return ("reads a whole folder that is too large to check for secret files; "
+                "name the files or a narrower folder")
+    if hit:
+        return (f"reads a whole folder that holds a secret-shaped file ({os.path.basename(hit)}); "
+                "name the files you need or a narrower folder")
+    return None
+
+
+def _guarded_names() -> frozenset:
+    try:
+        return frozenset(registry.load().get("secrets", {}))
+    except Exception:
+        return frozenset()
+
+
+def _recursive_folders(prog: str, args: list, cwd: Optional[str]) -> Optional[tuple[list, bool]]:
+    """(folders a recursive reader would walk, whether dotfiles count), or None if not recursive."""
+    flags = [a for a in args if a.startswith("-")]
+    pos = [a for a in args if not a.startswith("-")]
+    short = "".join(f[1:] for f in flags if not f.startswith("--"))
+    if prog in ALWAYS_RECURSIVE:
+        recursive = True
+    elif prog in GREP_FAMILY:
+        recursive = "r" in short or "R" in short or any(f in ("--recursive", "--dereference-recursive") for f in flags)
+    elif prog in ("cp", "scp"):
+        recursive = any(c in short for c in "rRa") or "--recursive" in flags or "--archive" in flags
+    elif prog == "diff":
+        recursive = "r" in short or "--recursive" in flags
+    else:
+        recursive = False
+    if not recursive:
+        return None
+    folders = [d for d in (_abs(a, cwd) for a in pos) if os.path.isdir(d)]
+    if not folders and (prog in GREP_FAMILY or prog in HIDDEN_SKIPPERS) and len(pos) <= 1:
+        folders = [_abs(".", cwd)]              # `grep -r PATTERN` and `rg PATTERN` search the cwd
+    hidden = True
+    if prog in HIDDEN_SKIPPERS:
+        hidden = any(f in ("--hidden", "-.", "--unrestricted", "--no-ignore") or re.fullmatch(r"-u+", f)
+                     for f in flags)
+    return folders, hidden
+
+
+def _find_roots(args: list, cwd: Optional[str]) -> list:
+    roots = []
+    for a in args:
+        if a.startswith("-") or a in ("(", "!", "\\("):
+            break
+        roots.append(_abs(a, cwd))
+    return roots or [_abs(".", cwd)]
+
+
 def _is_secrets_helper(token: str, cwd: Optional[str]) -> bool:
     full = _abs(token, cwd)
     return "/secrets-provider/" in full or full.endswith("/secret_guard/emit-secrets.sh")
@@ -193,6 +383,9 @@ def check_command(command: str, cwd: Optional[str] = None) -> Optional[str]:
     """Return a refusal reason, or None if the command may run."""
     if not command:
         return None
+    if _SUBST_READ_RE.search(command):
+        return "reads a file list produced by another command; name the files instead"
+    guarded = _guarded_names()
     for toks in _segments(command):
         # skip leading VAR=value assignments and wrappers
         i = 0
@@ -220,9 +413,49 @@ def check_command(command: str, cwd: Optional[str] = None) -> Optional[str]:
             return "openclaw mcp show prints stored headers unmasked; use openclaw mcp doctor"
         if prog in ("printenv", "env") and not [a for a in args if not a.startswith("-")]:
             return "dumps the whole environment, which holds live keys"
+        if prog == "set" and not args:
+            return "dumps every shell variable, which holds live keys"
+        if prog in ("export", "declare", "typeset") and not [a for a in args if not a.startswith("-")] \
+                and (prog == "export" or any("p" in a or "x" in a for a in args)):
+            return "dumps exported shell variables, which hold live keys"
+        if prog == "printenv":
+            for a in args:
+                if a in guarded:
+                    return f"prints a guarded variable ({a})"
+        if prog in ("echo", "printf", "print"):
+            for a in args:
+                for name in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", a):
+                    if name in guarded:
+                        return f"prints a guarded variable ({name})"
+        # 3b. a file list built at run time: find -exec READER, xargs READER
+        if prog == "find":
+            for j, a in enumerate(args[:-1]):
+                if a in ("-exec", "-execdir", "-ok") and os.path.basename(args[j + 1]) in READERS:
+                    for root in _find_roots(args, cwd):
+                        reason = _folder_reason(root)
+                        if reason:
+                            return reason
+                    break
+        if prog == "xargs" and any(os.path.basename(a) in READERS for a in args):
+            reason = _folder_reason(_abs(".", cwd))
+            if reason:
+                return reason
         # 4. a reader pointed at a secret-shaped file
         if prog in READERS:
+            walk = _recursive_folders(prog, args, cwd)
+            if walk:
+                for folder in walk[0]:
+                    reason = _folder_reason(folder, include_hidden=walk[1])
+                    if reason:
+                        return reason
             for a in args:
+                if not a.startswith("-") and any(c in a for c in "*?["):
+                    pattern = os.path.expanduser(a)
+                    if not os.path.isabs(pattern) and cwd:
+                        pattern = os.path.join(cwd, pattern)
+                    for m in _glob.glob(pattern, recursive="**" in a)[:2000]:
+                        if is_secret_path(m, cwd):
+                            return f"glob matches a secret-shaped file ({os.path.basename(m)})"
                 if is_secret_path(a, cwd):
                     return f"reads a secret-shaped file ({os.path.basename(a.strip(QUOTES))})"
                 # inline code (python -c, perl -e, node -e) naming a secret file
@@ -243,6 +476,12 @@ def check_code(code: str) -> Optional[str]:
         return None
     if _KEYCHAIN_PRINT_RE.search(code):
         return "asks the keychain to print a secret value"
+    if _ENV_DUMP_RE.search(code):
+        return "prints the whole environment, which holds live keys"
+    for name in _guarded_names():
+        if re.search(r"(?:print|log|write)\s*\([^)\n]*(?:environ|getenv|process\.env)[^)\n]*\b"
+                     + re.escape(name) + r"\b", code):
+            return f"prints a guarded variable ({name})"
     for tok in re.findall(r"[\w./~-]+", code):
         if ("/" in tok or tok.startswith(".")) and is_secret_path(tok):
             return f"code references a secret-shaped file ({os.path.basename(tok)})"
@@ -259,6 +498,11 @@ MAX_DEPTH, MAX_NODES, MAX_TEXT = 12, 5000, 2_000_000
 
 
 def _check_string(key: str, val: str, cwd: Optional[str]) -> Optional[str]:
+    if "file://" in val and len(val) <= MAX_TEXT:
+        for url in _FILE_URL_RE.findall(val):
+            target = urllib.parse.unquote(urllib.parse.urlparse(url).path)
+            if target and is_secret_path(target, cwd):
+                return f"opens a secret-shaped file through a file:// address ({os.path.basename(target)})"
     if key in COMMAND_KEYS:
         return check_command(val, cwd) or check_code(val)
     if key in CODE_KEYS:
@@ -296,9 +540,27 @@ def _walk(obj: Any, key: str, cwd: Optional[str], depth: int, budget: dict) -> O
     return None
 
 
+def _check_folder_search(tool_name: str, args: dict) -> Optional[str]:
+    """A content search over a folder returns file contents without naming a file. Applies to
+    search_files and to any tool named like a search that takes a path."""
+    name = (tool_name or "").lower()
+    path_key = next((k for k in ("path", "directory", "dir", "root", "folder") if isinstance(args.get(k), str)), None)
+    if not (name == "search_files" or (("search" in name or "grep" in name) and path_key)):
+        return None
+    if str(args.get("target", "")).lower() in NAME_ONLY_TARGETS:
+        return None                              # file names only: no contents returned
+    local = args.get("workdir") or args.get("cwd")
+    cwd = local if isinstance(local, str) else None
+    folder = _abs(args[path_key] if path_key else ".", cwd)
+    if not os.path.isdir(folder):
+        return None                              # a single file: the path rule already checked it
+    name_glob = next((args[k] for k in SEARCH_GLOB_KEYS if isinstance(args.get(k), str) and args[k]), None)
+    return _folder_reason(folder, name_glob)
+
+
 def check_tool_args(tool_name: str, args: dict) -> Optional[str]:
     try:
-        return _walk(args, "", None, 0, {"nodes": 0, "text": 0})
+        return _walk(args, "", None, 0, {"nodes": 0, "text": 0}) or _check_folder_search(tool_name, args)
     except (_TooBig, RecursionError):
         return "has arguments too large or too deeply nested to inspect"
 

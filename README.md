@@ -140,11 +140,17 @@ of overwriting. `hermes secret doctor` lists any variable your old source still 
    (`*.env`, `*token*`, `*secret*`, `*credential*`, `*.pem`, `id_rsa`, `auth.json`, Hermes
    `config.yaml`), running any secrets helper, `security find-*-password -w/-g`, `security
    dump-keychain`, a bare `env`/`printenv`, and `openclaw mcp show` (prints stored headers unmasked).
+   Since 1.1 it also refuses reads that reach such a file without naming it: a content search,
+   `grep -r`, `rg`, `tar`, `zip`, `cp -r`, `find -exec` or `xargs` over a folder that holds one; a
+   shell glob that matches one; a reader fed by `$(...)` or backticks; a `file://` address;
+   `printenv NAME` or `echo $NAME` for a guarded variable; and `set`, `export -p` or printing
+   `os.environ`. A blocked folder read tells the agent to name the files it needs.
 2. **Value redaction.** Every registered value is pushed into Hermes's own model-egress scrub, the
    same exact-value registry Hermes uses for browser-vault passwords. That registry applies even
    when `security.redact_secrets` is off. Backup `transform_*` hooks scrub tool results, terminal
    output and replies too; if a backup hook itself fails, it withholds the output instead of
-   passing it through.
+   passing it through. Since 1.1 these hooks also redact each value's base64 (any alignment, both
+   alphabets, wrapped or not), hex and percent-encoded forms.
 3. **Inbound block** (`pre_llm_call`). An exact registered value, or a string shaped like a known
    key (`sk-`, `ghp_`, `xoxb-`, `AKIA`, `AIza`, Telegram bot tokens, …), stops the turn before any
    inference.
@@ -184,9 +190,25 @@ What Secret Guard does on your machine, so you can decide before installing:
 
 Secret Guard reduces exposure. It is not a sandbox and it does not certify anything.
 
-- **Only exact values are scrubbed.** A key that is base64- or hex-encoded, reversed, split across
-  two outputs or partly echoed is not recognised. Redaction is the safety net; the path gate and
-  key entry outside chat are what keep keys from being read in the first place.
+- **Exact values and three encodings are scrubbed.** The plugin's transform hooks redact a key
+  verbatim and in base64, hex and percent-encoded form. A key that is compressed, encrypted,
+  reversed, upper-cased, spaced out, split across two outputs or partly echoed is not recognised.
+  Hermes's own model-egress scrub still matches the exact value only. `xxd` and `hexdump` output
+  with offsets and column groups is not matched; `xxd -p` is. Redaction is the safety net; the
+  path gate and key entry outside chat are what keep keys from being read in the first place.
+- **Folder reads are checked by file name, within limits.** The scan stops at 12 levels or 20,000
+  entries and then blocks the call. It skips `.git`, `node_modules` and virtual-environment
+  folders and does not follow symlinked folders. It ignores `*token*` names, so a repository with
+  `tokenizer.json` stays searchable; a direct read of such a file is still blocked. A secret in an
+  ordinarily named file is not seen. The scan uses the folder Hermes runs in when a command gives
+  a relative path, which can differ from a tool's own working folder.
+- **Some ordinary commands are now refused.** `cat $(...)`, `find . -exec grep ...` and
+  `grep -r` in a project that keeps a `.env` file are blocked; name the files or a subfolder
+  instead. `rg` and `ag` skip dotfiles by default, so a hidden `.env` does not block them unless
+  `--hidden` is used.
+- **Using a guarded variable is allowed; printing it is not.** `curl -H "Authorization: Bearer
+  $KEY"` runs. `echo $KEY` is blocked. A script that prints the variable some other way is caught
+  only by redaction.
 - **What it can't see:** logging done by MCP servers or child processes outside Hermes; images and
   screenshots; backups taken before a value was scrubbed. The plugin makes no network calls, but
   Hermes sends resolved keys to the services they belong to, as it does for any secret source.
@@ -244,6 +266,11 @@ Self-contained: a throwaway `HERMES_HOME`, a throwaway keychain and random canar
 the end. 163 checks: a block case and an allow case for every gate rule, fault injection for every
 keychain and registry failure path, and assertions of the documented limits (so this README cannot
 quietly overclaim).
+
+`python tests/test_gate.py` needs no Hermes and no keychain, and runs on any platform. It holds the
+1.1 matrix: named secret files, folder-wide reads, globs, command substitution, environment reads,
+`file://` addresses, the ordinary commands that must keep working, the encoded forms that are
+redacted, and the known limits that are not.
 
 `tests/e2e_canary.sh` runs the same attacks against a real Hermes agent in a throwaway home and
 throwaway keychain, and requires positive evidence for each result. See the script header for setup.
