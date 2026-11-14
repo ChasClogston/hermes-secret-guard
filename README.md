@@ -325,6 +325,38 @@ The script must never be imported into a running Hermes: closing a file descript
 process that also holds a SQLite connection to the same file can cancel that connection's
 locks.
 
+### One-off triage of artifact matches
+
+```bash
+python3 artifact_triage.py --home ~/.hermes/profiles/<one-profile>
+```
+
+When the artifact scope reports provider-key-shaped matches, this classifies each one by
+structure without printing any of them (contract `artifact-triage-v1`). It reads the same two
+files the same way, finds the same matches, and prints one line per group with labels and two
+counts: which listed shape; the class of the byte before it; `listed_word` when the bytes
+before it complete one of seven fixed English words ending in "sk" (which word is not
+printed); the class of the characters after the prefix, for example `uuid_layout` or
+`mixed_alphanumeric`; and a range for their number. No raw excerpt is printed: no matched
+byte, neighbour, offset or digest. It writes no file.
+
+The reason it exists: the artifact scope matches a provider-key shape wherever its prefix
+starts, so "task-" followed by a long identifier reads as "sk-" plus a key body.
+
+**The labels are structural classifications only.** No label and no combination confirms a
+credential or clears one; a match shaped like a task identifier may still be a credential.
+Do not use them to ignore a candidate automatically or to change what the scanner detects.
+The labels are also information: a group of one says that a string of that shape, body class
+and length range exists in the home, and the per-file totals show how matches are
+distributed. Distinct counts are per group and do not add up. Past the 500-group limit, the
+groups shown keep their own counts and the rest are not represented.
+
+Each of the two entries is looked at before it is opened and again at the end, opened or
+not. A file that appears, disappears, is replaced or changes makes the run not finished, as
+does a check that cannot be made, a home path that no longer points at the opened folder,
+any limit, or any error. Every limit of the artifact scope applies.
+`python tests/test_artifact_triage.py` covers it with synthetic byte files.
+
 `python tests/test_artifact_scan.py` builds synthetic databases and runs every scan in its own
 process. It compares the scanner with an independent hand-written whole-file pass (physical
 bytes, no regular expression shared with the scanner) and with the stored values (logical),
