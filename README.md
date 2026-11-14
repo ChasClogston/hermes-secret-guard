@@ -234,8 +234,13 @@ an internal error gives the same.
   it is scanned and counted as `hard_linked`. A folder renamed after it was opened is still
   read through the open handle.
 - *The time budget is cooperative.* It is checked while listing, before and after each open,
-  between bounded reads and before the scope is called finished. It cannot interrupt a call
-  the operating system has stalled.
+  between bounded reads, and once more after the files are closed and the candidates counted,
+  before the scope is called finished. It cannot interrupt a call the operating system has
+  stalled.
+- *Distinct counts can be lower bounds.* At most 200,000 distinct candidates per category are
+  remembered. Past that, occurrences stay exact, the run is not finished, the printed figure
+  reads "at least N", and the JSON sets `distinct_candidates_are_lower_bounds`. That key is
+  an addition to the `text-v1` output; no existing key changed.
 - *No snapshot.* A file that changes while it is read is counted as `changed_during_scan`.
   Nothing claims a point-in-time view of a live history.
 

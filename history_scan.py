@@ -75,15 +75,17 @@ Limits to know
     allow, and there is no look-ahead read. A token cut by a limit can be counted in shortened
     form or missed; a run stopped by a limit is reported as not finished and its counts are partial.
   - Memory. At most 200,000 distinct candidates per category are remembered. Past that the
-    distinct count is a floor, the run says so, and it is reported as not finished.
+    distinct count is a floor, the run says so, and it is reported as not finished. The printed
+    figure then reads "at least N", and the JSON sets distinct_candidates_are_lower_bounds.
   - Same-user limit. The terminal check is friction, not proof that a person started the run.
     Any process running as you can start this script or imitate a terminal.
   - Scope means the directory entries named above. A hard
     link shares its content with a file elsewhere; such files are scanned and counted as
     hard-linked. A folder renamed after it was opened is still read through the open handle.
   - The time limit is cooperative: it is checked while listing, before and after each open,
-    between bounded reads and before the scope is called finished. It cannot interrupt a call
-    the operating system has stalled.
+    between bounded reads, and once more after the files are closed and the candidates counted,
+    before the scope is called finished. It cannot interrupt a call the operating system has
+    stalled.
   - A file that changes while it is read is counted as changed. No point-in-time snapshot of a
     live history is claimed.
 """
@@ -183,6 +185,7 @@ def _new_result() -> dict:
             "kinds": {k: {"files_inspected": 0, "bytes_read": 0, "low_variety_also_counted": 0,
                           "occurrences": {c: 0 for c in CATEGORIES}, "files": {l: 0 for l in FILE_LABELS}} for k in KINDS},
             "distinct_candidates": {c: 0 for c, _p, d in DETECTORS if d},
+            "distinct_candidates_are_lower_bounds": False,
             "session_database": "not_scanned", "run": [], "complete": False}
 
 
@@ -344,6 +347,11 @@ def scan(home: str, home_fd=None) -> dict:
         res["distinct_candidates"][c] = len(seen[c])
     if budget["distinct_overflow"]:
         note("distinct_limit_reached")             # occurrences stay exact; the distinct count is a floor
+        res["distinct_candidates_are_lower_bounds"] = True
+    # The deadline is looked at once more here, after the closes and the counting, so time lost in
+    # either cannot end in a finished scope. It is still cooperative: it cannot interrupt a slow step.
+    if time.monotonic() > budget["deadline"]:
+        note("time_budget_reached")
     blocking = ("unreadable", "read_error", "truncated_at_size_cap", "changed_during_scan")
     if res["run"] and set(res["run"]) - {"location_absent"}:
         res["complete"] = False
@@ -650,8 +658,12 @@ def render(res: dict) -> str:
     out += ["", "totals"]
     for c in CATEGORIES:
         distinct = res["distinct_candidates"].get(c)
-        out.append("    %-22s occurrences %d, %s" % (c, totals[c], "distinct candidates %d" % distinct if distinct is not None
+        word = ("distinct candidates at least %d (limit reached: a lower bound)" if res["distinct_candidates_are_lower_bounds"]
+                else "distinct candidates %d")
+        out.append("    %-22s occurrences %d, %s" % (c, totals[c], word % distinct if distinct is not None
                                                       else "distinct not counted (header only)"))
+    if res["distinct_candidates_are_lower_bounds"]:
+        out.append("The distinct-candidate limit was reached. Occurrences are exact; every distinct figure above is a lower bound.")
     out.append("run notes: " + (", ".join(res["run"]) if res["run"] else "none"))
     out.append("")
     out.append("Text scope " + ("finished." if res["complete"] else "NOT FINISHED: this is a partial result, not a clean one."))

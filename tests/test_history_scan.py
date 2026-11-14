@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -393,6 +394,49 @@ class Bounds(Home):
             res = self.scan()
         self.assertEqual((self.occ(res)["provider-key-prefix"], res["distinct_candidates"]["provider-key-prefix"]), (50, 20))
         self.assertEqual((res["complete"], res["run"]), (False, ["distinct_limit_reached"]))
+        # a capped count is marked as a lower bound, in the JSON and in the printed summary
+        text = hs.render(res)
+        self.assertTrue(res["distinct_candidates_are_lower_bounds"])
+        self.assertIn("occurrences 50, distinct candidates at least 20 (limit reached: a lower bound)", text)
+        self.assertEqual(text.count("limit reached: a lower bound"), 2)                 # both counted categories
+        self.assertIn("Occurrences are exact; every distinct figure above is a lower bound.", text)
+        self.assertIsNone(re.search(r"distinct candidates \d", text))                   # no unqualified figure is left
+        res = self.scan()
+        text = hs.render(res)
+        self.assertEqual((res["distinct_candidates"]["provider-key-prefix"], res["distinct_candidates_are_lower_bounds"], res["complete"]), (50, False, True))
+        self.assertIn("occurrences 50, distinct candidates 50", text)
+        self.assertNotIn("lower bound", text); self.assertNotIn("at least", text)
+
+    def test_budget_that_runs_out_while_closing_is_not_a_finished_scope(self):
+        """The folders are closed after the last in-loop deadline check. Time lost there still counts. The
+        clock is pushed past the deadline inside each close of a run in turn; nothing sleeps. Every case
+        must end not finished, with the counts intact and nothing left open."""
+        self.s("a.jsonl", "k ghp_" + "a1B2" * 9 + "\n"); self.log("agent.log", "nothing\n")
+        real_close, real_clock = os.close, time.monotonic
+        state = {"n": 0, "at": 0, "jump": 0.0}
+
+        def closing(fd):
+            state["n"] += 1
+            if state["n"] == state["at"]:
+                state["jump"] = 100000.0
+            return real_close(fd)
+
+        def open_fds():
+            return len(os.listdir("/dev/fd"))
+        with mock.patch.object(os, "close", closing), mock.patch("time.monotonic", lambda: real_clock() + state["jump"]):
+            base = self.scan()                                                          # hooks installed, never fired
+        closes = state["n"]
+        self.assertEqual((base["complete"], base["run"]), (True, []))
+        self.assertGreaterEqual(closes, 5)                                              # two files, two folders, the home
+        for at in range(1, closes + 1):
+            state.update(n=0, at=at, jump=0.0)
+            before = open_fds()
+            with mock.patch.object(os, "close", closing), mock.patch("time.monotonic", lambda: real_clock() + state["jump"]):
+                res = self.scan()
+            self.assertEqual((res["complete"], "time_budget_reached" in res["run"]), (False, True), at)
+            self.assertEqual(open_fds(), before, at)
+            self.assertIn("NOT FINISHED", hs.render(res))
+        self.assertEqual(self.occ(res)["provider-key-prefix"], 1)                       # the last case: every file was read first
 
     def test_entry_file_total_and_time_limits(self):
         for i in range(12):
