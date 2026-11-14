@@ -249,7 +249,7 @@ python3 history_scan.py --home ~/.hermes/profiles/<one-profile> --database-artif
 
 Off unless you ask for it. Without the switch the scanner opens no database content, exactly
 as before. With it, after the text scope, the tool reads two files of the home as plain bytes:
-`state.db` and `state.db-wal` (contract `artifact-bytes-v1`). `state.db-shm` is never read.
+`state.db` and `state.db-wal` (contract `artifact-bytes-v2`). `state.db-shm` is never read.
 
 **This is not a read of the conversations.** It looks for contiguous secret-shaped byte
 strings in two database files, with no SQLite involved: no connection, no lock protocol, and
@@ -259,9 +259,18 @@ CPU; it is not "zero impact".
 **What a result means.**
 - A match is physical neighbouring bytes, not a stored value. A value split across cells,
   overflow pages or log frames is not put back together. UTF-16 text is not matched.
-- Neighbouring bytes change what matches. A message that is exactly a key sits right after
-  its role text in the record, so the detector's boundary rule hides it. Two adjacent columns
-  can also form a key shape that is no stored value at all. Both are shown in the tests.
+- Detection differs from the text scope in one way. A provider-key shape is matched wherever
+  its prefix starts, with no rule about the byte before it, because a stored value sits
+  directly against the bytes of its neighbouring fields. So a message that is exactly a key
+  is found even though its role text comes right before it. The byte after a match must still
+  not be a key character. Matches never overlap: the leftmost wins and the search resumes
+  after it, and the result does not depend on where the read chunks fall.
+- **This is not a complete fix.** A key character right after the value hides it. Letters or
+  digits right after it lengthen the match, so what is counted is not the stored value. A
+  value longer than the shape allows is not matched. Two adjacent columns can form a key
+  shape that is no stored value at all. Accidental matches inside binary data are more likely
+  than in text. The bot-token shape has no distinctive prefix and keeps its left-hand rule.
+  Each of these is shown in the tests.
 - Matches can come from deleted, superseded or uncommitted content. They are not row counts.
 - No miss rate is given, because none has been established. Some layouts could hide every
   copy of a value.
@@ -279,27 +288,39 @@ regrown to the same size can go unseen.
 
 **Extent and limits.** Both files are opened first and checked again after both are read.
 Each is read up to its size at open; a growing log is not chased. Fixed limits: 4 GiB per
-file, 6 GiB for both, 200,000 distinct candidates for both together in one map, and 600
-seconds (cooperative) for this scope on top of the text scope's 120, so 720 seconds at most
-per run. The artifact scope has its own byte and time allowance, so the text scope cannot
-starve it; `state.db` is read before the log, and a log that was not reached says
-`not_reached`. On the development machine the scan ran at roughly 100 MiB per second.
+file, 6 GiB for both, and 200,000 distinct candidates for both together in one map. There
+are two separate cooperative time budgets: 120 seconds for text and 600 seconds for this
+scope. They are checked between bounded steps and cannot interrupt a stalled system call, so
+they are not a hard limit on wall-clock time. The artifact scope has its own byte and time
+allowance, so the text scope cannot starve it; `state.db` is read before the log, and a log
+that was not reached says `not_reached`. The author measured roughly 100 MiB per second on
+one development machine; that is a report, not a guarantee.
+
+**One home for both scopes.** The command opens the home folder once and both scopes read
+through that handle, so they read the same folder even if the path is re-pointed mid-run. If
+the path no longer names that folder at the end, the run adds `home_path_changed_during_run`
+and is not finished. The check is made at one moment: a path re-pointed and restored in
+between is not seen. Neither scope claims a snapshot.
 
 **Counting.** Occurrences and distinct candidates are shown per file. One combined figure is
 shown: the number of different matched byte strings across both files. It is not a pair, a
 row count or a count of confirmed secrets. Text-scope counts stay separate.
 
-**Run it as its own process.** The scope refuses to run in a process that has loaded
-`sqlite3`, and the script must never be imported into a running Hermes: closing a file
-descriptor in a process that also holds a SQLite connection to the same file can cancel that
-connection's locks.
+**Run it as its own process.** The scope declines to run when the standard `sqlite3` module
+is already loaded in its process. That is a rejection check, not proof that no SQLite
+connection exists: another SQLite binding or a natively loaded library would not be noticed.
+The script must never be imported into a running Hermes: closing a file descriptor in a
+process that also holds a SQLite connection to the same file can cancel that connection's
+locks.
 
 `python tests/test_artifact_scan.py` builds synthetic databases and runs every scan in its own
-process. It compares the scanner with a whole-file pass (physical bytes) and with the stored
-values (logical), and lists what the byte scan misses by mechanism. Evidence for "no SQLite, no
+process. It compares the scanner with an independent hand-written whole-file pass (physical
+bytes, no regular expression shared with the scanner) and with the stored values (logical),
+and lists what the byte scan misses by mechanism. Evidence for "no SQLite, no
 locks, no writes" comes in layers, each with a positive control: a Python audit hook, an
 operating-system trace on Linux (no tracer is available on macOS without changing system
-protection, so that layer is absent there), and a measurement of a concurrent writer against
+protection, so that layer is absent there and Linux traces do not show what happens on a
+Mac), and a measurement of a concurrent writer against
 a baseline. None of these is a sandbox or a proof.
 
 

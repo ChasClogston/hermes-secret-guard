@@ -1,4 +1,4 @@
-"""Database-artifact byte scan tests (contract artifact-bytes-v1). Synthetic databases only.
+"""Database-artifact byte scan tests (contract artifact-bytes-v2). Synthetic databases only.
 
     python tests/test_artifact_scan.py
 
@@ -97,15 +97,37 @@ def run_scan(home, **opts):
     return out
 
 
-def physical(path, pattern):
-    """What a whole-file regex pass finds: the reference for the chunked scanner."""
+_ALNUM = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+_KEYCH = _ALNUM | frozenset(b"_-")
+
+
+def oracle_bytes(data):
+    """The artifact rule for the GitHub token shape, written by hand with no regular expression, so it
+    shares no code with the scanner. One pass over the bytes: a match starts wherever "gh" + one of
+    p,o,u,s,r + "_" starts, takes the whole run of letters and digits after it, and counts only if
+    that run is 36 to 255 long and the byte after it is not a key character. Nothing is required of
+    the byte before. After a match the search resumes at its end; otherwise one byte further on."""
+    out, i, n = [], 0, len(data)
+    while i + 4 <= n:
+        if data[i] == 0x67 and data[i + 1] == 0x68 and data[i + 2] in b"pousr" and data[i + 3] == 0x5F:
+            j = i + 4
+            while j < n and data[j] in _ALNUM:
+                j += 1
+            if 36 <= j - (i + 4) <= 255 and (j == n or data[j] not in _KEYCH):
+                out.append(bytes(data[i:j])); i = j
+                continue
+        i += 1
+    return out
+
+
+def physical(path):
+    """What the hand-written whole-file pass finds: the reference for the chunked scanner."""
     if not os.path.exists(path):
         return []
     with open(path, "rb") as fh:
-        return [m.group(0) for m in re.finditer(pattern, fh.read())]
+        return oracle_bytes(fh.read())
 
 
-GH = re.compile(rb"(?<![A-Za-z0-9_-])gh[pousr]_[A-Za-z0-9]{36,255}(?![A-Za-z0-9_-])")
 SCHEMA = ("CREATE TABLE sessions (id TEXT PRIMARY KEY, display_name TEXT, system_prompt TEXT);"
           "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, tool_calls TEXT, reasoning TEXT);")
 
@@ -142,16 +164,16 @@ class DB(unittest.TestCase):
 
 
 class Oracle(DB):
-    """The scanner must equal a whole-file regex pass (physical bytes). What it misses against the
-    logical contents is listed by mechanism, and is never claimed as coverage."""
+    """The scanner must equal an independent hand-written whole-file pass (physical bytes). What it
+    misses against the logical contents is listed by mechanism, and is never claimed as coverage."""
 
     def compare(self, out):
         db, wal = self.arts(out)
         for a, path in ((db, self.db), (wal, self.wal)):
-            found = physical(path, GH)
+            found = physical(path)
             self.assertEqual(a["occurrences"]["provider-key-prefix"], len(found), path)
             self.assertEqual(a["distinct_candidates"]["provider-key-prefix"], len(set(found)), path)
-        both = set(physical(self.db, GH)) | set(physical(self.wal, GH))
+        both = set(physical(self.db)) | set(physical(self.wal))
         self.assertEqual(out["res"]["combined_distinct_candidates"]["provider-key-prefix"], len(both))
         return both
 
@@ -200,24 +222,32 @@ class Oracle(DB):
         self.assertEqual(self.compare(out), set())
         self.assertEqual(len(self.logical()), 20)                                # all there, none seen: stated exclusion
 
-    def test_field_edge_bytes_can_hide_or_create_a_match(self):
-        """A stored value sits between its neighbours' bytes. A message that is exactly a key comes right
-        after the role text, so the detector's left boundary hides it. Two columns can also form a key."""
+    def test_field_edge_bytes_can_reveal_hide_lengthen_or_create_a_match(self):
+        """A stored value sits directly against its neighbours' bytes. With no rule about the byte before
+        a provider-key shape, a message that is exactly a key is found even though the role text comes
+        right before it. The byte after still decides: the next column can hide or lengthen a match,
+        and two columns can form a key that is no stored value at all."""
         c = self.connect()
-        bare, spaced = key(1), key(2)
+        bare, spaced, hidden, longer = key(1), key(2), key(3), key(4)
         accidental = "ghp_" + "A1b2C3d4E5" + "f6G7h8I9j0K1l2M3n4O5p6Q7r8"
-        c.execute("INSERT INTO messages(session_id, role, content) VALUES ('s','user',?)", (bare,))            # the whole message is the key
-        c.execute("INSERT INTO messages(session_id, role, content) VALUES ('s','user',?)", (" " + spaced + " ",))
-        c.execute("INSERT INTO messages(session_id, role, content, tool_calls, reasoning) VALUES ('s',':',?,?,' ')",
-                  (accidental[:14], accidental[14:]))                                                           # neither column is a key
+        ins = "INSERT INTO messages(session_id, role, content, tool_calls, reasoning) VALUES ('s',?,?,?,?)"
+        c.execute(ins, ("user", bare, None, None))                    # the whole message is the key, role text right before it
+        c.execute(ins, ("user", " " + spaced + " ", None, None))
+        c.execute(ins, ("user", hidden, "-next-column", " "))         # next column starts with a key character: hidden
+        c.execute(ins, ("user", longer, "Zz9", " "))                  # next column starts with letters: one longer match
+        c.execute(ins, (":", accidental[:14], accidental[14:], " "))  # neither column is a key
         c.execute("PRAGMA wal_checkpoint(TRUNCATE)"); c.close()
         out = run_scan(self.home)
         phys = self.compare(out)
         logical = self.logical()
-        self.assertEqual(logical, {bare.encode(), spaced.encode()})
+        self.assertEqual(logical, {k.encode() for k in (bare, spaced, hidden, longer)})
+        self.assertIn(bare.encode(), phys)                       # found: this was the reported miss under the old rule
         self.assertIn(spaced.encode(), phys)
-        self.assertNotIn(bare.encode(), phys)                    # logically present, physically hidden by the neighbour
+        self.assertNotIn(hidden.encode(), phys)                  # logically present, physically hidden by what follows
+        self.assertNotIn(longer.encode(), phys)                  # logically present, counted only in lengthened form
+        self.assertIn((longer + "Zz9").encode(), phys)
         self.assertIn(accidental.encode(), phys)                 # physically matched, logically not a value at all
+        self.assertEqual(len(logical - phys), 2)                 # so this is not a complete search
 
     def test_deleted_rows_can_still_match(self):
         c = self.connect()
@@ -264,6 +294,195 @@ class Oracle(DB):
             out = run_scan(self.home)
             self.compare(out)                                                    # equal to the bytes, whatever the index stores
             self.assertEqual(out["res"]["combined_distinct_candidates"]["provider-key-prefix"], 1, name)
+
+
+class Detector(DB):
+    """Artifact-only detection rules on raw byte fixtures. The scanner reads bytes, so a state.db that is
+    not a database is a precise way to place them. Every key here is synthetic."""
+
+    def raw(self, data, **opts):
+        with open(self.db, "wb") as fh:
+            fh.write(data)
+        out = run_scan(self.home, **opts)
+        db, _wal = self.arts(out)
+        want = oracle_bytes(data)
+        self.assertEqual(db["occurrences"]["provider-key-prefix"], len(want))
+        self.assertEqual(db["distinct_candidates"]["provider-key-prefix"], len(set(want)))
+        self.assertTrue(db["traversal_finished"])
+        return want, db
+
+    def test_left_neighbour_never_hides_a_prefixed_key(self):
+        for before in (b"", b"user", b"x", b"_", b"-", b"9", b"\x00", b"\xff", b"Bearer "):
+            want, _db = self.raw(b"\x01\x02" + before + key(1).encode() + b"\x00tail")
+            self.assertEqual(want, [key(1).encode()], before)
+
+    def test_right_neighbour_still_decides(self):
+        k = key(1).encode()
+        self.assertEqual(self.raw(k)[0], [k])                                   # end of file
+        self.assertEqual(self.raw(k + b"\x00")[0], [k])
+        self.assertEqual(self.raw(k + b'"')[0], [k])
+        self.assertEqual(self.raw(k + b"-x")[0], [])                            # a key character follows: hidden
+        self.assertEqual(self.raw(k + b"_x")[0], [])
+        self.assertEqual(self.raw(k + b"abc ")[0], [k + b"abc"])                # lengthened, not the stored value
+
+    def test_overlong_value_is_not_matched(self):
+        self.assertEqual(self.raw(b"ghp_" + b"a" * 255 + b" ")[0], [b"ghp_" + b"a" * 255])
+        self.assertEqual(self.raw(b"ghp_" + b"a" * 256 + b" ")[0], [])          # longer than the shape allows: hidden
+        self.assertEqual(self.raw(b"ghp_" + b"a" * 35 + b" ")[0], [])           # shorter than the shape allows
+
+    def test_ambiguous_and_repeated_prefixes(self):
+        k1, k2 = key(1).encode(), key(2).encode()
+        self.assertEqual(self.raw(b"ghp_" + k1 + b" ")[0], [k1])                # a false start, then the real one
+        self.assertEqual(self.raw(k1 + k2 + b" ")[0], [k2])                     # run-on: the first is hidden by the second's prefix
+        self.assertEqual(self.raw(k1 + b" " + k2)[0], [k1, k2])
+        self.assertEqual(self.raw(b"gh_" + k1[4:] + b" ghx_" + k1[4:])[0], [])  # not the prefix
+        want, db = self.raw(k1 + b"\n" + k1 + b"\n" + k1)
+        self.assertEqual((db["occurrences"]["provider-key-prefix"], db["distinct_candidates"]["provider-key-prefix"]), (3, 1))
+
+    def test_matches_do_not_overlap_across_shapes(self):
+        """One byte string is one candidate even when two listed shapes could both claim part of it."""
+        ant = b"sk-ant-" + hashlib.sha256(b"a").hexdigest().encode()            # also fits the sk- shape
+        nested = b"sk-" + b"A" * 20 + key(5).encode()                           # a gh shape inside an sk- run
+        for data, n in ((ant + b" ", 1), (nested + b" ", 1), (ant + b" " + nested + b" ", 2)):
+            with open(self.db, "wb") as fh:
+                fh.write(data)
+            db, _wal = self.arts(run_scan(self.home))
+            self.assertEqual(db["occurrences"]["provider-key-prefix"], n, data[:12])
+
+    def test_bot_token_keeps_its_left_rule(self):
+        tok = b"1234567890:" + b"A" * 35                                     # ten digits, the most the shape allows
+        for data, n in ((b" " + tok + b" ", 1), (b"x" + tok + b" ", 0), (b"7" + tok + b" ", 0), (b"-" + tok + b" ", 1)):
+            with open(self.db, "wb") as fh:
+                fh.write(data)
+            db, _wal = self.arts(run_scan(self.home))
+            self.assertEqual(db["occurrences"]["bot-token-shape"], n, data[:4])
+
+    def test_bot_token_left_rule_holds_at_every_seam(self):
+        """The byte before a bot-token shape must be visible to the rule even when a seam falls right
+        there. Tokens glued to a letter are never counted, wherever the chunks fall."""
+        glued, free = b"x1234567890:" + b"A" * 35 + b" ", b" 1234567890:" + b"C" * 35 + b" "
+        data = b"".join(b"\x00" * (1 + (i * 29) % 211) + (glued if i % 4 else free) for i in range(2000))
+        counts = set()
+        for chunk, overlap in ((1024 * 1024, 1024), (1025, 1024), (1500, 1024), (2048, 300), (4099, 1024)):
+            with open(self.db, "wb") as fh:
+                fh.write(data)
+            db, _wal = self.arts(run_scan(self.home, patch={"CHUNK": chunk, "OVERLAP": overlap}))
+            counts.add(db["occurrences"]["bot-token-shape"])
+        self.assertEqual(counts, {500})
+
+    def test_text_scope_rule_is_unchanged(self):
+        os.makedirs(os.path.join(self.home, "logs"))
+        with open(os.path.join(self.home, "logs", "agent.log"), "wb") as fh:
+            fh.write(b"user" + key(1).encode() + b"\n " + key(2).encode() + b"\n")
+        r = subprocess.run([sys.executable, "-c", "import sys, json; sys.path.insert(0, %r); import history_scan as h; "
+                            "print(json.dumps(h.scan(%r)))" % (REPO, self.home)], capture_output=True, text=True)
+        res = json.loads(r.stdout)
+        self.assertEqual(res["contract"], "text-v1")
+        self.assertEqual(res["kinds"]["logs"]["occurrences"]["provider-key-prefix"], 1)      # the glued one is still not counted there
+
+    def test_result_does_not_depend_on_where_chunks_fall(self):
+        """Pseudo-random binary with keys planted bare, glued, run-on and near every kind of seam, read
+        with several chunk sizes. Every reading must equal the single hand-written pass."""
+        stream = b"".join(hashlib.sha256(b"blob%d" % i).digest() for i in range(12000))          # 384,000 bytes
+        data, pos, i = bytearray(stream), 500, 0
+        while pos + 700 < len(data):
+            k = key(i).encode()
+            piece = (k, b"role" + k, k + k, k + b"-" , b"ghp_" + k, k + b"Q" * (i % 7), b"ghp_" + b"z" * (250 + i % 12))[i % 7]
+            data[pos:pos + len(piece)] = piece
+            pos += 1024 + 4096 * (i % 3) + (i * 37) % 1500; i += 1
+        data = bytes(data)
+        want = oracle_bytes(data)
+        self.assertGreater(len(want), 40)
+        seen = set()
+        for chunk, overlap in ((1024 * 1024, 1024), (4096, 1024), (4099, 1024), (1500, 1024), (1025, 1024), (2048, 300)):
+            _want, db = self.raw(data, patch={"CHUNK": chunk, "OVERLAP": overlap})
+            seen.add((db["occurrences"]["provider-key-prefix"], db["distinct_candidates"]["provider-key-prefix"], db["bytes_read"]))
+        self.assertEqual(seen, {(len(want), len(set(want)), len(data))})
+
+    def test_a_shape_nested_in_a_longer_match_is_never_counted_twice_at_a_seam(self):
+        """A gh shape inside a longer sk- run is part of that one match. If a chunk seam falls between the
+        two prefixes, the second must not be picked up as a fresh match in the next buffer."""
+        token = b"sk-" + b"B" * 150 + key(5).encode()                            # 193 bytes, one match in a single pass
+        data = b"".join(b"\x00" * (107 + (i * 53) % 400) + token + b" " for i in range(600))
+        counts = set()
+        for chunk, overlap in ((1024 * 1024, 1024), (1500, 1024), (1025, 1024), (4099, 1024), (2048, 300)):
+            with open(self.db, "wb") as fh:
+                fh.write(data)
+            db, _wal = self.arts(run_scan(self.home, patch={"CHUNK": chunk, "OVERLAP": overlap}))
+            counts.add((db["occurrences"]["provider-key-prefix"], db["distinct_candidates"]["provider-key-prefix"]))
+        self.assertEqual(counts, {(600, 1)})
+
+    def test_accidental_matches_in_binary_are_counted_as_candidates(self):
+        """Random-looking bytes can spell a shape. It is counted like any other match, and nothing marks
+        it as a real value. AKIA plus sixteen capitals is the shortest listed shape."""
+        blob = hashlib.sha256(b"noise").digest() * 4 + b"AKIA" + b"QWERTYUIOPASDFGH" + hashlib.sha256(b"more").digest()
+        with open(self.db, "wb") as fh:
+            fh.write(blob)
+        db, _wal = self.arts(run_scan(self.home))
+        self.assertEqual(db["occurrences"]["provider-key-prefix"], 1)
+
+
+class PinnedHome(DB):
+    """Both scopes read through one opened handle on the home folder."""
+
+    SWAP = r'''
+import json, os, sys
+home, repo = sys.argv[1], sys.argv[2]
+sys.path.insert(0, repo)
+import history_scan as hs
+pinned = os.open(home, hs._DIR)
+os.rename(home, home + ".moved")                 # the path is re-pointed after the handle is taken
+os.rename(home + ".other", home)
+text = hs.scan(home, home_fd=pinned)
+art = hs.scan_artifacts(home, home_fd=pinned)
+os.fstat(pinned)                                 # still open: the caller owns it
+print(json.dumps({"text": text, "art": art, "moved": hs._home_moved(home, pinned), "fresh": hs.scan_artifacts(home)}))
+'''
+
+    def two_homes(self):
+        os.makedirs(os.path.join(self.home, "logs"))
+        with open(os.path.join(self.home, "logs", "agent.log"), "w") as fh:
+            fh.write(" %s \n" % key(1))
+        with open(self.db, "wb") as fh:
+            fh.write(b"first " + key(1).encode() + b" " + key(2).encode() + b" ")
+        other = self.home + ".other"
+        os.makedirs(other)
+        with open(os.path.join(other, "state.db"), "wb") as fh:
+            fh.write(b"second, no keys")
+
+    def test_both_scopes_read_the_folder_that_was_opened(self):
+        self.two_homes()
+        r = subprocess.run([sys.executable, "-c", self.SWAP, self.home, REPO], capture_output=True, text=True)
+        out = json.loads(r.stdout)
+        self.assertEqual(out["text"]["kinds"]["logs"]["occurrences"]["provider-key-prefix"], 1)
+        self.assertEqual(out["art"]["artifacts"]["state.db"]["occurrences"]["provider-key-prefix"], 2)
+        self.assertTrue(out["art"]["scope_finished"])
+        self.assertTrue(out["moved"])
+        self.assertEqual(out["fresh"]["artifacts"]["state.db"]["occurrences"]["provider-key-prefix"], 0)   # the path now names the other folder
+
+    def test_cli_marks_the_run_not_finished_when_the_path_moves(self):
+        self.two_homes()
+        wrapper = ("import os, sys; sys.path.insert(0, %r); import history_scan as hs\n"
+                   "real = hs.scan\n"
+                   "def swapping(home, home_fd=None):\n"
+                   "    res = real(home, home_fd=home_fd)\n"
+                   "    os.rename(home, home + '.moved'); os.rename(home + '.other', home)\n"
+                   "    return res\n"
+                   "hs.scan = swapping\n"
+                   "sys.exit(hs.main(['--home', %r, '--database-artifacts', '--json']))\n" % (REPO, self.home))
+        code, out, err = Invocation.cli(self, cmd=[sys.executable, "-c", wrapper])
+        self.assertEqual((code, err), (1, ""))
+        data = json.loads(out)
+        self.assertEqual(data["run"], ["home_path_changed_during_run"])
+        self.assertFalse(data["complete"])
+        self.assertEqual(data["artifact_scope"]["artifacts"]["state.db"]["occurrences"]["provider-key-prefix"], 2)   # the opened folder, not the swapped-in one
+        self.assertTrue(data["artifact_scope"]["scope_finished"])
+
+    def test_unmoved_run_has_no_aggregate_note(self):
+        self.two_homes()
+        code, out, err = Invocation.cli(self, "--home", self.home, "--database-artifacts", "--json")
+        data = json.loads(out)
+        self.assertEqual((code, data["run"], data["complete"]), (0, [], True))
 
 
 class Status(DB):
@@ -588,9 +807,9 @@ class Evidence(DB):
 
 
 class Invocation(DB):
-    def cli(self, *args):
+    def cli(self, *args, cmd=None):
         import pty
-        cmd = [sys.executable, os.path.join(REPO, "history_scan.py"), *args]
+        cmd = cmd or [sys.executable, os.path.join(REPO, "history_scan.py"), *args]
         master, slave = pty.openpty()
         p = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=subprocess.PIPE, close_fds=True)
         os.close(slave); chunks = []
@@ -640,8 +859,10 @@ class Invocation(DB):
                            capture_output=True, text=True)
         first, doc = r.stdout.split("\n", 1)
         self.assertEqual(first.split(), [str(4 * 1024 ** 3), str(6 * 1024 ** 3), "200000", "600.0", "120.0"])
-        for phrase in ("4 GiB per file, 6 GiB for both", "200,000 distinct candidates for both together", "720 seconds at most",
-                       "NOT a read of the conversations", "state.db-shm is never read", "refuses to run in a process that has loaded sqlite3",
+        for phrase in ("4 GiB per file, 6 GiB for both", "200,000 distinct candidates for both together",
+                       "120 seconds for text, 600 seconds for this scope", "not\n  a hard limit on wall-clock time",
+                       "NOT a read of the conversations", "state.db-shm is never read", "That is a rejection check, not proof",
+                       "This is not a complete fix", "No such\n      trace has been taken on macOS", "one opened handle on the home folder",
                        "a log reset and regrown to the same size can go unseen"):
             self.assertIn(phrase, doc)
 
