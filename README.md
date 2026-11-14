@@ -97,6 +97,48 @@ lists every profile and says which ones still need a step.
 | `hermes secret recover ENV_VAR [--yes] [--discard]` | Finishes (or with `--discard`, cancels) an interrupted replace, without re-entering the key. |
 | `hermes secret import SCRIPT` | Registers keys named in an existing `emit "service" "ENV"` keychain helper. Reads names only; never runs it. |
 | `hermes secret doctor` | Read-only health check of every profile. Exit 1 on problems. |
+| `hermes secret inventory` | Static inventory of every Hermes home: reads config only. Exit 1 if incomplete. |
+
+## Inventory: where Secret Guard is, home by home
+
+```bash
+hermes secret inventory                   # inside a Hermes that has the plugin
+python3 inventory.py --root ~/.hermes     # from a clone, with no Hermes and no plugin installed
+```
+
+A static, read-only report. For each Hermes home it reads two files, `config.yaml` and
+`plugins/secret-guard/plugin.yaml`, and prints one of six states:
+
+| State | Meaning |
+|---|---|
+| `absent` | No plugin files in this home. |
+| `disabled` | Plugin files are present; this home's config does not list the plugin. |
+| `configured` | Plugin files are present and this home's config lists the plugin. |
+| `unsupported` | Plugin files are present on a host the plugin does not load on (anything but macOS). |
+| `unreadable` | A file or folder needed for the answer could not be read. |
+| `unknown` | A file could not be parsed, or the evidence is inconsistent. |
+
+**No state means "protected".** `configured` describes files on disk. Whether a running Hermes
+has the guard loaded and enforcing is not tested, and every row says `runtime: not tested`. An
+unreadable or unparsed home never becomes a positive result, and it marks the inventory
+incomplete (exit code 1).
+
+What it shows per home: the state, whether the plugin files are present, whether the config
+lists the plugin, the version in `plugin.yaml`, the commit when a `.git` folder makes it
+readable (no git is run), how many of the six hooks `plugin.yaml` declares, and whether the
+key source is on. It lists every root it searched and every entry it skipped, with the reason,
+so the count of homes can be checked. A home reached twice (a symlink, a root given twice) is
+counted once. Plugins are per home: nothing is inherited from the root profile.
+
+What it does not do: import the plugin, start a gateway, run a subprocess, touch the keychain,
+resolve a credential, write or repair anything, or print any configuration value. Paths are
+hidden unless you add `--paths`, because a path can itself be sensitive. `--json` gives the
+same report as data. `--expect-version` and `--expect-commit` add a note to every copy that
+differs. `--root` (repeatable) adds homes outside the default root.
+
+It needs a YAML reader: Hermes's bundled one, or PyYAML. With neither, every home is
+`unknown`. `hermes secret doctor` is a different tool: it runs inside one profile and does
+resolve keys, to check that they arrive.
 
 ## How keys reach your profiles
 
@@ -314,6 +356,8 @@ Self-contained: a throwaway `HERMES_HOME`, a throwaway keychain and random canar
 the end. 165 checks: a block case and an allow case for every gate rule, fault injection for every
 keychain and registry failure path, and assertions of the documented limits (so this README cannot
 quietly overclaim).
+
+`python tests/test_inventory.py` covers the inventory on synthetic homes: every state, duplicates and symlinks, malformed and unreadable files, a missing YAML reader, and checks that nothing on disk changes and no configuration value is printed. It needs PyYAML and nothing else.
 
 `python tests/test_gate.py` needs no Hermes and no keychain, and runs on any platform. It holds the
 1.1 matrix: named secret files, folder-wide reads, globs, command substitution, environment reads,
