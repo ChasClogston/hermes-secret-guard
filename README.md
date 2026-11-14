@@ -263,7 +263,7 @@ PYTHONPATH=$HA $HA/venv/bin/python tests/test_guard.py
 ```
 
 Self-contained: a throwaway `HERMES_HOME`, a throwaway keychain and random canaries, removed at
-the end. 163 checks: a block case and an allow case for every gate rule, fault injection for every
+the end. 165 checks: a block case and an allow case for every gate rule, fault injection for every
 keychain and registry failure path, and assertions of the documented limits (so this README cannot
 quietly overclaim).
 

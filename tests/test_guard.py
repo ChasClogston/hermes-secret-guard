@@ -206,7 +206,9 @@ try:
     print("== known limits, asserted so the README stays honest")
     import base64
     b64 = base64.b64encode(CANARY.encode()).decode()
-    check("LIMIT: base64 of a key is NOT scrubbed (documented)", guard.scrub("x " + b64)[1], 0)
+    check("1.1: base64 of a key IS scrubbed by the transform hooks", guard.scrub("x " + b64)[1], 1)
+    check("1.1: hex of a key IS scrubbed by the transform hooks", guard.scrub("x " + CANARY.encode().hex())[1], 1)
+    check("LIMIT: a reversed key is NOT scrubbed (documented)", guard.scrub("x " + CANARY[::-1])[1], 0)
     check("LIMIT: a key split in two is NOT scrubbed (documented)", guard.scrub(CANARY[:20])[1] + guard.scrub(CANARY[20:])[1], 0)
     from agent.redact import register_vault_redaction_value, redact_sensitive_text as _rst
     guard.register_values()
