@@ -20,14 +20,31 @@ NOT COVERED, and said so on every run
 So a finished run is a finished scan of that text scope. It is not a scan of the home's whole
 history, and zero findings does not show the history holds no secrets.
 
+What a count means
+  - Every full match of a listed shape is counted as a candidate. Nothing is left out for looking
+    like a placeholder. A match whose last 24 characters hold fewer than 8 different characters
+    is also counted under "low-variety", as an annotation only.
+  - A candidate is a shape, not a confirmed secret: look-alikes are counted, and keys of another
+    length or alphabet are missed.
+  - Files are chosen by name and read as bytes. A binary file with a covered name is scanned
+    like any other; nothing is decoded or unpacked.
+
 Limits to know
+  - Symlinks. The home you name is followed if it is a link, because you chose it. Nothing
+    below it is: a linked folder or file is counted and not opened.
+  - Limits are exact. A read is never larger than the per-file and total byte limits still
+    allow, and there is no look-ahead read. A token cut by a limit can be counted in shortened
+    form or missed; a run stopped by a limit is reported as not finished and its counts are partial.
+  - Memory. At most 200,000 distinct candidates per category are remembered. Past that the
+    distinct count is a floor, the run says so, and it is reported as not finished.
   - Same-user limit. The terminal check is friction, not proof that a person started the run.
     Any process running as you can start this script or imitate a terminal.
-  - Scope means the directory entries named above, opened without following symlinks. A hard
+  - Scope means the directory entries named above. A hard
     link shares its content with a file elsewhere; such files are scanned and counted as
     hard-linked. A folder renamed after it was opened is still read through the open handle.
-  - The time limit is cooperative: it is checked between bounded reads and cannot interrupt a
-    read the operating system has stalled.
+  - The time limit is cooperative: it is checked while listing, before and after each open,
+    between bounded reads and before the scope is called finished. It cannot interrupt a call
+    the operating system has stalled.
   - A file that changes while it is read is counted as changed. No point-in-time snapshot of a
     live history is claimed.
 """
@@ -59,7 +76,8 @@ MAX_TOTAL_BYTES = 1024 * 1024 * 1024
 TIME_BUDGET_S = 120.0               # cooperative
 CHUNK = 1024 * 1024
 OVERLAP = 1024                      # longer than any token a detector can match
-MIN_DISTINCT_CHARS = 8              # fewer distinct characters in a token's last 24: placeholder-like, not counted
+MAX_DISTINCT = 200_000              # distinct candidates remembered per category (about 32 bytes of digest each)
+LOW_VARIETY_CHARS = 8               # fewer distinct characters in a token's last 24: annotated, and still counted
 
 _L, _R = rb"(?<![A-Za-z0-9_-])", rb"(?![A-Za-z0-9_-])"
 # Shapes chosen by the author from the public look of these keys. They are not vendor guarantees:
@@ -88,6 +106,7 @@ FILE_LABELS = ("symlink_not_followed", "not_a_regular_file", "unreadable", "repe
                "truncated_at_size_cap", "changed_during_scan", "hard_linked", "not_covered_entry")
 RUN_LABELS = ("home_unavailable", "location_absent", "location_is_a_symlink", "location_unavailable",
               "entry_limit_reached", "file_limit_reached", "total_byte_limit_reached", "time_budget_reached",
+              "distinct_limit_reached",
               "cancelled", "internal_error")
 _DIR = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -101,26 +120,31 @@ class _Stop(Exception):
 
 def _new_result() -> dict:
     return {"contract": CONTRACT, "baseline": BASELINE,
-            "kinds": {k: {"files_inspected": 0, "bytes_read": 0, "placeholder_like_not_counted": 0,
+            "kinds": {k: {"files_inspected": 0, "bytes_read": 0, "low_variety_also_counted": 0,
                           "occurrences": {c: 0 for c in CATEGORIES}, "files": {l: 0 for l in FILE_LABELS}} for k in KINDS},
             "distinct_candidates": {c: 0 for c, _p, d in DETECTORS if d},
             "session_database": "not_scanned", "run": [], "complete": False}
 
 
-def _scan_bytes(fd: int, kind: dict, seen: dict, key: bytes, budget: dict) -> bool:
-    """Read one open regular file in bounded chunks and count matches. Returns True if the size cap
-    cut the read short. Holds at most one chunk plus the overlap; lines are never assembled."""
-    carry, lead, read, truncated = b"", 0, 0, False
+def _tick(budget: dict) -> None:
+    """The cooperative deadline. Called between bounded steps; it cannot interrupt a stalled system call."""
+    if time.monotonic() > budget["deadline"]:
+        raise _Stop("time_budget_reached")
+
+
+def _scan_bytes(fd: int, kind: dict, seen: dict, key: bytes, budget: dict, size_hint: int) -> bool:
+    """Read one open regular file in bounded chunks and count matches. Returns True if the per-file cap
+    cut the read short. Holds at most one chunk plus the overlap; lines are never assembled.
+
+    Every byte read is counted against the per-file and the total limit before it is asked for: a read
+    is never larger than what both limits still allow, and there is no look-ahead read. When a limit
+    stops a file part-way, what was read is still matched to its end, so a token cut by the limit can
+    be counted in shortened form or missed. Counts from a run that is not finished are partial."""
+    carry, lead, read = b"", 0, 0
     while True:
-        if time.monotonic() > budget["deadline"]:
-            raise _Stop("time_budget_reached")
-        if budget["total"] >= MAX_TOTAL_BYTES:
-            raise _Stop("total_byte_limit_reached")
-        if read >= MAX_FILE_BYTES:
-            truncated = bool(os.read(fd, 1))
-            chunk = b""
-        else:
-            chunk = os.read(fd, min(CHUNK, MAX_FILE_BYTES - read))
+        _tick(budget)
+        allowed = min(CHUNK, MAX_FILE_BYTES - read, MAX_TOTAL_BYTES - budget["total"])
+        chunk = os.read(fd, allowed) if allowed > 0 else b""
         read += len(chunk); budget["total"] += len(chunk); kind["bytes_read"] += len(chunk)
         final = not chunk
         buf = carry + chunk
@@ -132,14 +156,23 @@ def _scan_bytes(fd: int, kind: dict, seen: dict, key: bytes, budget: dict) -> bo
                 if m.start() >= cutoff:
                     break
                 token = m.group(0)
-                if distinct and len(set(token[-24:])) < MIN_DISTINCT_CHARS:
-                    kind["placeholder_like_not_counted"] += 1
-                    continue
-                kind["occurrences"][category] += 1
+                kind["occurrences"][category] += 1          # every full match is a candidate
                 if distinct:
-                    seen[category].add(hmac.new(key, token, hashlib.sha256).digest())
+                    if len(set(token[-24:])) < LOW_VARIETY_CHARS:
+                        kind["low_variety_also_counted"] += 1   # an annotation, not an exclusion
+                    digest = hmac.new(key, token, hashlib.sha256).digest()
+                    if digest not in seen[category]:
+                        if len(seen[category]) >= MAX_DISTINCT:
+                            budget["distinct_overflow"] = True
+                        else:
+                            seen[category].add(digest)
         if final:
-            return truncated
+            more = max(size_hint, os.fstat(fd).st_size) > read       # is there content this run did not read?
+            if more and read >= MAX_FILE_BYTES:
+                return True
+            if more and budget["total"] >= MAX_TOTAL_BYTES:
+                raise _Stop("total_byte_limit_reached")
+            return False
         lead = 1 if cutoff > 0 else 0              # keep one byte of left context for the boundary check
         carry = buf[cutoff - lead:]
 
@@ -149,7 +182,7 @@ def scan(home: str) -> dict:
     res = _new_result()
     seen = {c: set() for c in res["distinct_candidates"]}
     key = os.urandom(32)                       # lives for this call only; no digest leaves this function
-    budget = {"deadline": time.monotonic() + TIME_BUDGET_S, "total": 0, "files": 0}
+    budget = {"deadline": time.monotonic() + TIME_BUDGET_S, "total": 0, "files": 0, "distinct_overflow": False}
     identities, fds = set(), []
 
     def note(label):
@@ -170,6 +203,7 @@ def scan(home: str) -> dict:
             res["session_database"] = "not_found_not_scanned"
         for kind_name, folder, pattern in COVERAGE:
             kind = res["kinds"][kind_name]
+            _tick(budget)
             try:
                 dfd = os.open(folder, _DIR | _NOFOLLOW, dir_fd=home_fd)
             except FileNotFoundError:
@@ -182,12 +216,15 @@ def scan(home: str) -> dict:
             try:
                 with os.scandir(dfd) as it:
                     for entry in it:
+                        _tick(budget)
                         if len(names) >= MAX_ENTRIES:
                             note("entry_limit_reached"); break
                         names.append(entry.name)
             except OSError:
                 note("location_unavailable"); continue
+            _tick(budget)
             for name in sorted(names):
+                _tick(budget)
                 if not pattern.match(name):
                     kind["files"]["not_covered_entry"] += 1
                     continue
@@ -202,6 +239,7 @@ def scan(home: str) -> dict:
                                   else "unreadable"] += 1
                     continue
                 try:
+                    _tick(budget)                  # the open may have been slow
                     before = os.fstat(fd)
                     if not stat.S_ISREG(before.st_mode):
                         kind["files"]["not_a_regular_file"] += 1
@@ -215,7 +253,7 @@ def scan(home: str) -> dict:
                         kind["files"]["hard_linked"] += 1
                     kind["files_inspected"] += 1
                     try:
-                        if _scan_bytes(fd, kind, seen, key, budget):
+                        if _scan_bytes(fd, kind, seen, key, budget, before.st_size):
                             kind["files"]["truncated_at_size_cap"] += 1
                     except OSError:
                         kind["files"]["read_error"] += 1
@@ -223,8 +261,10 @@ def scan(home: str) -> dict:
                     after = os.fstat(fd)
                     if (after.st_size, after.st_mtime_ns, after.st_ino) != (before.st_size, before.st_mtime_ns, before.st_ino):
                         kind["files"]["changed_during_scan"] += 1
+                    _tick(budget)
                 finally:
                     os.close(fd)
+        _tick(budget)                              # last check before the scope is called finished
         res["complete"] = True
     except _Stop as stop:
         note(stop.label)
@@ -240,6 +280,8 @@ def scan(home: str) -> dict:
                 pass
     for c in seen:
         res["distinct_candidates"][c] = len(seen[c])
+    if budget["distinct_overflow"]:
+        note("distinct_limit_reached")             # occurrences stay exact; the distinct count is a floor
     blocking = ("unreadable", "read_error", "truncated_at_size_cap", "changed_during_scan")
     if res["run"] and set(res["run"]) - {"location_absent"}:
         res["complete"] = False
@@ -252,6 +294,7 @@ def render(res: dict) -> str:
     out = ["Secret Guard history scan: summary only",
            "coverage contract %s (%s)" % (res["contract"], res["baseline"]),
            "  transcripts: sessions/*.jsonl, sessions/*.json   logs: logs/*.log, logs/*.log.N   (direct entries only)",
+           "  Files are chosen by name and read as bytes. The home you name is followed if it is a link; nothing below it is.",
            "NOT SCANNED: the session database (state.db) [%s], every other file and subfolder," % res["session_database"],
            "  encoded or transformed values, name assignments, registered values.", ""]
     totals = {c: 0 for c in CATEGORIES}
@@ -261,7 +304,7 @@ def render(res: dict) -> str:
         for c in CATEGORIES:
             totals[c] += d["occurrences"][c]
             out.append("    occurrences %-22s %d" % (c, d["occurrences"][c]))
-        out.append("    placeholder-like, not counted       %d" % d["placeholder_like_not_counted"])
+        out.append("    of those, low-variety (also counted) %d" % d["low_variety_also_counted"])
         flagged = ["%s %d" % (l, n) for l, n in d["files"].items() if n]
         out.append("    file notes: " + (", ".join(flagged) if flagged else "none"))
     out += ["", "totals"]
@@ -272,6 +315,7 @@ def render(res: dict) -> str:
     out.append("run notes: " + (", ".join(res["run"]) if res["run"] else "none"))
     out.append("")
     out.append("Text scope " + ("finished." if res["complete"] else "NOT FINISHED: this is a partial result, not a clean one."))
+    out.append("Counts are candidates by shape, not confirmed secrets. Counts from a run that is not finished are partial.")
     out.append("This is not a scan of the home's whole history. Zero findings does not show it holds no secrets.")
     out.append("No point-in-time snapshot is claimed: files can change while they are read.")
     return "\n".join(out)

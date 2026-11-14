@@ -122,15 +122,33 @@ class Detection(Home):
 
     def test_near_misses_and_placeholders_are_not_counted(self):
         self.s("a.jsonl", "\n".join([
-            "pip install sk-learn and sk-image", "sk-ant-short", "sk-" + "x" * 40, "sk-proj-" + "0" * 48,
-            "sk-your-api-key-here", "ghp_" + "A" * 36, "AKIA1234", "akia" + "Q7L2X9V4N6H8J1K3", "AIzaTooShort",
+            "pip install sk-learn and sk-image", "sk-ant-short", "sk-" + "x" * 31, "sk-proj-" + "0" * 20,
+            "sk-your-api-key-here", "ghp_" + "A" * 35, "AKIA1234", "akia" + "Q7L2X9V4N6H8J1K3", "AIzaTooShort",
             "xoxb-", "12345:" + BODY[:35], "1234567890123:" + BODY[:35], "export OPENAI_API_KEY=", "password: hunter2",
             "prefix" + ANT, ANT + "suffix-that-makes-it-longer" + "a" * 200, "the word token and the word secret",
             "BEGIN PRIVATE KEY without dashes", "0f" * 32]) + "\n")
         res = self.scan()
         self.assertEqual(sum(self.occ(res).values()), 0)
-        self.assertEqual(res["kinds"]["transcripts"]["placeholder_like_not_counted"], 3)
+        self.assertEqual(res["kinds"]["transcripts"]["low_variety_also_counted"], 0)
         self.assertEqual(sum(res["distinct_candidates"].values()), 0)
+
+    def test_s2_low_variety_matches_are_candidates_and_only_annotated(self):
+        """Review S2. A full match is never left out for looking like a placeholder."""
+        review_case = "ghp_" + "aBcDeFgHiJkL" + "A" * 24                        # the reviewer's fixture
+        low = [review_case, "sk-" + "x" * 40, "sk-proj-" + "0" * 48, "ghp_" + "A" * 36, "AKIA" + "A" * 16,
+               "AIza" + "b" * 35, "xoxb-" + "1" * 30, "sk-ant-" + "Q" * 40]
+        bot_low = "123456789:" + "z" * 35
+        self.s("a.jsonl", "\n".join(low) + "\n" + bot_low + "\n" + ANT + "\n" + review_case + "\n")
+        self.log("agent.log", review_case + " " + bot_low + "\n")
+        res = self.scan()
+        t, l = res["kinds"]["transcripts"], res["kinds"]["logs"]
+        self.assertEqual((t["occurrences"]["provider-key-prefix"], t["occurrences"]["bot-token-shape"]), (len(low) + 2, 1))
+        self.assertEqual((l["occurrences"]["provider-key-prefix"], l["occurrences"]["bot-token-shape"]), (1, 1))
+        self.assertEqual(t["low_variety_also_counted"], len(low) + 1 + 1)        # annotated, not subtracted
+        self.assertEqual(l["low_variety_also_counted"], 2)
+        self.assertEqual(res["distinct_candidates"], {"provider-key-prefix": len(low) + 1, "bot-token-shape": 1})
+        self.assertTrue(res["complete"])
+        self.assertIn("low-variety (also counted)", hs.render(res))
 
     def test_tokens_across_chunk_boundaries_are_counted_exactly_once(self):
         filler = "x" * 37 + "\n"
@@ -278,6 +296,104 @@ class Bounds(Home):
                          (4000, 1, False, 0))
         self.assertIn("NOT FINISHED", hs.render(res))
 
+    def reads(self):
+        """Run a scan recording the size of every os.read: (asked, got)."""
+        calls, real = [], os.read
+
+        def spy(fd, n):
+            data = real(fd, n)
+            calls.append((n, len(data)))
+            return data
+        with mock.patch("os.read", spy):
+            res = self.scan()
+        return res, calls
+
+    def test_s1_total_byte_limit_is_never_exceeded(self):
+        """Review S1. Bytes actually read are captured, not just the incomplete flag."""
+        self.s("a.jsonl", "x" * 4096)
+        with mock.patch.object(hs, "MAX_TOTAL_BYTES", 100), mock.patch.object(hs, "CHUNK", 4096):
+            res, calls = self.reads()                                              # the reviewer's case
+        self.assertEqual((sum(g for _a, g in calls), max(a for a, _g in calls), res["kinds"]["transcripts"]["bytes_read"]), (100, 100, 100))
+        self.assertEqual((res["complete"], res["run"]), (False, ["total_byte_limit_reached"]))
+        for i in range(6):
+            self.s("f%d.jsonl" % i, "y" * 700)
+        self.log("agent.log", "z" * 900)
+        for total, chunk in ((1, 64), (99, 64), (100, 64), (701, 256), (1000, 333), (2500, 1024), (4096 + 4200 - 1, 512), (5000, 4096)):
+            with mock.patch.object(hs, "MAX_TOTAL_BYTES", total), mock.patch.object(hs, "CHUNK", chunk), mock.patch.object(hs, "OVERLAP", 32):
+                res, calls = self.reads()
+            got = sum(g for _a, g in calls)
+            self.assertLessEqual(got, total, (total, chunk))
+            self.assertEqual(got, total, (total, chunk))                           # and the whole allowance is used
+            self.assertEqual(sum(res["kinds"][k]["bytes_read"] for k in hs.KINDS), got)
+            self.assertFalse(res["complete"]); self.assertIn("total_byte_limit_reached", res["run"])
+            self.assertTrue(all(a <= chunk for a, _g in calls))
+        with mock.patch.object(hs, "MAX_TOTAL_BYTES", 4096 + 4200 + 900):            # exactly everything: finished
+            res, calls = self.reads()
+        self.assertEqual((sum(g for _a, g in calls), res["complete"], res["run"]), (9196, True, []))
+
+    def test_s1_per_file_limit_has_no_lookahead_read(self):
+        self.s("a.jsonl", "x" * 5000); self.s("b.jsonl", "y" * 3000); self.s("c.jsonl", "z" * 4000)
+        with mock.patch.object(hs, "MAX_FILE_BYTES", 4000), mock.patch.object(hs, "CHUNK", 1500), mock.patch.object(hs, "OVERLAP", 64):
+            res, calls = self.reads()
+        t = res["kinds"]["transcripts"]
+        self.assertEqual((sum(g for _a, g in calls), t["bytes_read"]), (4000 + 3000 + 4000, 11000))
+        self.assertEqual((t["files"]["truncated_at_size_cap"], res["complete"]), (1, False))   # only the 5000-byte file
+
+    def test_s1_a_match_at_the_last_permitted_boundary(self):
+        """Stopping at a cap neither loses nor double-counts what was read; a token cut by the cap may shorten."""
+        self.s("a.jsonl", "p" * 500 + " " + ANT + " " + "q" * 500 + " " + GH + " tail")
+        end_first = 501 + len(ANT)
+        for total, want in ((end_first + 1, 1), (end_first + 300, 1), (end_first + 502 + len(GH) + 1, 2), (500, 0)):
+            for chunk in (64, 200, 4096):
+                with mock.patch.object(hs, "MAX_TOTAL_BYTES", total), mock.patch.object(hs, "CHUNK", chunk), mock.patch.object(hs, "OVERLAP", 60):
+                    res, calls = self.reads()
+                self.assertEqual(sum(g for _a, g in calls), total)
+                self.assertEqual(self.occ(res)["provider-key-prefix"], want, (total, chunk))
+                self.assertFalse(res["complete"])
+        self.assertIn("Counts from a run that is not finished are partial", hs.render(res))
+
+    def test_s1_the_deadline_is_checked_outside_file_reads(self):
+        """Review S1. A home with nothing to read still meets the deadline check."""
+        def expired_after(n):
+            state = {"n": 0}
+
+            def clock():
+                state["n"] += 1
+                return 0.0 if state["n"] <= n else 10_000.0
+            return clock
+        builds = {
+            "only excluded entries": lambda: [write(os.path.join(self.home, "sessions", "notes%d.txt" % i), "x") for i in range(5)],
+            "only non-regular files": lambda: [os.mkfifo(os.path.join(self.home, "sessions", "p%d.jsonl" % i)) for i in range(5)],
+            "only repeated files": lambda: (self.s("one.jsonl", "x"), [os.link(os.path.join(self.home, "sessions", "one.jsonl"),
+                                            os.path.join(self.home, "sessions", "dup%d.jsonl" % i)) for i in range(5)]),
+            "absent locations": lambda: (shutil.rmtree(os.path.join(self.home, "sessions")), shutil.rmtree(os.path.join(self.home, "logs"))),
+        }
+        for label, build in builds.items():
+            shutil.rmtree(self.home); os.makedirs(os.path.join(self.home, "sessions")); os.makedirs(os.path.join(self.home, "logs"))
+            build()
+            self.assertTrue(self.scan()["complete"], label)                         # an ordinary run finishes
+            with mock.patch("time.monotonic", expired_after(1)):                    # expired at the very next check
+                res = self.scan()
+            self.assertEqual((res["complete"], res["run"][-1]), (False, "time_budget_reached"), label)
+            checks = {"n": 0}
+
+            def counting():
+                checks["n"] += 1
+                return 0.0
+            with mock.patch("time.monotonic", counting):
+                self.scan()
+            self.assertGreaterEqual(checks["n"], 4, label)                          # start, per location, and before finishing
+            for n in range(1, checks["n"]):                                         # expiry at any later check is never "finished"
+                with mock.patch("time.monotonic", expired_after(n)):
+                    self.assertFalse(self.scan()["complete"], (label, n))
+
+    def test_distinct_memory_is_capped_and_said(self):
+        self.s("a.jsonl", "\n".join("ghp_" + ("%036d" % i) for i in range(50)) + "\n")
+        with mock.patch.object(hs, "MAX_DISTINCT", 20):
+            res = self.scan()
+        self.assertEqual((self.occ(res)["provider-key-prefix"], res["distinct_candidates"]["provider-key-prefix"]), (50, 20))
+        self.assertEqual((res["complete"], res["run"]), (False, ["distinct_limit_reached"]))
+
     def test_entry_file_total_and_time_limits(self):
         for i in range(12):
             self.s("f%02d.jsonl" % i, "x" * 500)
@@ -419,7 +535,8 @@ class Invocation(Home):
 
     def test_the_coverage_table_names_every_shape(self):
         doc = hs.__doc__
-        for word in ("state.db", "sessions/*.jsonl", "logs/*.log", "encoded", "Same-user limit", "cooperative", "hard", "snapshot"):
+        for word in ("state.db", "sessions/*.jsonl", "logs/*.log", "encoded", "Same-user limit", "cooperative", "hard", "snapshot",
+                     "The home you name is followed if it is a link", "read as bytes", "no look-ahead read", "200,000 distinct"):
             self.assertIn(word, doc)
         self.assertEqual(len(hs.PROVIDER_SHAPES), 7)
         self.assertEqual(hs.CATEGORIES, ("private-key-header", "provider-key-prefix", "bot-token-shape"))

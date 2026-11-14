@@ -133,21 +133,28 @@ findings does not show the home holds no secrets.**
 
 The shapes were chosen by the author from the public look of these keys. They are not vendor
 guarantees: a key of another length or alphabet is missed, and a look-alike string is counted.
-A match whose last 24 characters hold fewer than 8 different characters is treated as a
-placeholder and counted separately.
+Every full match is counted as a candidate. Nothing is left out for looking like a
+placeholder. A match whose last 24 characters hold fewer than 8 different characters is also
+counted under "low-variety"; that is an annotation, not an exclusion, and it does not say the
+value is harmless. Files are chosen by name and read as bytes, so a binary file with a
+covered name is scanned like any other; nothing is decoded or unpacked.
 
 **What it prints:** counters and fixed labels. Per kind: files inspected, bytes read,
-occurrences by category, placeholder-like matches, and file notes under fixed labels. Then
+occurrences by category, how many of those are low-variety, and file notes under fixed labels. Then
 totals with distinct candidates, run notes, and whether the text scope finished. No source text
 or identifiers are emitted: no file name, path, offset, snippet, digest or error message.
 Distinct candidates are counted with a keyed digest whose key exists only in memory for the
 run. It writes no file, so there is no report to protect or clean up.
 
-**How it reads:** it walks from the chosen home by directory handle and opens each entry
-without following symlinks and without blocking, then checks the open handle is a regular
-file. Work is bounded by entries listed, files opened, bytes per file and in total, and a time
-budget. Anything cut short is counted under a fixed label and the result is "NOT FINISHED",
-never a clean one. Cancelling or an internal error gives the same.
+**How it reads:** the home you name is followed if it is a link, because you chose it. Below
+it nothing is: the tool walks by directory handle and opens each entry without following
+symlinks and without blocking, then checks the open handle is a regular file. Work is bounded
+by entries listed, files opened, bytes per file and in total, distinct candidates remembered
+(200,000 per category) and a time budget. The byte limits are exact: a read is never larger
+than both limits still allow, and there is no look-ahead read. Anything cut short is counted
+under a fixed label and the result is "NOT FINISHED", never a clean one; its counts are
+partial, and a token cut by a limit can be counted in shortened form or missed. Cancelling or
+an internal error gives the same.
 
 **Limits.**
 - *Same-user limit.* The tool refuses to run unless attached to a terminal. That is friction,
@@ -156,8 +163,9 @@ never a clean one. Cancelling or an internal error gives the same.
 - *Scope means directory entries.* A hard-linked file shares its content with a file elsewhere;
   it is scanned and counted as `hard_linked`. A folder renamed after it was opened is still
   read through the open handle.
-- *The time budget is cooperative.* It is checked between bounded reads and cannot interrupt a
-  read the operating system has stalled.
+- *The time budget is cooperative.* It is checked while listing, before and after each open,
+  between bounded reads and before the scope is called finished. It cannot interrupt a call
+  the operating system has stalled.
 - *No snapshot.* A file that changes while it is read is counted as `changed_during_scan`.
   Nothing claims a point-in-time view of a live history.
 
