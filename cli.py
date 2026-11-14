@@ -32,6 +32,13 @@ def register_cli(p: argparse.ArgumentParser) -> None:
     im = subs.add_parser("import", help="Register keys named in an existing keychain helper script")
     im.add_argument("script", help="e.g. ~/.hermes/secrets-provider/keychain-secrets-env.sh")
     subs.add_parser("doctor", help="Read-only health check")
+    inv = subs.add_parser("inventory", help="Static inventory of Secret Guard across Hermes homes (reads config only)")
+    inv.add_argument("--root", action="append", default=[])
+    inv.add_argument("--json", action="store_true")
+    inv.add_argument("--names", action="store_true")
+    inv.add_argument("--paths", action="store_true")
+    inv.add_argument("--expect-version")
+    inv.add_argument("--expect-commit")
     p.set_defaults(func=secret_command)
 
 
@@ -139,5 +146,12 @@ def secret_command(args: argparse.Namespace) -> int:
         return 0
     if act == "doctor":
         return doctor.run()
-    print("usage: hermes secret {add,list,verify,remove,recover,import,doctor} ...")
+    if act == "inventory":
+        from . import inventory
+        argv = [x for r in args.root for x in ("--root", r)]
+        argv += ["--json"] * args.json + ["--names"] * args.names + ["--paths"] * args.paths
+        for flag, val in (("--expect-version", args.expect_version), ("--expect-commit", args.expect_commit)):
+            argv += [flag, val] if val else []
+        return inventory.main(argv)
+    print("usage: hermes secret {add,list,verify,remove,recover,import,doctor,inventory} ...")
     return 1

@@ -24,3 +24,7 @@ jobs:
           grep --version 2>&1 | head -1 || true
       - name: Gate and redaction matrix (no Hermes, no keychain)
         run: python tests/test_gate.py
+      - name: Static inventory (synthetic homes only)
+        run: |
+          python -m pip install -q pyyaml
+          python tests/test_inventory.py
