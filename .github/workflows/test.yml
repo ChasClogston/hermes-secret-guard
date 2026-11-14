@@ -1,0 +1,26 @@
+name: Secret Guard gate tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install ripgrep for the tool-versus-gate tests
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep; else brew install ripgrep; fi
+          rg --version | head -1
+          grep --version 2>&1 | head -1 || true
+      - name: Gate and redaction matrix (no Hermes, no keychain)
+        run: python tests/test_gate.py

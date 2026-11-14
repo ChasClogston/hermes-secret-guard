@@ -1,10 +1,15 @@
 """Leak prevention: a fail-closed path gate, value redaction, and an inbound paste block.
 
 Layer 1  pre_tool_call          block tool calls that would read a secret-shaped file, run a
-                                secrets helper, or ask the keychain to print a value.
+                                secrets helper, or ask the keychain to print a value. Since 1.1
+                                this includes reads that reach such a file without naming it:
+                                folder-wide searches and archives, shell globs, file lists built
+                                by another command, file:// addresses, and environment dumps.
 Layer 2  value redaction        register every guarded value with Hermes's own model-egress scrub
                                 (agent.redact vault registry), plus backup transform hooks that
                                 catch their own errors and withhold output rather than fail open.
+                                Since 1.1 the transform hooks also redact the base64, hex and
+                                percent-encoded forms of each guarded value.
 Layer 3  pre_llm_call           a key pasted into chat never reaches a model.
 
 Values live only in this process's memory. Nothing here logs or returns a value.
@@ -12,11 +17,15 @@ Values live only in this process's memory. Nothing here logs or returns a value.
 
 from __future__ import annotations
 
+import base64
+import contextvars
 import fnmatch
 import logging
 import os
 import re
 import shlex
+import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
 
@@ -106,13 +115,80 @@ def core_covers(value: str) -> bool:
         return False
 
 
+# Shortest encoded fragment matched. A guarded value is at least 8 bytes, and every base64
+# alignment of 8 bytes leaves a 10-character core, so 10 covers every accepted value.
+MIN_ENCODED = 10
+_WS_RE = re.compile(r"\s")
+_form_cache: dict[str, tuple[str, ...]] = {}   # value -> encoded forms; memory only, like the values
+
+
+def _b64_cores(raw: bytes) -> set[str]:
+    """The base64 text that `raw` produces wherever it sits in a larger stream. Base64 works in
+    3-byte groups, so the value can start at three alignments; for each, keep only the characters
+    that depend on the value alone (drop the ones shared with neighbouring bytes)."""
+    out: set[str] = set()
+    for off in (0, 1, 2):
+        enc = base64.b64encode(b"\0" * off + raw).decode("ascii").rstrip("=")
+        if (off + len(raw)) % 3:
+            enc = enc[:-1]                      # last character also carries bits of the next byte
+        core = enc[(0, 2, 3)[off]:]             # leading characters carry bits of the previous bytes
+        if len(core) >= MIN_ENCODED:
+            out.add(core)
+            out.add(core.replace("+", "-").replace("/", "_"))   # URL-safe alphabet
+    return out
+
+
+def encoded_forms(value: str) -> tuple[str, ...]:
+    """Encodings a command produces without trying: base64 (any alignment, both alphabets), hex and
+    percent-encoding. Not covered, by design: compression, encryption, reversal, splitting."""
+    cached = _form_cache.get(value)
+    if cached is not None:
+        return cached
+    raw = value.encode("utf-8")
+    forms = _b64_cores(raw)
+    hx = raw.hex()
+    if len(hx) >= MIN_ENCODED:
+        forms.update((hx, hx.upper()))
+    for quoted in (urllib.parse.quote(value, safe=""), urllib.parse.quote_plus(value)):
+        if quoted != value and len(quoted) >= MIN_ENCODED:
+            forms.add(quoted)
+            forms.add(re.sub(r"%[0-9A-F]{2}", lambda m: m.group(0).lower(), quoted))
+    forms.discard(value)
+    result = tuple(sorted(forms, key=len, reverse=True))
+    if len(_form_cache) > 512:
+        _form_cache.clear()
+    _form_cache[value] = result
+    return result
+
+
+def _spaced(form: str) -> "re.Pattern[str]":
+    return re.compile(r"\s*".join(re.escape(c) for c in form))
+
+
 def scrub(text: str) -> tuple[str, int]:
     values = _load_values()
     hits = 0
-    for env, v in sorted(values.items(), key=lambda kv: len(kv[1]), reverse=True):
+    ordered = sorted(values.items(), key=lambda kv: len(kv[1]), reverse=True)
+    for env, v in ordered:
         if v in text:
             hits += text.count(v)
             text = text.replace(v, f"[secret:{env} redacted]")
+    compact: Optional[str] = None
+    for env, v in ordered:
+        label = f"[secret:{env} redacted (encoded)]"
+        for form in encoded_forms(v):
+            if form in text:
+                hits += text.count(form)
+                text = text.replace(form, label)
+                compact = None
+            # base64 and xxd -p wrap long output. Always look again across line breaks: one result
+            # can hold an unwrapped copy and a wrapped copy of the same encoding.
+            if compact is None:
+                compact = _WS_RE.sub("", text)
+            if form in compact:
+                text, n = _spaced(form).subn(label, text)
+                hits += n
+                compact = None
     return text, hits
 
 # ---------------------------------------------------------------- layer 1: path gate
@@ -122,6 +198,10 @@ SECRET_PATTERNS = ("*.env", "*.env.*", ".env", "openclaw.json", "*credential*", 
                    "*secret*", "*.pem", "*.pfx", "*.ppk", "id_rsa", "id_ed25519", "*-keys.json",
                    "auth.json")
 SAFE_EXTENSIONS = (".sh", ".py", ".md")  # code and docs; a *secret*.log is still blocked
+# Patterns that can only be a file name. A bare argument matching one (prod.env, id_rsa) is
+# treated as a secret file for any program. The other three patterns are also ordinary words
+# (token, secret, credential), so a bare match counts only when such a file exists.
+WORD_PATTERNS = ("*credential*", "*token*", "*secret*")
 QUOTES = "\"'"
 READERS = frozenset({"cat", "bat", "less", "more", "head", "tail", "sed", "awk", "gawk", "grep",
                      "egrep", "fgrep", "rg", "ag", "strings", "xxd", "od", "hexdump", "base64",
@@ -135,6 +215,78 @@ COMMAND_KEYS = frozenset({"command", "cmd", "shell", "script"})
 CODE_KEYS = frozenset({"code", "js", "javascript", "expression", "source", "python"})
 PATH_KEYS = frozenset({"path", "file_path", "filepath", "filename", "file", "paths", "files",
                        "source_path", "image_path", "video_path", "workdir_file"})
+
+# --- 1.1: reads that reach a secret file without naming it
+# Folder scans use every name pattern, with two explicit, documented reductions in coverage so that
+# a recursive search of an ordinary repository is not always refused: a fixed list of tokenizer
+# data files, and compiled Python. Neither is proof the file is harmless. A direct read of any of
+# these is still blocked by the path rule. Placeholder env files (.env.example) are NOT exempt.
+BENIGN_DIR_NAMES = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model",
+                    "special_tokens_map.json", "added_tokens.json", "*.pyc", "*.pyo")
+# The time limit is cooperative: it is checked between directory listings and every 256 entries.
+# One slow filesystem call cannot be interrupted by it.
+SCAN_MAX_DEPTH, SCAN_MAX_ENTRIES, SCAN_MAX_SECONDS = 12, 20000, 2.0
+GLOB_MAX_MATCHES = 2000
+SHELL_MAX_DEPTH = 3
+MAX_CWDS = 8
+SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+GREP_FAMILY = frozenset({"grep", "egrep", "fgrep"})
+HIDDEN_SKIPPERS = frozenset({"rg", "ag"})          # skip dotfiles unless told otherwise
+ALWAYS_RECURSIVE = HIDDEN_SKIPPERS | {"tar", "zip", "rsync"}
+# Options that take a value, so the value is not mistaken for a pattern or a path. An option
+# outside these tables and the flag tables below makes the call "not understood": the working
+# folder is then scanned as well as any folder named.
+_VALUE_OPTS = {
+    "grep": ("efmABdD", {"regexp", "file", "max-count", "after-context", "before-context",
+                         "include", "exclude", "exclude-dir", "exclude-from", "label", "binary-files",
+                         "devices", "directories"}),
+    "rg": ("efgtTABCmjMdEr", {"regexp", "file", "glob", "iglob", "type", "type-not", "type-add",
+                              "type-clear", "after-context", "before-context", "context", "max-count",
+                              "threads", "max-columns", "max-depth", "maxdepth", "encoding", "replace",
+                              "color", "colors", "sort", "sortr", "pre", "pre-glob", "ignore-file",
+                              "max-filesize", "path-separator", "context-separator",
+                              "field-match-separator", "field-context-separator", "engine",
+                              "dfa-size-limit", "regex-size-limit", "hyperlink-format", "generate"}),
+    "ag": ("ABCGgmW", {"after", "before", "context", "file-search-regex", "ignore", "ignore-dir",
+                       "max-count", "depth", "pager", "path-to-ignore", "workers", "width"}),
+}
+_FLAG_OPTS = {
+    "grep": ("rRinvclLhHowxsqEFGPzZabUIT", {"recursive", "dereference-recursive", "ignore-case",
+             "no-ignore-case", "line-number", "invert-match", "count", "files-with-matches",
+             "files-without-match", "no-filename", "with-filename", "only-matching", "word-regexp",
+             "line-regexp", "quiet", "silent", "no-messages", "extended-regexp", "fixed-strings",
+             "basic-regexp", "perl-regexp", "null", "null-data", "text", "byte-offset", "binary",
+             "initial-tab", "line-buffered"}),
+    "rg": ("inSsvwxclLoHINpPUuzaFqbh.0", {"hidden", "no-hidden", "no-ignore", "no-ignore-vcs",
+           "no-ignore-parent", "no-ignore-dot", "no-ignore-global", "ignore-case", "smart-case",
+           "case-sensitive", "line-number", "no-line-number", "invert-match", "word-regexp",
+           "line-regexp", "count", "count-matches", "files-with-matches", "files-without-match",
+           "only-matching", "with-filename", "no-filename", "heading", "no-heading", "text", "binary",
+           "fixed-strings", "pcre2", "multiline", "multiline-dotall", "unrestricted", "follow", "json",
+           "vimgrep", "column", "no-column", "trim", "null", "null-data", "search-zip",
+           "one-file-system", "pretty", "no-messages", "quiet", "stats", "no-config", "crlf",
+           "line-buffered", "block-buffered", "mmap", "no-mmap", "passthru", "sort-files",
+           "no-unicode", "glob-case-insensitive", "include-zero", "byte-offset", "files"}),
+    "ag": ("aDfFiLlnQsSuUvwz0cHt", {"hidden", "unrestricted", "all-types", "all-text", "ignore-case",
+           "smart-case", "case-sensitive", "literal", "count", "files-with-matches",
+           "files-without-matches", "invert-match", "word-regexp", "follow", "nocolor", "color",
+           "numbers", "nonumbers", "heading", "noheading", "filename", "nofilename", "null", "stats",
+           "search-binary", "search-zip", "skip-vcs-ignores", "only-matching", "column", "vimgrep"}),
+}
+# Options whose value is optional. GNU and BSD grep disagree on some (-C, --context), so a bare
+# one never consumes the next token unless that token is a number, and marks the call "not
+# understood". --color/--colour never take a separate value in either.
+_OPTIONAL_OPTS = {"grep": ("C", {"context", "color", "colour"}), "rg": ("", set()), "ag": ("", set())}
+_SETTLED_OPTIONAL = {"color", "colour"}
+PLAIN_READERS = ("cat", "bat", "less", "more", "head", "tail", "nl", "tac", "strings", "xxd", "od",
+                 "hexdump", "base64")
+_SUBST_READ_RE = re.compile(r"(?:^|[|;&\n(]\s*)(?:sudo\s+)?(?:" + "|".join(PLAIN_READERS)
+                            + r")\b[^|;&\n]*?(?:\$\(|`|<\()")
+_ENV_DUMP_RE = re.compile(r"(?:print|pprint|dumps|log|write)\s*\(\s*(?:dict\s*\(\s*)?"
+                          r"(?:os\.environ|process\.env)\s*\)?\s*[,)]")
+_FILE_URL_RE = re.compile(r"file://[^\s\"'<>)]+")
+SEARCH_GLOB_KEYS = ("file_glob", "glob", "include")
+NAME_ONLY_TARGETS = frozenset({"files", "filenames", "names"})
 _KEYCHAIN_PRINT_RE = re.compile(r"find-(?:generic|internet)-password[^\n]*?(?:^|\s|['\",])-[a-zA-Z]*[wg]\b|dump-keychain")
 
 
@@ -155,9 +307,12 @@ def _abs(token: str, cwd: Optional[str]) -> str:
     return os.path.realpath(t)
 
 
-def is_secret_path(token: str, cwd: Optional[str] = None) -> bool:
-    name = os.path.basename(token.strip("\"'").rstrip("/")).lower()
-    if not name or name.startswith("-"):
+def is_secret_path(token: str, cwd: Optional[str] = None, literal: bool = False) -> bool:
+    """`literal` means the token is known to be a path (it follows a `--` terminator), so a
+    leading dash does not make it an option. A dash inside a path (dir/-prod.env) never does."""
+    stripped = token.strip("\"'")
+    name = os.path.basename(stripped.rstrip("/")).lower()
+    if not name or (stripped.startswith("-") and not literal):
         return False
     if name.endswith(SAFE_EXTENSIONS):
         return False
@@ -169,66 +324,630 @@ def is_secret_path(token: str, cwd: Optional[str] = None) -> bool:
     return False
 
 
+def names_secret_file(token: str, cwd: Optional[str], literal: bool = False) -> bool:
+    """True when a bare argument names a secret-shaped file: by name alone for file-only patterns,
+    and for the word-like patterns only when that file exists in the folder being used."""
+    if not is_secret_path(token, cwd, literal):
+        return False
+    name = os.path.basename(token.strip("\"'").rstrip("/")).lower()
+    if any(fnmatch.fnmatch(name, p) for p in SECRET_PATTERNS if p not in WORD_PATTERNS):
+        return True
+    if name == "config.yaml" or name.startswith(("config.yaml.", "config.yaml~")):
+        return True                              # is_secret_path already tied it to a Hermes root
+    return os.path.isfile(_abs(token.strip("\"'"), cwd))
+
+
+class _ScanTooBig(Exception):
+    pass
+
+
+class _ScanFailed(Exception):
+    pass
+
+
+class _Budget:
+    """Work allowed for one tool call, shared by every folder scan and glob expansion in it."""
+    def __init__(self) -> None:
+        self.entries = 0
+        self.deadline = time.monotonic() + SCAN_MAX_SECONDS
+
+    def tick(self) -> None:
+        self.entries += 1
+        if self.entries > SCAN_MAX_ENTRIES or (self.entries % 256 == 0 and time.monotonic() > self.deadline):
+            raise _ScanTooBig
+
+    def check_time(self) -> None:
+        if time.monotonic() > self.deadline:
+            raise _ScanTooBig
+
+
+_budget_var: "contextvars.ContextVar[Optional[_Budget]]" = contextvars.ContextVar("secret_guard_budget", default=None)
+
+
+def _budget() -> _Budget:
+    b = _budget_var.get()
+    if b is None:
+        b = _Budget()
+        _budget_var.set(b)
+    return b
+
+
+def _dir_secret_name(path: str) -> bool:
+    name = os.path.basename(path).lower()
+    if any(fnmatch.fnmatch(name, p) for p in BENIGN_DIR_NAMES):
+        return False
+    return is_secret_path(path)
+
+
+def _glob_regex(pattern: str) -> Optional["re.Pattern[str]"]:
+    """A ripgrep/gitignore-style glob with a folder part, as a regex over the relative path.
+    None when the glob uses syntax this does not model (the caller then applies no filter)."""
+    if not pattern or pattern.startswith("!") or any(c in pattern for c in "{}[]\\"):
+        return None                              # exclusions, braces, classes: not modelled
+    pattern = pattern.lstrip("/")
+    out, i = [], 0
+    while i < len(pattern):
+        c = pattern[i]
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?"); i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*"); i += 2
+        elif c == "*":
+            out.append("[^/]*"); i += 1
+        elif c == "?":
+            out.append("[^/]"); i += 1
+        else:
+            out.append(re.escape(c)); i += 1
+    try:
+        return re.compile("".join(out) + r"\Z")
+    except re.error:
+        return None
+
+
+def _name_filter(name_glob: Optional[str]):
+    """How a search tool's file filter selects files, or None for "every file". A filter is used
+    only when it can be modelled exactly; anything else is ignored, which can only block more."""
+    if not name_glob:
+        return None
+    if any(c in name_glob for c in "{}[]\\") or name_glob.startswith("!"):
+        return None                              # includes [!x] and [^x], which tools and fnmatch read differently
+    if "/" not in name_glob:
+        return lambda rel: fnmatch.fnmatchcase(os.path.basename(rel), name_glob)
+    rx = _glob_regex(name_glob)
+    return (lambda rel: rx.match(rel) is not None) if rx else None
+
+
+def secret_file_under(root: str, name_glob: Optional[str] = None, include_hidden: bool = True,
+                      skip_dirs: frozenset = frozenset()) -> Optional[str]:
+    """First secret-shaped file under `root` (relative path), or None. The work is bounded by the
+    call's shared budget and by depth; exceeding either raises _ScanTooBig, and a folder that
+    cannot be listed raises _ScanFailed. The caller blocks on both (never a silent pass).
+    Symlinked folders are not followed."""
+    budget = _budget()
+    selects = _name_filter(name_glob)
+    stack = [(root, 0)]
+    while stack:
+        folder, depth = stack.pop()
+        budget.check_time()
+        try:
+            with os.scandir(folder) as it:
+                for e in it:
+                    budget.tick()
+                    if not include_hidden and e.name.startswith("."):
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        if e.name in skip_dirs:
+                            continue
+                        if depth + 1 > SCAN_MAX_DEPTH:
+                            raise _ScanTooBig
+                        stack.append((e.path, depth + 1))
+                    elif _dir_secret_name(e.path):
+                        rel = os.path.relpath(e.path, root)
+                        if selects is None or selects(rel):
+                            return rel
+        except OSError as exc:
+            raise _ScanFailed from exc
+    return None
+
+
+def _folder_reason(folder: str, name_glob: Optional[str] = None, include_hidden: bool = True,
+                   skip_dirs: frozenset = frozenset()) -> Optional[str]:
+    try:
+        hit = secret_file_under(folder, name_glob, include_hidden, skip_dirs)
+    except _ScanTooBig:
+        return ("reads a whole folder that is too large to check for secret files; "
+                "name the files or a narrower folder")
+    except _ScanFailed:
+        return ("reads a whole folder that could not be checked for secret files "
+                "(permission or I/O error); name the files you need")
+    if hit:
+        return (f"reads a whole folder that holds a secret-shaped file ({os.path.basename(hit)}); "
+                "name the files you need or a narrower folder")
+    return None
+
+
+def _has_magic(token: str) -> bool:
+    return any(c in token for c in "*?[")
+
+
+def expand_glob(pattern: str, cwd: Optional[str]) -> list:
+    """Paths a shell glob would produce, like the shell (dotfiles only when the pattern part starts
+    with a dot). Walks lazily on the call's shared budget; more than GLOB_MAX_MATCHES matches, an
+    exhausted budget or an unreadable folder raises, and the caller blocks. Never a checked prefix."""
+    budget = _budget()
+    pattern = os.path.expanduser(pattern.strip("\"'"))
+    if not os.path.isabs(pattern):
+        pattern = os.path.join(cwd or os.getcwd(), pattern)
+    parts = [p for p in pattern.split("/") if p]
+    results: list = []
+
+    def listing(folder: str):
+        try:
+            with os.scandir(folder) as it:
+                for e in it:
+                    budget.tick()
+                    yield e
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        except OSError as exc:
+            raise _ScanFailed from exc
+
+    def walk(base: str, idx: int, depth: int) -> None:
+        if depth > SCAN_MAX_DEPTH + len(parts):
+            raise _ScanTooBig
+        if idx == len(parts):
+            results.append(base)
+            if len(results) > GLOB_MAX_MATCHES:
+                raise _ScanTooBig
+            return
+        part = parts[idx]
+        if part == "**":
+            walk(base, idx + 1, depth)
+            for e in listing(base):
+                if not e.name.startswith(".") and e.is_dir(follow_symlinks=False):
+                    walk(e.path, idx, depth + 1)
+        elif _has_magic(part):
+            for e in listing(base):
+                if (part.startswith(".") or not e.name.startswith(".")) and fnmatch.fnmatchcase(e.name, part):
+                    if idx == len(parts) - 1 or e.is_dir():
+                        walk(e.path, idx + 1, depth + 1)
+        else:
+            nxt = os.path.join(base, part)
+            if os.path.lexists(nxt):
+                walk(nxt, idx + 1, depth)
+
+    try:
+        walk("/", 0, 0)
+    except (_ScanTooBig, _ScanFailed):
+        raise
+    except OSError as exc:
+        raise _ScanFailed from exc
+    return results
+
+
+def _guarded_names() -> frozenset:
+    try:
+        return frozenset(registry.load().get("secrets", {}))
+    except Exception:
+        return frozenset()
+
+
+def _folder_tokens(args: list, cwd: Optional[str]) -> list:
+    """Every argument that is an existing folder, whatever its role and whether or not it starts
+    with a dash (after a `--`, `-data` is a folder). Globs are expanded. Shared by every recursive
+    reader so they cannot apply different operand rules."""
+    out = []
+    for tok in args:
+        if tok == "--":
+            continue
+        for m in (expand_glob(tok, cwd) if _has_magic(tok) else [_abs(tok, cwd)]):
+            if os.path.isdir(m):
+                out.append(m)
+    return out
+
+
+def _parse_search_args(prog: str, args: list) -> dict:
+    """Options and operands of a grep/rg/ag call. `understood` is False when an option is not in
+    the tables, so its value could be mistaken for a pattern or a path."""
+    family = "grep" if prog in GREP_FAMILY else prog
+    v_short, v_long = _VALUE_OPTS[family]
+    f_short, f_long = _FLAG_OPTS[family]
+    o_short, o_long = _OPTIONAL_OPTS[family]
+    short, long_flags, operands = [], [], []
+    understood, pattern_given, glob_given = True, False, False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            operands.extend(args[i:])
+            break
+        if a.startswith("--"):
+            name, eq, _val = a[2:].partition("=")
+            long_flags.append(name)
+            if name in o_long:
+                if not eq and name not in _SETTLED_OPTIONAL:
+                    if i < len(args) and args[i].isdigit():
+                        i += 1
+                    understood = False           # tools disagree on whether a bare one takes a value
+            elif name in v_long:
+                pattern_given = pattern_given or name in ("regexp", "file")
+                glob_given = glob_given or name in ("glob", "iglob")
+                if not eq:
+                    i += 1                       # value is the next token
+            elif name not in f_long:
+                understood = False
+        elif a.startswith("-") and len(a) > 1:
+            for j, ch in enumerate(a[1:], start=1):
+                if ch in o_short:
+                    if j == len(a) - 1:          # bare: a following number is its value, nothing else is
+                        if i < len(args) and args[i].isdigit():
+                            i += 1
+                        else:
+                            understood = False
+                    break                        # attached digits are the value
+                if ch in v_short:
+                    pattern_given = pattern_given or ch in "ef"
+                    glob_given = glob_given or (family == "rg" and ch == "g")
+                    if j == len(a) - 1:
+                        i += 1                   # value is the next token
+                    break                        # the rest of the cluster is the value
+                short.append(ch)
+                if ch not in f_short and not ch.isdigit():
+                    understood = False
+        else:
+            operands.append(a)
+    return {"short": short, "long": long_flags, "operands": operands, "understood": understood,
+            "pattern_given": pattern_given, "glob_given": glob_given}
+
+
+def _recursive_folders(prog: str, args: list, cwd: Optional[str]) -> Optional[tuple[list, bool, frozenset]]:
+    """(folders a recursive reader would walk, whether dotfiles count, folder names it skips), or
+    None if the call is not recursive. Glob operands are expanded first. When the call is not
+    understood, or names no existing path, the working folder is included."""
+    here = _abs(".", cwd)
+    if prog in GREP_FAMILY or prog in HIDDEN_SKIPPERS:
+        # Recursion, dotfile reach and candidate folders are read from every raw token, so a token
+        # whose role is misjudged can only add scanning, never remove it. A "--" is not trusted as
+        # the end of options here: in `-e -- -r` it is the pattern, and -r still applies.
+        raw_opts = [a for a in args if a.startswith("-") and len(a) > 1 and a != "--"]
+        raw_short = "".join(a[1:] for a in raw_opts if not a.startswith("--"))
+        raw_long = [a[2:].partition("=")[0] for a in raw_opts if a.startswith("--")]
+        if prog in GREP_FAMILY and not (any(c in raw_short for c in "rRd") or "recursive" in raw_long
+                                        or "dereference-recursive" in raw_long or "directories" in raw_long):
+            return None
+        parsed = _parse_search_args(prog, args)
+        operands = parsed["operands"]
+        paths = operands if parsed["pattern_given"] else operands[1:]
+        hidden = True
+        if prog in HIDDEN_SKIPPERS:
+            hidden = ("hidden" in raw_long or "." in raw_short or "glob" in raw_long or "iglob" in raw_long
+                      or (prog == "rg" and "g" in raw_short)
+                      or raw_short.count("u") >= (2 if prog == "rg" else 1)
+                      or raw_long.count("unrestricted") >= (2 if prog == "rg" else 1))
+        folders, named_existing = [], False
+        for p in paths:                          # the parsed path operands, dash-prefixed ones included
+            for m in (expand_glob(p, cwd) if _has_magic(p) else [_abs(p, cwd)]):
+                if os.path.isdir(m):
+                    folders.append(m)
+                    named_existing = True
+                elif os.path.exists(m):
+                    named_existing = True
+        folders.extend(_folder_tokens(args, cwd))    # and every token that is a folder, whatever its role
+        if not named_existing or not parsed["understood"]:
+            folders.append(here)
+        return list(dict.fromkeys(folders)), hidden, frozenset()
+    # tar, zip, rsync, cp, scp, diff. Flags are read from every dash token, so a folder such as
+    # -data can at worst be misread as flags, which only adds scanning.
+    flags = [a for a in args if a.startswith("-") and a != "--"]
+    short = "".join(f[1:] for f in flags if not f.startswith("--"))
+    if prog in ALWAYS_RECURSIVE:
+        recursive = True
+    elif prog in ("cp", "scp"):
+        recursive = any(c in short for c in "rRa") or "--recursive" in flags or "--archive" in flags
+    elif prog == "diff":
+        recursive = "r" in short or "--recursive" in flags
+    else:
+        recursive = False
+    if not recursive:
+        return None
+    return list(dict.fromkeys(_folder_tokens(args, cwd))), True, frozenset()
+
+
+def _find_roots(args: list, cwd: Optional[str]) -> list:
+    roots = []
+    for a in args:
+        if a.startswith("-") or a in ("(", "!", "\\("):
+            break
+        roots.append(_abs(a, cwd))
+    return roots or [_abs(".", cwd)]
+
+
 def _is_secrets_helper(token: str, cwd: Optional[str]) -> bool:
     full = _abs(token, cwd)
     return "/secrets-provider/" in full or full.endswith("/secret_guard/emit-secrets.sh")
 
 
+def _split_records(command: str) -> list:
+    """Split a command line into simple commands at ; | & newline ( ) and around $( ... ) and
+    backticks, respecting quotes: nothing inside single quotes splits, and inside double quotes
+    only a command substitution does (its body is then read as unquoted shell).
+
+    Each record is (text, depth, prev, next): how deeply the command sits inside parentheses or
+    substitutions, and the operator before and after it. That is the only shell structure kept;
+    it is what lets `cd X && cmd` be recognised as an AND-list."""
+    recs, buf, quote, i, n = [], [], "", 0, len(command)
+    stack: list = []                            # (opener, quote state to restore) per open substitution
+    state = {"paren": 0, "last": None}
+
+    def flush(op):
+        seg = "".join(buf).strip()
+        buf.clear()
+        if seg and seg != '""':
+            recs.append([seg, len(stack) + state["paren"], state["last"], op])
+        elif recs and op is not None and recs[-1][3] in (")", None):
+            pass
+        state["last"] = op if op is not None else state["last"]
+
+    def enter(opener: str):
+        nonlocal quote
+        if quote == '"':
+            buf.append('"')                     # close the open quote so the outer piece still parses
+        flush("$(")
+        stack.append((opener, quote))
+        quote = ""
+
+    def leave():
+        nonlocal quote
+        flush(")")
+        _opener, quote = stack.pop()
+        if quote == '"':
+            buf.append('"')
+
+    while i < n:
+        c = command[i]
+        if quote == "'":
+            buf.append(c)
+            if c == "'":
+                quote = ""
+        elif c == "\\" and i + 1 < n:
+            buf.append(c); buf.append(command[i + 1]); i += 1
+        elif c == "$" and command.startswith("$(", i):
+            enter("$("); i += 1
+        elif c == "`":
+            if stack and stack[-1][0] == "`" and not quote:
+                leave()
+            else:
+                enter("`")
+        elif quote == '"':
+            buf.append(c)
+            if c == '"':
+                quote = ""
+        elif c in "'\"":
+            quote = c; buf.append(c)
+        elif c == ")" and stack and stack[-1][0] == "$(":
+            leave()
+        elif c == "(":
+            flush("(")
+            state["paren"] += 1
+        elif c == ")":
+            flush(")")
+            state["paren"] = max(0, state["paren"] - 1)
+        elif c in "|&" and i + 1 < n and command[i + 1] == c:
+            flush(c + c); i += 1
+        elif c in ";|&\n":
+            flush(";" if c == "\n" else c)
+        else:
+            buf.append(c)
+        i += 1
+    flush(None)
+    return [tuple(r) for r in recs]
+
+
+def _split_commands(command: str) -> list[str]:
+    return [r[0] for r in _split_records(command)]
+
+
+def _tokens(seg: str) -> list:
+    try:
+        return shlex.split(seg, posix=True)
+    except ValueError:
+        return seg.split()
+
+
 def _segments(command: str) -> list[list[str]]:
-    out = []
-    for seg in re.split(r"\|\|?|&&|;|\n|\$\(|`|\)", command):
-        seg = seg.strip()
-        if not seg:
-            continue
-        try:
-            toks = shlex.split(seg, posix=True)
-        except ValueError:
-            toks = seg.split()
-        if toks:
-            out.append(toks)
-    return out
+    return [t for t in (_tokens(seg) for seg in _split_commands(command)) if t]
 
 
-def check_command(command: str, cwd: Optional[str] = None) -> Optional[str]:
+def check_command(command: str, cwd: Optional[str] = None, _depth: int = 0) -> Optional[str]:
     """Return a refusal reason, or None if the command may run."""
     if not command:
         return None
-    for toks in _segments(command):
-        # skip leading VAR=value assignments and wrappers
-        i = 0
-        # a wrapper counts only when something follows it: a bare `env` is an environment dump
-        while i + 1 < len(toks) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[i]) or toks[i] in ("sudo", "env", "command", "exec", "nohup", "time")):
-            i += 1
-        if i >= len(toks):
+    try:
+        return _check_command(command, cwd, _depth)
+    except _ScanTooBig:
+        return "names files through a pattern too large to check; name the files instead"
+    except _ScanFailed:
+        return "names files in a folder that could not be checked (permission or I/O error)"
+
+
+def _check_command(command: str, cwd: Optional[str], _depth: int) -> Optional[str]:
+    if _SUBST_READ_RE.search(command):
+        return "reads a file list produced by another command; name the files instead"
+    guarded = _guarded_names()
+    cwds = [cwd]                                 # every folder this command line may be working in
+    # A folder change never removes a candidate: nothing here can show that a cd ran and worked
+    # (it may sit in an untaken branch, its redirection may fail, its target may be unreadable).
+    # The one narrowing kept is the AND-list: in `cd X && cmd`, cmd runs only if that cd ran and
+    # succeeded, so cmd alone is checked from X. `chain` holds those folders while the && run lasts.
+    chain = None                                 # (folders, depth) or None
+    chainable = not _CD_REDEFINED_RE.search(command)
+    for seg, depth, prev, nxt in _split_records(command):
+        toks = _tokens(seg)
+        if not toks:
             continue
-        prog = os.path.basename(toks[i])
-        args = toks[i + 1:]
-        # 1. the keychain printing a value
-        if prog == "security":
-            joined = " ".join(args)
-            if re.search(r"\bfind-(generic|internet)-password\b", joined) and re.search(r"(^|\s)-[a-zA-Z]*[wg]", joined):
-                return "asks the keychain to print a secret value (security find-*-password -w/-g)"
-            if "dump-keychain" in joined:
-                return "dumps the keychain"
-        # 2. running or sourcing a secrets helper prints every secret
-        if prog in ("source", ".", "sh", "bash", "zsh") and args and _is_secrets_helper(args[-1] if prog in ("source", ".") else args[0], cwd):
-            return "runs a secrets helper script, which prints every secret"
-        if "/" in toks[i] and _is_secrets_helper(toks[i], cwd):
-            return "runs a secrets helper script, which prints every secret"
-        # 3. inspection commands known to print stored credentials unmasked
-        if prog == "openclaw" and args[:2] == ["mcp", "show"]:
-            return "openclaw mcp show prints stored headers unmasked; use openclaw mcp doctor"
-        if prog in ("printenv", "env") and not [a for a in args if not a.startswith("-")]:
-            return "dumps the whole environment, which holds live keys"
-        # 4. a reader pointed at a secret-shaped file
-        if prog in READERS:
-            for a in args:
-                if is_secret_path(a, cwd):
-                    return f"reads a secret-shaped file ({os.path.basename(a.strip(QUOTES))})"
-                # inline code (python -c, perl -e, node -e) naming a secret file
-                for inner in re.findall(r"[\w./~-]+", a) if len(a) > 40 or " " in a else ():
-                    if is_secret_path(inner, cwd):
-                        return f"inline code references a secret-shaped file ({os.path.basename(inner)})"
+        in_chain = chain is not None and prev == "&&" and depth == chain[1]
+        here = chain[0] if in_chain else cwds
+        if not in_chain:
+            chain = None
+        step = _cd_args(toks)
+        if step is not None:
+            args, plain = step
+            moved, static = [], False
+            if len(args) <= 1 and not (args and ("$" in args[0] or "`" in args[0] or args[0] == "-")):
+                static = True
+                target = args[0] if args else os.path.expanduser("~")
+                moved = [c for c in (_abs(target, base) for base in here) if os.path.isdir(c)]
+            # `cd -`, popd and a target built at run time ($DIR) cannot be followed: the candidates
+            # already hold every folder this line has been in, and they stay as they are
+            cwds = list(dict.fromkeys(cwds + moved))
+            if len(cwds) > MAX_CWDS:
+                return "changes folder too many times to check; run the commands separately"
+            ok = (chainable and plain and static and moved and nxt == "&&" and prev in (None, ";", "&&", "("))
+            chain = (moved, depth) if ok else None
+            continue
+        for where in here:
+            reason = _check_tokens(toks, where, guarded, _depth)
+            if reason:
+                return reason
+    return None
+
+
+# a line that redefines cd, or sets a search path for it, gets no AND-list narrowing
+_CD_REDEFINED_RE = re.compile(r"\b(?:cd|pushd)\s*\(\s*\)|\bfunction\s+(?:cd|pushd)\b|\balias\b[^;|&\n]*\b(?:cd|pushd)=|CDPATH")
+
+
+_SHELL_KEYWORDS = ("then", "do", "else", "elif", "if", "while", "until", "{", "!", "time")
+
+
+def _cd_args(toks: list) -> Optional[tuple]:
+    """(arguments, plain) of a cd/pushd/popd command, or None if the tokens are some other command.
+    `plain` is True only for the bare form `cd [--] [target]`: no keyword, `!`, assignment, wrapper,
+    option or redirection in the same simple command."""
+    i = 0
+    while i + 1 < len(toks) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[i]) or toks[i] in ("command", "builtin")
+                                 or toks[i] in _SHELL_KEYWORDS):
+        i += 1
+    if i < len(toks) and toks[i] in ("cd", "pushd", "popd"):
+        rest = toks[i + 1:]
+        args = [a for a in rest if a not in ("--", "-P", "-L", "-e", "-@", ";", "}", "fi", "done")
+                and not re.match(r"^\d*[<>]", a) and not re.match(r"^&?\d*$", a)]
+        if toks[i] == "popd":
+            return (["-"], False)
+        plain = i == 0 and toks[0] in ("cd", "pushd") and [a for a in rest if a != "--"] == args
+        return (args, plain)
+    return None
+
+
+def _check_tokens(toks: list, cwd: Optional[str], guarded: frozenset, _depth: int) -> Optional[str]:
+    """One simple command, checked as if run in `cwd`."""
+    # skip leading VAR=value assignments and wrappers
+    i = 0
+    # a wrapper counts only when something follows it: a bare `env` is an environment dump
+    while i + 1 < len(toks) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[i]) or toks[i] in ("sudo", "env", "command", "exec", "nohup", "time")):
+        i += 1
+    if i >= len(toks):
+        return None
+    prog = os.path.basename(toks[i])
+    args = toks[i + 1:]
+    # 00. any argument that names a secret-shaped file, whatever the program: `rev prod.env`,
+    # `tr a b < prod.env`, `mv prod.env x.txt`, `F=prod.env`, `dd if=prod.env`
+    after_terminator = False
+    for t in toks:
+        if t == "--":
+            after_terminator = True
+            continue
+        bare = t.lstrip("<>")
+        for cand in ([bare, bare.rsplit("=", 1)[1]] if "=" in bare else [bare]):
+            if cand and "://" not in cand and names_secret_file(cand, cwd, literal=after_terminator):
+                return f"names a secret-shaped file ({os.path.basename(cand)})"
+    # 0. a shell given its command as a string: check that string as a command too
+    payloads = []
+    if prog in SHELLS:
+        for j, a in enumerate(args):
+            if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", a):
+                rest = [x for x in args[j + 1:] if not x.startswith("-")]
+                payloads.append(rest[0] if rest else "")
+                break
+    elif prog == "eval" and args:
+        payloads.append(" ".join(args))
+    for payload in payloads:
+        if _depth >= SHELL_MAX_DEPTH:
+            return "nests shell commands too deeply to check"
+        if not payload or re.fullmatch(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$[@*0-9]", payload.strip()):
+            return "runs a command string built at run time, which cannot be checked"
+        reason = check_command(payload, cwd, _depth + 1) or check_code(payload)
+        if reason:
+            return reason
+    # 1. the keychain printing a value
+    if prog == "security":
+        joined = " ".join(args)
+        if re.search(r"\bfind-(generic|internet)-password\b", joined) and re.search(r"(^|\s)-[a-zA-Z]*[wg]", joined):
+            return "asks the keychain to print a secret value (security find-*-password -w/-g)"
+        if "dump-keychain" in joined:
+            return "dumps the keychain"
+    # 2. running or sourcing a secrets helper prints every secret
+    if prog in ("source", ".", "sh", "bash", "zsh") and args and _is_secrets_helper(args[-1] if prog in ("source", ".") else args[0], cwd):
+        return "runs a secrets helper script, which prints every secret"
+    if "/" in toks[i] and _is_secrets_helper(toks[i], cwd):
+        return "runs a secrets helper script, which prints every secret"
+    # 3. inspection commands known to print stored credentials unmasked
+    if prog == "openclaw" and args[:2] == ["mcp", "show"]:
+        return "openclaw mcp show prints stored headers unmasked; use openclaw mcp doctor"
+    if prog in ("printenv", "env") and not [a for a in args if not a.startswith("-")]:
+        return "dumps the whole environment, which holds live keys"
+    if prog == "set" and not args:
+        return "dumps every shell variable, which holds live keys"
+    if prog in ("export", "declare", "typeset") and not [a for a in args if not a.startswith("-")] \
+            and (prog == "export" or any("p" in a or "x" in a for a in args)):
+        return "dumps exported shell variables, which hold live keys"
+    if prog == "printenv":
+        for a in args:
+            if a in guarded:
+                return f"prints a guarded variable ({a})"
+    if prog in ("echo", "printf", "print"):
+        for a in args:
+            for name in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", a):
+                if name in guarded:
+                    return f"prints a guarded variable ({name})"
+    # 3b. a file list built at run time: find -exec READER, xargs READER
+    if prog == "find":
+        for j, a in enumerate(args[:-1]):
+            if a in ("-exec", "-execdir", "-ok") and os.path.basename(args[j + 1]) in READERS:
+                for root in list(dict.fromkeys(_find_roots(args, cwd) + _folder_tokens(args[:j], cwd))):
+                    reason = _folder_reason(root)
+                    if reason:
+                        return reason
+                break
+    if prog == "xargs" and any(os.path.basename(a) in READERS for a in args):
+        reason = _folder_reason(_abs(".", cwd))
+        if reason:
+            return reason
+    # 4. a reader pointed at a secret-shaped file
+    if prog in READERS:
+        walk = _recursive_folders(prog, args, cwd)
+        if walk:
+            for folder in walk[0]:
+                reason = _folder_reason(folder, include_hidden=walk[1], skip_dirs=walk[2])
+                if reason:
+                    return reason
+        after_terminator = False
+        for a in args:
+            if a == "--":
+                after_terminator = True
+                continue
+            if (after_terminator or not a.startswith("-")) and _has_magic(a):
+                for m in expand_glob(a, cwd):
+                    if is_secret_path(m, cwd):
+                        return f"glob matches a secret-shaped file ({os.path.basename(m)})"
+            if after_terminator and is_secret_path(a, cwd, literal=True):
+                return f"reads a secret-shaped file ({os.path.basename(a)})"
+            if is_secret_path(a, cwd):
+                return f"reads a secret-shaped file ({os.path.basename(a.strip(QUOTES))})"
+            # inline code (python -c, perl -e, node -e) naming a secret file
+            for inner in re.findall(r"[\w./~-]+", a) if len(a) > 40 or " " in a else ():
+                if is_secret_path(inner, cwd):
+                    return f"inline code references a secret-shaped file ({os.path.basename(inner)})"
     return None
 
 
@@ -243,6 +962,12 @@ def check_code(code: str) -> Optional[str]:
         return None
     if _KEYCHAIN_PRINT_RE.search(code):
         return "asks the keychain to print a secret value"
+    if _ENV_DUMP_RE.search(code):
+        return "prints the whole environment, which holds live keys"
+    for name in _guarded_names():
+        if re.search(r"(?:print|log|write)\s*\([^)\n]*(?:environ|getenv|process\.env)[^)\n]*\b"
+                     + re.escape(name) + r"\b", code):
+            return f"prints a guarded variable ({name})"
     for tok in re.findall(r"[\w./~-]+", code):
         if ("/" in tok or tok.startswith(".")) and is_secret_path(tok):
             return f"code references a secret-shaped file ({os.path.basename(tok)})"
@@ -259,6 +984,11 @@ MAX_DEPTH, MAX_NODES, MAX_TEXT = 12, 5000, 2_000_000
 
 
 def _check_string(key: str, val: str, cwd: Optional[str]) -> Optional[str]:
+    if "file://" in val and len(val) <= MAX_TEXT:
+        for url in _FILE_URL_RE.findall(val):
+            target = urllib.parse.unquote(urllib.parse.urlparse(url).path)
+            if target and is_secret_path(target, cwd):
+                return f"opens a secret-shaped file through a file:// address ({os.path.basename(target)})"
     if key in COMMAND_KEYS:
         return check_command(val, cwd) or check_code(val)
     if key in CODE_KEYS:
@@ -296,9 +1026,58 @@ def _walk(obj: Any, key: str, cwd: Optional[str], depth: int, budget: dict) -> O
     return None
 
 
+SEARCH_PATH_KEYS = ("path", "directory", "dir", "root", "folder")
+
+
+def _search_dicts(obj: Any, depth: int = 0, seen: Optional[list] = None) -> list:
+    """Every nested dict of the arguments (bounded), so a wrapped schema such as
+    {"input": {"path": ...}} is checked where its path actually is."""
+    seen = [] if seen is None else seen
+    if depth > MAX_DEPTH or len(seen) > 200:
+        raise _TooBig
+    if isinstance(obj, dict):
+        seen.append(obj)
+        for v in obj.values():
+            _search_dicts(v, depth + 1, seen)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _search_dicts(v, depth + 1, seen)
+    return seen
+
+
+def _check_folder_search(tool_name: str, args: dict) -> Optional[str]:
+    """A content search over a folder returns file contents without naming a file. Applies to
+    search_files and to any tool named like a search that takes a path, at any nesting depth."""
+    name = (tool_name or "").lower()
+    searchy = "search" in name or "grep" in name
+    if not (name == "search_files" or searchy):
+        return None
+    dicts = _search_dicts(args)
+    with_path = [d for d in dicts if any(isinstance(d.get(k), str) for k in SEARCH_PATH_KEYS)]
+    if not with_path:
+        if name != "search_files":
+            return None                          # web_search, session_search: no folder involved
+        with_path = [args]                       # search_files with no path searches the cwd
+    for d in with_path:
+        if str(d.get("target", args.get("target", ""))).lower() in NAME_ONLY_TARGETS:
+            continue                             # file names only: no contents returned
+        path_key = next((k for k in SEARCH_PATH_KEYS if isinstance(d.get(k), str)), None)
+        local = d.get("workdir") or d.get("cwd") or args.get("workdir") or args.get("cwd")
+        cwd = local if isinstance(local, str) else None
+        folder = _abs(d[path_key] if path_key else ".", cwd)
+        if not os.path.isdir(folder):
+            continue                             # a single file: the path rule already checked it
+        name_glob = next((d[k] for k in SEARCH_GLOB_KEYS if isinstance(d.get(k), str) and d[k]), None)
+        reason = _folder_reason(folder, name_glob)
+        if reason:
+            return reason
+    return None
+
+
 def check_tool_args(tool_name: str, args: dict) -> Optional[str]:
+    _budget_var.set(_Budget())                   # one work budget for this whole tool call
     try:
-        return _walk(args, "", None, 0, {"nodes": 0, "text": 0})
+        return _walk(args, "", None, 0, {"nodes": 0, "text": 0}) or _check_folder_search(tool_name, args)
     except (_TooBig, RecursionError):
         return "has arguments too large or too deeply nested to inspect"
 

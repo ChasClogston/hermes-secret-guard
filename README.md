@@ -140,11 +140,20 @@ of overwriting. `hermes secret doctor` lists any variable your old source still 
    (`*.env`, `*token*`, `*secret*`, `*credential*`, `*.pem`, `id_rsa`, `auth.json`, Hermes
    `config.yaml`), running any secrets helper, `security find-*-password -w/-g`, `security
    dump-keychain`, a bare `env`/`printenv`, and `openclaw mcp show` (prints stored headers unmasked).
+   Since 1.1 it also refuses reads that reach such a file without naming it: a content search,
+   `grep -r`, `rg`, `tar`, `zip`, `cp -r`, `find -exec` or `xargs` over a folder that holds one; a
+   shell glob that matches one; a reader fed by `$(...)` or backticks; a `file://` address;
+   `printenv NAME` or `echo $NAME` for a guarded variable; and `set`, `export -p` or printing
+   `os.environ`. The same checks apply inside `sh -c '...'`, `bash -lc`, `eval` and command
+   substitutions, up to three levels deep. A blocked folder read tells the agent to name the
+   files it needs. A folder that is too large, or cannot be listed, is refused, not passed.
 2. **Value redaction.** Every registered value is pushed into Hermes's own model-egress scrub, the
    same exact-value registry Hermes uses for browser-vault passwords. That registry applies even
    when `security.redact_secrets` is off. Backup `transform_*` hooks scrub tool results, terminal
    output and replies too; if a backup hook itself fails, it withholds the output instead of
-   passing it through.
+   passing it through. Since 1.1 these hooks also redact each value's base64 (any alignment, both
+   alphabets, wrapped or not, for every accepted value of 8 bytes or more), hex and
+   percent-encoded forms.
 3. **Inbound block** (`pre_llm_call`). An exact registered value, or a string shaped like a known
    key (`sk-`, `ghp_`, `xoxb-`, `AKIA`, `AIza`, Telegram bot tokens, …), stops the turn before any
    inference.
@@ -184,9 +193,70 @@ What Secret Guard does on your machine, so you can decide before installing:
 
 Secret Guard reduces exposure. It is not a sandbox and it does not certify anything.
 
-- **Only exact values are scrubbed.** A key that is base64- or hex-encoded, reversed, split across
-  two outputs or partly echoed is not recognised. Redaction is the safety net; the path gate and
-  key entry outside chat are what keep keys from being read in the first place.
+- **Exact values and three encodings are scrubbed.** The plugin's transform hooks redact a key
+  verbatim and in base64, hex and percent-encoded form. A key that is compressed, encrypted,
+  reversed, upper-cased, spaced out, split across two outputs or partly echoed is not recognised.
+  Hermes's own model-egress scrub still matches the exact value only. `xxd` and `hexdump` output
+  with offsets and column groups is not matched; `xxd -p` is. Redaction is the safety net; the
+  path gate and key entry outside chat are what keep keys from being read in the first place.
+- **Folder reads are checked by file name, within limits.** One tool call gets one work budget
+  for all its folder scans and glob expansions: 20,000 entries and 12 levels, plus a two-second
+  budget that is cooperative (checked between folder listings; it cannot interrupt one slow
+  filesystem call). Past that, or when a folder cannot be listed, the call is blocked. Symlinked
+  folders are not followed, so `grep -R`, `rg -L` or `cp -L` can read further than the scan
+  looked. A secret in an ordinarily named file is not seen.
+- **Two deliberate reductions in folder-scan coverage.** A fixed list of tokenizer data files
+  (`tokenizer.json`, `tokenizer_config.json`, `tokenizer.model`, `special_tokens_map.json`,
+  `added_tokens.json`) and compiled Python (`*.pyc`, `*.pyo`) do not block a folder search. That
+  is a noise trade, not proof those files are harmless: bytecode can embed a credential. A direct
+  read of any of them is still blocked. Placeholder env files (`.env.example` and the like) are
+  not exempt, so a recursive search of a repository that has one is refused; search a subfolder.
+- **Whole-repository searches are often refused.** Name patterns also match public material such
+  as `cacert.pem`. This is the cost of blocking by file name.
+- **The scan is at least as wide as the tool, never narrower by assumption.** Every folder is
+  scanned in full for `grep -r`, `tar`, `zip`, `cp -r`, `search_files`, `rg` and `ag`, including
+  `node_modules` and virtual environments: ignore files are not read, so `rg` may be refused for
+  a file it would in fact skip. The one modelled difference is dotfiles, which `rg` and `ag` skip
+  unless `--hidden`, `-uu` or a `--glob` is given; a config file or alias that changes that is not
+  seen. A search tool's file filter is honoured only when it can be modelled exactly (`*.py`,
+  `src/**/*.py`); exclusions, brace patterns and character classes are ignored, which can only
+  block more.
+- **The scan uses the folder Hermes runs in** when a command gives a relative path. A tool with
+  its own working folder, a remote backend or a container may be reading somewhere the scan did
+  not look. This is a real gap, not a formality.
+- **A secret file named without a folder is recognised by name, with one exception.** `rev
+  prod.env`, `tr a b < prod.env`, `mv prod.env x.txt` and `F=prod.env` are refused for any
+  program, because names like `prod.env` and `id_rsa` can only be files. Names that are also
+  ordinary words (`credentials`, `token`, `secret`) are refused for the listed reader programs
+  always, and for other programs only when such a file exists in a folder the command line
+  may be using. In a shell that kept its folder from an
+  earlier call, `rev credentials` is therefore not caught.
+- **A folder change inside one command line never removes a folder from the check.** Nothing
+  the gate can see proves that a `cd` ran and worked: it may sit in a branch that is not taken,
+  its redirection may fail, the target may be unreadable. So every `cd` target is added as a
+  candidate and the earlier folders stay; later commands are checked under every candidate, and
+  a block under any of them blocks. The one narrowing is the AND-list: in `cd X && cmd`, `cmd`
+  runs only if that `cd` ran and succeeded, so `cmd` is checked from `X` alone, for as long as
+  the `&&` run lasts. It applies only to the bare form `cd X` (no `!`, keyword, option or
+  redirection, not piped, not after `||`) and not on a line that redefines `cd` or sets
+  `CDPATH`. The cost: `cd X; grep -r word .` and `cd X || exit; grep -r word .` are refused when
+  the starting folder holds a secret file; write `cd X && grep -r word .`. More than eight
+  candidates refuses the line. A folder named at run time (`cd "$DIR"`), an inherited `CDPATH`,
+  a `cd` redefined outside the line, and a folder change made in an earlier call cannot be
+  followed.
+- **Command parsing is a small grammar, not a shell.** Quotes, `;`, `|`, `&&`, `$(...)`,
+  backticks, `sh -c` and `eval` are handled. Here-documents, aliases, functions, variables holding
+  command names and scripts on disk are not. Whether a `grep` call is recursive, and
+  which folders it names, are read from the raw arguments, so a misread option can only add
+  scanning. An option the tables do not know, or one whose value is optional in some `grep`
+  builds, makes the call "not understood": the working folder is then scanned as well.
+- **Some ordinary commands are now refused.** `cat $(...)`, `find . -exec grep ...`,
+  `sh -c "$CMD"` and `grep -r` in a project that keeps a `.env` file are blocked; name the files
+  or a subfolder instead. `rg` skips dotfiles by default, so a hidden `.env` does not block it
+  unless `--hidden` or `-uu` is used.
+- **Using a guarded variable is allowed; printing it is not.** `curl -H "Authorization: Bearer
+  $KEY"` runs. `echo $KEY` is blocked. A script that prints the variable some other way is caught
+  only by redaction.
 - **What it can't see:** logging done by MCP servers or child processes outside Hermes; images and
   screenshots; backups taken before a value was scrubbed. The plugin makes no network calls, but
   Hermes sends resolved keys to the services they belong to, as it does for any secret source.
@@ -241,9 +311,17 @@ PYTHONPATH=$HA $HA/venv/bin/python tests/test_guard.py
 ```
 
 Self-contained: a throwaway `HERMES_HOME`, a throwaway keychain and random canaries, removed at
-the end. 163 checks: a block case and an allow case for every gate rule, fault injection for every
+the end. 165 checks: a block case and an allow case for every gate rule, fault injection for every
 keychain and registry failure path, and assertions of the documented limits (so this README cannot
 quietly overclaim).
+
+`python tests/test_gate.py` needs no Hermes and no keychain, and runs on any platform. It holds the
+1.1 matrix: named secret files, folder-wide reads, globs, command substitution, environment reads,
+`file://` addresses, the ordinary commands that must keep working, the encoded forms that are
+redacted, and the known limits that are not. It also holds a regression for each finding of the
+two independent reviews of the 1.1 candidates, and differential tests that really run the
+installed `grep` and ripgrep in the synthetic tree: whenever the tool prints the synthetic value,
+the gate must have blocked that command or search filter.
 
 `tests/e2e_canary.sh` runs the same attacks against a real Hermes agent in a throwaway home and
 throwaway keychain, and requires positive evidence for each result. See the script header for setup.
