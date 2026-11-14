@@ -24,3 +24,5 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq strace && strace -V | head -1
       - name: Database-artifact byte scan (synthetic databases only)
         run: python tests/test_artifact_scan.py
+      - name: Artifact comparison (synthetic byte files and dummy helpers only)
+        run: python -W error tests/test_artifact_compare.py
