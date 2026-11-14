@@ -35,6 +35,7 @@ def register_cli(p: argparse.ArgumentParser) -> None:
     inv = subs.add_parser("inventory", help="Static inventory of Secret Guard across Hermes homes (reads config only)")
     inv.add_argument("--root", action="append", default=[])
     inv.add_argument("--json", action="store_true")
+    inv.add_argument("--names", action="store_true")
     inv.add_argument("--paths", action="store_true")
     inv.add_argument("--expect-version")
     inv.add_argument("--expect-commit")
@@ -148,7 +149,7 @@ def secret_command(args: argparse.Namespace) -> int:
     if act == "inventory":
         from . import inventory
         argv = [x for r in args.root for x in ("--root", r)]
-        argv += ["--json"] * args.json + ["--paths"] * args.paths
+        argv += ["--json"] * args.json + ["--names"] * args.names + ["--paths"] * args.paths
         for flag, val in (("--expect-version", args.expect_version), ("--expect-commit", args.expect_commit)):
             argv += [flag, val] if val else []
         return inventory.main(argv)
