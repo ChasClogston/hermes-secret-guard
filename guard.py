@@ -12,6 +12,12 @@ Layer 2  value redaction        register every guarded value with Hermes's own m
                                 percent-encoded forms of each guarded value.
 Layer 3  pre_llm_call           a key pasted into chat never reaches a model.
 
+Since 1.3, layers 2 and 3 also recognise keys by shape (detectors.py): vendor-prefixed API keys,
+private key blocks, JWTs, checksum-verified seed phrases and values assigned to key-like names.
+Layer 2 redacts them from tool results, terminal output and replies; layer 3 stops the turn and
+holds the message in memory for HOLD_SECONDS, so the user can release it with the flagged values
+replaced ("proceed CODE") or, for a false alarm, unchanged ("proceed CODE as-is").
+
 Values live only in this process's memory. Nothing here logs or returns a value.
 """
 
@@ -23,13 +29,14 @@ import fnmatch
 import logging
 import os
 import re
+import secrets as _secrets
 import shlex
 import time
 import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
 
-from . import keychain, registry
+from . import detectors, keychain, registry
 
 logger = logging.getLogger(__name__)
 
@@ -1105,7 +1112,9 @@ def _transform(text: Any) -> Optional[str]:
     if not isinstance(text, str) or not text:
         return None
     try:
-        out, hits = scrub(text)
+        out, hits = scrub(text)                      # exact values first: they get their own names
+        out, shaped = detectors.redact(out)          # then keys nobody registered (1.3)
+        hits += shaped
     except Exception:
         logger.warning("secret-guard: redaction failed; withholding output", exc_info=False)
         return WITHHELD
@@ -1128,15 +1137,7 @@ def on_transform_llm_output(response_text: Any = None, **_kw) -> Optional[str]:
 
 # ---------------------------------------------------------------- layer 3: inbound paste block
 
-KEY_FORMATS = [
-    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}"), re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}"), re.compile(r"\bgithub_pat_[A-Za-z0-9_]{40,}"),
-    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{20,}"), re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),
-    re.compile(r"\bhf_[A-Za-z0-9]{30,}"), re.compile(r"\bxai-[A-Za-z0-9]{30,}"),
-    re.compile(r"\bgsk_[A-Za-z0-9]{30,}"), re.compile(r"\bpplx-[A-Za-z0-9]{30,}"),
-    re.compile(r"\b\d{8,10}:AA[A-Za-z0-9_-]{30,}"),  # Telegram bot token
-]
+KEY_FORMATS = detectors.KEY_FORMATS   # moved to detectors.py in 1.3; the 1.0 list is its first 13
 
 
 def _message_text(m: Any) -> str:
@@ -1158,23 +1159,106 @@ def find_key_in(text: str) -> Optional[str]:
     for env, v in _load_values().items():
         if v in text:
             return f"the value of {env}"
-    for rx in KEY_FORMATS:
-        if rx.search(text):
-            return "something shaped like an API key or token"
+    label = detectors.first_label(text)
+    if label:
+        return f"something that looks like {'an' if label[0] in 'AEIOU' else 'a'} {label}"
     return None
+
+
+# ---------------------------------------------------------------- 1.3: hold and release
+
+HOLD_SECONDS = 300
+# A released message travels as pre_llm_call context. Hermes spills context over 10,000 characters
+# (hooks.output_spill.max_chars) to a file and shows the model only a preview, so anything longer
+# could not arrive intact; it is refused instead of half-delivered.
+MAX_RELEASE = 9_000
+_CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"   # no 0/O, 1/I/L
+# The whole message must be the command, so a sentence that mentions "proceed" never releases.
+_PROCEED_RE = re.compile(r"^\s*proceed\s+([A-Za-z0-9]{4})(\s+as[\s-]?is)?\s*[.!]?\s*$", re.I)
+# (session_id, sender_id) -> {"code", "text", "known", "partial", "expires"}. Memory only.
+_held: dict[tuple[str, str], dict] = {}
+
+
+def _purge(now: float) -> None:
+    for k in [k for k, h in _held.items() if h["expires"] <= now]:
+        del _held[k]
+
+
+def _hold(key: tuple[str, str], text: str, known: bool, partial: bool) -> str:
+    """Keep one stopped message per conversation and sender; a newer one replaces it."""
+    now = time.monotonic()
+    _purge(now)
+    code = "".join(_secrets.choice(_CODE_CHARS) for _ in range(4))
+    _held[key] = {"code": code, "text": text, "known": known, "partial": partial,
+                  "expires": now + HOLD_SECONDS}
+    return code
+
+
+def _has_non_text(m: Any) -> bool:
+    if isinstance(m, dict):
+        return m.get("type") not in (None, "text", "input_text")
+    if isinstance(m, (list, tuple)):
+        return any(_has_non_text(p) for p in m)
+    return False
+
+
+def _block(message: str) -> dict:
+    return {"action": "block", "message": message}
+
+
+def _release(key: tuple[str, str], code: str, as_is: bool) -> Optional[dict]:
+    """Answer a `proceed CODE` message. None means nothing is held for this conversation, so the
+    message is ordinary text and goes to the model like any other."""
+    _purge(time.monotonic())
+    h = _held.get(key)
+    if h is None:
+        return None
+    if code.upper() != h["code"]:
+        return _block("🔐 That code does not match the held message, so nothing was sent. The held "
+                      "message is still waiting; check the code and try again.")
+    if as_is and h["known"]:
+        return _block(f"🔐 The held message contains one of your stored keys, so it can only be sent "
+                      f"with that key replaced: reply `proceed {h['code']}`.")
+    if len(h["text"]) > MAX_RELEASE:
+        del _held[key]
+        return _block("🔐 The held message is too long to release this way, so it was discarded. "
+                      "Please send it again without the key.")
+    del _held[key]                                   # single use
+    if as_is:
+        body, how = h["text"], "unchanged (the user confirmed the flagged text is not a secret)"
+    else:
+        body, _ = scrub(h["text"])
+        body, _ = detectors.redact(body)
+        if find_key_in(body):                        # defensive: never release a known match
+            return _block("🔐 Secret Guard could not safely remove the flagged text, so the held "
+                          "message was discarded. Please send it again without the key.")
+        how = "with the flagged values replaced"
+    note = " Only its text was held; any attachment must be sent again." if h["partial"] else ""
+    return {"context": f"[Secret Guard: the user approved sending their held message {how}. "
+                       f"It follows, and is the user's actual request.{note}]\n\n{body}"}
 
 
 # Only surfaces that are on this machine by construction. "api" and "dashboard" can be remote.
 LOCAL_PLATFORMS = frozenset({"cli", "local", "tui", "desktop"})
 
 
-def on_pre_llm_call(user_message: Any = None, platform: str = "", **_kw) -> Optional[dict]:
+def on_pre_llm_call(user_message: Any = None, platform: str = "", session_id: Any = "",
+                    sender_id: Any = "", **_kw) -> Optional[dict]:
     try:
         register_values()
     except Exception:
         logger.warning("secret-guard: could not register values for redaction", exc_info=False)
+    key = (str(session_id or ""), str(sender_id or ""))
     try:
-        found = find_key_in(_message_text(user_message))
+        text = _message_text(user_message)
+        # pre_llm_call fires only for a message the user sent, never for tool output, a web page or
+        # an email, so a release command can only come from the user.
+        m = _PROCEED_RE.match(text) if len(text) < 64 else None
+        if m:
+            released = _release(key, m.group(1), bool(m.group(2)))
+            if released is not None:
+                return released
+        found = find_key_in(text)
     except Exception:
         # Fail closed: an uninspected message may hold a key. Never echo the message or the error.
         logger.warning("secret-guard: inbound check failed; turn blocked", exc_info=False)
@@ -1183,18 +1267,33 @@ def on_pre_llm_call(user_message: Any = None, platform: str = "", **_kw) -> Opti
                                               "`hermes secret doctor`."}
     if not found:
         return None
+    known = found.startswith("the value of ")
     plat = (platform or "").lower()
+    real = "" if known else "If it is a real key, it "
     if plat in LOCAL_PLATFORMS:
         where = "It was typed on this machine."
     elif plat:
-        where = (f"It has already passed through {platform.title()}, though, so treat the key as "
-                 "exposed and rotate it at the provider.")
+        where = (f"{real or 'It '}has already passed through {platform.title()}, though, so treat the key "
+                 "as exposed and rotate it at the provider.")
     else:
-        where = "If it came through a chat app or a remote connection, treat the key as exposed and rotate it."
+        where = ("If it came through a chat app or a remote connection, treat the key as exposed and "
+                 "rotate it.")
+    try:
+        code = _hold(key, text, known, _has_non_text(user_message))
+    except Exception:
+        code = None
+    if code is None:
+        options = "Please send it again without the key."
+    elif known:
+        options = (f"It is held in memory for {HOLD_SECONDS // 60} minutes. Reply `proceed {code}` to send "
+                   "it with your stored key replaced.")
+    else:
+        options = (f"It is held in memory for {HOLD_SECONDS // 60} minutes. Reply `proceed {code}` to send "
+                   f"it with the flagged text replaced, or `proceed {code} as-is` if this is a false alarm.")
     return {"action": "block", "message": (
         f"🔐 Secret Guard stopped that message: it contains {found}. No model saw it, and it is not "
-        f"stored in this session. {where} To store a key safely, ask me to add it — a hidden dialog "
-        "will take the value instead of chat.")}
+        f"stored in this session. {where} {options} To store a key safely, ask me to add it — a "
+        "hidden dialog will take the value instead of chat.")}
 
 
 def on_session_start(**_kw) -> None:
