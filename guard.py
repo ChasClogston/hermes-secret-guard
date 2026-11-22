@@ -1159,7 +1159,7 @@ def find_key_in(text: str) -> Optional[str]:
     for env, v in _load_values().items():
         if v in text:
             return f"the value of {env}"
-    label = detectors.first_label(text)
+    label = detectors.first_label(text, inbound=True)
     if label:
         return f"something that looks like {'an' if label[0] in 'AEIOU' else 'a'} {label}"
     return None
@@ -1228,7 +1228,7 @@ def _release(key: tuple[str, str], code: str, as_is: bool) -> Optional[dict]:
         body, how = h["text"], "unchanged (the user confirmed the flagged text is not a secret)"
     else:
         body, _ = scrub(h["text"])
-        body, _ = detectors.redact(body)
+        body, _ = detectors.redact(body, inbound=True)   # the same rules that stopped it
         if find_key_in(body):                        # defensive: never release a known match
             return _block("🔐 Secret Guard could not safely remove the flagged text, so the held "
                           "message was discarded. Please send it again without the key.")

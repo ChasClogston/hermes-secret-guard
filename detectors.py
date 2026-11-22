@@ -117,11 +117,28 @@ def _plausible_value(v: str) -> bool:
     return bool(re.search(r"[A-Za-z]", v) and re.search(r"[0-9]", v))
 
 
+# Inside a web address, a bare "token" (or redir_token, jwt) is usually a signed-link or download
+# token the agent needs to open that link: Firebase "?alt=media&token=", CDN "?jwt=". Names that
+# say what the token grants (access_token, api_key, secret, ...) still count in a web address.
+_URL_PARAM_OK = re.compile(r"^(?:token|jwt|sig|signature|[a-z]{1,12}_token)$")
+_URL_PARAM_KEEP = ("access", "auth", "refresh", "id_", "session", "bearer", "api", "private",
+                   "client", "secret", "oauth")
+
+
+def _url_param_name(text: str, start: int, name: str) -> bool:
+    """True if `name` begins right after ? or & (a query parameter) and is a generic token name."""
+    if start == 0 or text[start - 1] not in "?&":
+        return False
+    return bool(_URL_PARAM_OK.match(name)) and not any(k in name for k in _URL_PARAM_KEEP)
+
+
 def _assigned(text: str) -> list[Hit]:
     hits = []
     for m in _ASSIGN_RE.finditer(text):
         name = m.group(1).lower()
         if any(w in name for w in _NOT_SECRET_NAMES):
+            continue
+        if _url_param_name(text, m.start(1), name):
             continue
         if _plausible_value(m.group(2)):
             end = m.start(2) + len(m.group(2).rstrip(".,;"))
@@ -205,17 +222,35 @@ def _seed_phrases(text: str) -> list[Hit]:
     flush()
     return hits
 
+# ---------------------------------------------------------------- look-alikes left alone
+
+# A documentation example such as "sk-" followed by twenty x's has the vendor prefix but almost no
+# variety. Real keys of every listed format have far more than 8 different characters.
+def _placeholder_key(v: str) -> bool:
+    return len(set(v)) < 8 or bool(re.search(r"(?i)x{4,}|your|example|placeholder|changeme|dummy", v))
+
+
+# A JWT that is a signed-link parameter (?jwt=, &token=) opens that link; it is left alone so the
+# agent can still follow it. A JWT after access_token=, id_token= or a header still counts.
+_URL_JWT_LEAD = re.compile(r"[?&](?:jwt|token)=$")
+
 # ---------------------------------------------------------------- public interface
 
-def detect(text: str) -> list[Hit]:
-    """Every pattern match in `text`, sorted, with overlaps merged (the earlier, longer label wins)."""
+def detect(text: str, inbound: bool = False) -> list[Hit]:
+    """Every pattern match in `text`, sorted, with overlaps merged (the earlier, longer label wins).
+
+    inbound=True is the chat check: a vendor-format string is matched even when it looks like a
+    placeholder, exactly as in 1.0, because a stopped message can be released with `as-is`. For
+    output (inbound=False) placeholders are left alone, so documentation examples stay readable."""
     if not text:
         return []
     found: list[Hit] = []
     for rx in KEY_FORMATS:
-        found += [Hit(m.start(), m.end(), "API key") for m in rx.finditer(text)]
+        found += [Hit(m.start(), m.end(), "API key") for m in rx.finditer(text)
+                  if inbound or not _placeholder_key(m.group(0))]
     found += [Hit(m.start(), m.end(), "private key block") for m in _PEM_RE.finditer(text)]
-    found += [Hit(m.start(), m.end(), "JWT") for m in _JWT_RE.finditer(text) if _is_jwt(m.group(0))]
+    found += [Hit(m.start(), m.end(), "JWT") for m in _JWT_RE.finditer(text)
+              if _is_jwt(m.group(0)) and not _URL_JWT_LEAD.search(text, max(0, m.start() - 7), m.start())]
     found += _assigned(text)
     found += _seed_phrases(text)
     found.sort(key=lambda h: (h.start, -(h.end - h.start)))
@@ -230,14 +265,14 @@ def detect(text: str) -> list[Hit]:
     return merged
 
 
-def first_label(text: str) -> Optional[str]:
-    hits = detect(text)
+def first_label(text: str, inbound: bool = False) -> Optional[str]:
+    hits = detect(text, inbound)
     return hits[0].label if hits else None
 
 
-def redact(text: str) -> tuple[str, int]:
+def redact(text: str, inbound: bool = False) -> tuple[str, int]:
     """Replace each match with a label naming its kind. Returns (text, number of matches)."""
-    hits = detect(text)
+    hits = detect(text, inbound)
     if not hits:
         return text, 0
     out, pos = [], 0

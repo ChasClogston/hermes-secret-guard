@@ -180,6 +180,39 @@ class Detection(unittest.TestCase):
             with self.subTest(text[:30]):
                 self.assertClean(text)
 
+    def test_placeholder_keys_left_in_output_but_stop_chat(self):
+        # Seen in real history: a doc example "sk-" plus a run of one letter, in a bundled skill.
+        for ph in ("sk-" + "x" * 20, "sk-" + "abcd" * 6, "gh" + "p_" + "A" * 36,
+                   "sk-" + "proj-your-key-goes-here-" + "1" * 8):
+            with self.subTest(ph):
+                self.assertClean(f'headers:\n  Authorization: "{ph}"')
+                self.assertTrue(detectors.detect(ph, inbound=True))     # chat still stops it
+
+    def test_signed_link_tokens_left_alone(self):
+        jwt = b64u({"alg": "HS256", "typ": "JWT"}) + "." + b64u({"sub": rnd(12)}) + "." + rnd(43, ALNUM + "_-")
+        v = rnd(36, ALNUM + "-")
+        for text in (f"https://cdn.example.net/a/{rnd(20)}.png?jwt={jwt}",
+                     f"https://cdn.example.net/a.gif?w=3&jwt={jwt}",
+                     f"https://firebasestorage.googleapis.com/v0/b/x/o/6_feet.webp?alt=media&token={v}",
+                     f"https://www.youtube.com/redirect?event=x&redir_token={v}&q=y",
+                     f"https://example.com/dl?file=1&sig={v}"):
+            with self.subTest(text[:40]):
+                self.assertClean(text)
+
+    def test_url_parameters_that_still_count(self):
+        v = rnd(36)
+        jwt = b64u({"alg": "RS256"}) + "." + b64u({"sub": rnd(12)}) + "." + rnd(43, ALNUM + "_-")
+        for text, secret in ((f"https://api.example.com/v1?api_key={v}", v),
+                             (f"https://x.example.com/cb#x&access_token={v}", v),
+                             (f"https://x.example.com/cb?client_secret={v}", v),
+                             (f"https://x.example.com/cb?id_token={jwt}", jwt),
+                             (f"curl -H 'Authorization: Bearer {jwt}' https://x", jwt),
+                             (f"token={v}", v)):                   # not in a web address
+            with self.subTest(text[:40]):
+                out, n = detectors.redact(text)
+                self.assertGreaterEqual(n, 1)
+                self.assertNotIn(secret, out)
+
     def test_wordlist_integrity_is_checked(self):
         self.assertEqual(len(detectors._wordlist()), 2048)
         self.assertEqual(hashlib.sha256(Path(detectors._WORDLIST_PATH).read_bytes()).hexdigest(),
@@ -302,6 +335,13 @@ class HoldAndRelease(unittest.TestCase):
         _, code = self.stop([{"type": "text", "text": "see " + keys()["groq"]},
                              {"type": "image_url", "image_url": {"url": "data:..."}}])
         self.assertIn("attachment", self.send(f"proceed {code}")["context"])
+
+    def test_placeholder_paste_releases_redacted(self):
+        ph = "sk-" + "x" * 24
+        _, code = self.stop(f"is {ph} the right shape?")
+        r = self.send(f"proceed {code}")
+        self.assertIn("context", r)
+        self.assertNotIn(ph, r["context"])
 
     def test_too_long_to_release(self):
         _, code = self.stop("x " + keys()["groq"] + " " + "word " * 2000)
