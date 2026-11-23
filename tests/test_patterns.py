@@ -96,6 +96,13 @@ class Detection(unittest.TestCase):
             with self.subTest(name):
                 self.assertCaught(k, "here it is {} thanks")
 
+    def test_google_key_ending_in_dash_or_underscore(self):     # found by CI, 1 run in ~30
+        for last in "-_":
+            k = "AI" + "za" + rnd(34, ALNUM) + last
+            with self.subTest(last):
+                self.assertCaught(k, "key {} here")
+                self.assertCaught(k, "key={}")
+
     def test_original_formats_still_present(self):
         self.assertGreaterEqual(len(detectors.KEY_FORMATS), 13)
         self.assertIs(guard.KEY_FORMATS, detectors.KEY_FORMATS)

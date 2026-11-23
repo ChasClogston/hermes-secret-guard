@@ -40,13 +40,14 @@ class Hit(NamedTuple):
 
 # ---------------------------------------------------------------- prefixed API keys
 
-# The first 13 are the 1.0 paste-block formats, unchanged, so nothing that was caught stops being
-# caught. The rest are added in 1.3.
+# The first 13 are the 1.0 paste-block formats, so nothing that was caught stops being caught.
+# One fix: the Google key's closing \b missed keys ending in '-' (a key character but not a word
+# character); it is now a lookahead on the key alphabet. The rest are added in 1.3.
 KEY_FORMATS = [
     re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}"), re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}"), re.compile(r"\bgithub_pat_[A-Za-z0-9_]{40,}"),
     re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{20,}"), re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"), re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),
     re.compile(r"\bhf_[A-Za-z0-9]{30,}"), re.compile(r"\bxai-[A-Za-z0-9]{30,}"),
     re.compile(r"\bgsk_[A-Za-z0-9]{30,}"), re.compile(r"\bpplx-[A-Za-z0-9]{30,}"),
     re.compile(r"\b\d{8,10}:AA[A-Za-z0-9_-]{30,}"),  # Telegram bot token
