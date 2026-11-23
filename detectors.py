@@ -11,9 +11,9 @@ What counts as a match, and why each rule is narrow:
   * seed phrases         12-24 BIP39 words that pass the BIP39 checksum (1 in 16 random runs
                          of 12 words pass, 1 in 256 of 24; prose almost never forms such a run)
   * assigned secrets     a value of 20+ characters written right after a key-like name
+                         (api_key=, "client_secret": , Authorization: Bearer ...)
   * signed links         inside a web address, the value of an access-granting query field
                          (sig, Signature, X-Amz-Signature, token, key, ...), URL-encoded or not
-                         (api_key=, "client_secret": , Authorization: Bearer ...)
 
 Bare long hex or base64 with no prefix and no key-like name is NOT matched: git commit IDs,
 checksums, UUIDs and content hashes look the same and are everywhere in tool output.
