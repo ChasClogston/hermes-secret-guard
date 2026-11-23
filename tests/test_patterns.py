@@ -547,6 +547,136 @@ class ReviewRegressions(unittest.TestCase):
         self.assertIn("not approval of anything it asks for", self.call(f"proceed {code}")["context"])
 
 
+class RecheckRegressions(unittest.TestCase):
+    """Astra's recheck of 64d4af3: F1 (bounded expiry workers), F2 (assigned placeholders),
+    F3 (signed-link coverage), and the R1 automated-turn hardening."""
+
+    HIGH = "Ab3Cd4Ef5Gh6Jk7Lm8Np9Qr0St1Uv2Wx3"
+
+    def setUp(self):
+        guard._held.clear()
+
+    def tearDown(self):
+        guard._held.clear()
+        guard._purge()
+
+    def sweepers(self):
+        import threading as _th
+        return [t for t in _th.enumerate() if t.name == "secret-guard-hold-sweeper" and t.is_alive()]
+
+    def call(self, text, **kw):
+        a = {"session_id": "s1", "sender_id": "u1", "platform": "telegram", **kw}
+        return guard.on_pre_llm_call(user_message=text, **a) or {}
+
+    # F1 ------------------------------------------------------------------------------------------
+    def test_f1_replacing_one_hold_64_times_uses_one_worker(self):
+        for _ in range(64):
+            self.call("x " + keys()["groq"])
+        self.assertEqual(len(guard._held), 1)
+        self.assertLessEqual(len(self.sweepers()), 1)
+
+    def test_f1_many_conversations_releases_and_closes_stay_bounded(self):
+        for i in range(40):
+            self.call("x " + keys()["groq"], session_id=f"s{i}")
+        self.assertEqual(len(guard._held), guard.MAX_HELD)
+        for k in list(guard._held):
+            guard.on_session_closed(session_id=k[2])
+        self.assertEqual(guard._held, {})
+        self.assertLessEqual(len(self.sweepers()), 1)
+
+    def test_f1_worker_exits_when_nothing_is_held(self):
+        import time as _t
+        self.call("x " + keys()["groq"])
+        guard.on_session_closed(session_id="s1")
+        deadline = _t.monotonic() + 2
+        while self.sweepers() and _t.monotonic() < deadline:
+            _t.sleep(0.05)
+        self.assertEqual(self.sweepers(), [])
+
+    def test_f1_old_expiry_never_removes_a_newer_hold(self):
+        import time as _t
+        old = guard.HOLD_SECONDS
+        try:
+            guard.HOLD_SECONDS = 0.3
+            self.call("x " + keys()["groq"])
+            guard.HOLD_SECONDS = 30
+            self.call("y " + keys()["xai"])            # same person and conversation: replaces
+            _t.sleep(0.7)
+            self.assertEqual(len(guard._held), 1)
+            self.assertTrue(next(iter(guard._held.values()))["text"].startswith("y "))
+        finally:
+            guard.HOLD_SECONDS = old
+
+    def test_f1_idle_expiry_still_works(self):
+        import time as _t
+        old = guard.HOLD_SECONDS
+        guard.HOLD_SECONDS = 0.3
+        try:
+            self.call("x " + keys()["groq"])
+            _t.sleep(0.8)
+            self.assertEqual(guard._held, {})
+        finally:
+            guard.HOLD_SECONDS = old
+
+    # F2 ------------------------------------------------------------------------------------------
+    def test_f2_values_starting_with_a_placeholder_word_are_still_secrets(self):
+        for pre in ("your", "dummy", "example", "changeme", "placeholder", "my", "redacted"):
+            v = pre + self.HIGH
+            with self.subTest(pre):
+                out, n = detectors.redact(f"api_key={v}")
+                self.assertEqual(n, 1)
+                self.assertNotIn(v, out)
+                self.assertTrue(detectors.detect(f"api_key={v}", inbound=True))
+
+    def test_f2_documented_examples_left_in_output_but_stop_chat(self):
+        # Every example here has letters and digits: a value with letters only is not matched in
+        # either direction (README, honest limits), so it cannot show the inbound difference.
+        for text in ("api_key = your-api-key-goes-here-1234", "client_secret: changeme_secret_value_2026",
+                     "password=" + "x" * 20 + "1234", "secret_key = example-secret-key-for-docs-01"):
+            with self.subTest(text):
+                self.assertEqual(detectors.detect(text), [])
+                self.assertTrue(detectors.detect(text, inbound=True))
+
+    def test_f2_masked_preview_is_not_a_value_anywhere(self):
+        text = "OPENAI_API_KEY=sk-proj-Ab3...Wx3z"
+        self.assertEqual(detectors.detect(text), [])
+        self.assertEqual(detectors.detect(text, inbound=True), [])
+
+    # F3 ------------------------------------------------------------------------------------------
+    def test_f3_signature_fields_in_links_are_redacted(self):
+        v = rnd(40, ALNUM + "-_")
+        hx = hexs(64)
+        enc = "Ab3Cd4%2BEf5Gh6%2FJk7Lm8Np9%3D%3D"
+        for text, secret in ((f"https://example.invalid/file?sig={v}", v),
+                             (f"https://example.invalid/file?Signature={v}&Expires=1", v),
+                             (f"https://bucket.s3.example.invalid/k?X-Amz-Signature={hx}", hx),
+                             (f"https://storage.example.invalid/o?X-Goog-Signature={hx}&x=1", hx),
+                             (f"https://example.invalid/f?a=1&sig={enc}", enc),
+                             (f"https://example.invalid/f?X-Amz-Security-Token={enc}{v}", enc + v),
+                             (f"https://maps.example.invalid/api?key={v}", v)):
+            with self.subTest(text[:48]):
+                out, n = detectors.redact(text)
+                self.assertGreaterEqual(n, 1)
+                self.assertNotIn(secret, out)
+                self.assertTrue(detectors.detect(text, inbound=True))
+
+    def test_f3_ordinary_links_and_bare_signatures_unchanged(self):
+        for text in ("https://example.invalid/search?q=weather+little+rock&page=2&id=12345",
+                     "https://example.invalid/a?ref=homepage_banner_2026&utm_source=newsletter",
+                     "https://example.invalid/docs/signature-verification?lang=en",
+                     "the signature=" + hexs(64) + " in this log line is a checksum"):
+            with self.subTest(text[:40]):
+                self.assertEqual(detectors.detect(text), [])
+
+    # R1 hardening ------------------------------------------------------------------------------------
+    def test_r1_automated_turn_with_a_sender_is_never_held(self):
+        for plat in ("cron", ""):
+            with self.subTest(plat):
+                r = self.call("x " + keys()["groq"], platform=plat, sender_id="scheduler")
+                self.assertNotIn("proceed", r["message"])
+        self.assertEqual(guard._held, {})
+
+
 class HermesBoundary(unittest.TestCase):
     """The real Hermes collector, with a stub agent, passes our ids through and applies our result.
     Skipped where Hermes is not importable (CI); run locally against the installed hermes-agent."""

@@ -1184,6 +1184,10 @@ _PROCEED_RE = re.compile(r"^\s*proceed\s+([A-Za-z0-9]{4})(\s+as[\s-]?is)?\s*[.!]
 # Memory only. Python cannot guarantee erasure of a string; entries are dropped, not wiped.
 _held: dict[tuple, dict] = {}
 _held_lock = threading.Lock()
+_held_cv = threading.Condition(_held_lock)
+# One sweeper thread at most, started when something is held and gone when nothing is: idle
+# expiry without a thread per message (review F1).
+_sweeper: Optional[threading.Thread] = None
 
 
 def _spill_limit() -> int:
@@ -1205,8 +1209,8 @@ def _hold_key(session_id: Any, sender_id: Any, platform: Any) -> Optional[tuple]
     sid = session_id.strip() if isinstance(session_id, str) else ""
     snd = sender_id.strip() if isinstance(sender_id, str) else ""
     plat = platform.strip().lower() if isinstance(platform, str) else ""
-    if not sid:
-        return None
+    if not sid or plat in ("", "cron"):
+        return None          # automated turns never hold, whatever sender they carry
     if not snd:
         if plat not in LOCAL_PLATFORMS:
             return None
@@ -1214,40 +1218,62 @@ def _hold_key(session_id: Any, sender_id: Any, platform: Any) -> Optional[tuple]
     return (_scope(), plat, sid, snd)
 
 
+def _purge_locked(now: float) -> None:
+    for k in [k for k, h in _held.items() if h["expires"] <= now]:
+        del _held[k]
+
+
 def _purge() -> None:
-    now = time.monotonic()
-    with _held_lock:
-        for k in [k for k, h in _held.items() if h["expires"] <= now]:
-            del _held[k]
+    with _held_cv:
+        _purge_locked(time.monotonic())
+        _held_cv.notify_all()
 
 
-def _expire(key: tuple, code: str) -> None:
-    with _held_lock:
-        if _held.get(key, {}).get("code") == code:
-            del _held[key]
+def _sweep() -> None:
+    """Drop expired holds while the process is otherwise idle; exit when nothing is held."""
+    global _sweeper
+    with _held_cv:
+        try:
+            while True:
+                now = time.monotonic()
+                _purge_locked(now)
+                if not _held:
+                    return
+                _held_cv.wait(timeout=max(0.05, min(h["expires"] for h in _held.values()) - now))
+        finally:
+            if _sweeper is threading.current_thread():
+                _sweeper = None
+
+
+def _ensure_sweeper_locked() -> None:
+    global _sweeper
+    if _sweeper is None or not _sweeper.is_alive():
+        _sweeper = threading.Thread(target=_sweep, name="secret-guard-hold-sweeper", daemon=True)
+        _sweeper.start()
+    else:
+        _held_cv.notify_all()              # recompute the next expiry
 
 
 def _take(key: tuple, code: str) -> bool:
     """Remove the hold if it is still the one with this code. True if this call removed it."""
-    with _held_lock:
+    with _held_cv:
         if _held.get(key, {}).get("code") == code:
             del _held[key]
+            _held_cv.notify_all()
             return True
     return False
 
 
 def _hold(key: tuple, text: str, known: bool, partial: bool) -> str:
-    """Keep one stopped message per person and conversation; a newer one replaces it. Expired by a
-    timer, so an idle process does not keep it; also purged on every turn."""
+    """Keep one stopped message per person and conversation; a newer one replaces it. Expired by
+    the single sweeper thread, so an idle process does not keep it; also purged on every turn."""
     code = "".join(_secrets.choice(_CODE_CHARS) for _ in range(4))
-    with _held_lock:
+    with _held_cv:
         _held[key] = {"code": code, "text": text, "known": known, "partial": partial,
                       "expires": time.monotonic() + HOLD_SECONDS}
         while len(_held) > MAX_HELD:
             del _held[min(_held, key=lambda k: _held[k]["expires"])]
-    timer = threading.Timer(HOLD_SECONDS, _expire, (key, code))
-    timer.daemon = True
-    timer.start()
+        _ensure_sweeper_locked()
     return code
 
 
@@ -1255,9 +1281,10 @@ def on_session_closed(session_id: Any = "", **_kw) -> None:
     """on_session_finalize / on_session_reset / on_session_delete: drop that conversation's hold."""
     if not isinstance(session_id, str) or not session_id:
         return
-    with _held_lock:
+    with _held_cv:
         for k in [k for k in _held if k[2] == session_id.strip()]:
             del _held[k]
+        _held_cv.notify_all()
 
 
 def _has_non_text(m: Any) -> bool:

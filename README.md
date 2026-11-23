@@ -407,18 +407,26 @@ of overwriting. `hermes secret doctor` lists any variable your old source still 
 25 vendor key formats; `-----BEGIN … PRIVATE KEY-----` blocks through the END line (or the end of
 a truncated output); JWTs whose header decodes to JSON with `alg`; 12 to 24 BIP39 words that pass
 the BIP39 checksum (the bundled English list is verified against its published SHA-256 on load);
-and a value of 20+ characters written right after a key-like name (`api_key`, `client_secret`,
-`admin_password`, `access_token`, `Authorization: Bearer`, …). Two narrow exclusions: pagination
-names (`next_page_token`, `pageToken`, `continuation_token`), matched as whole name parts, and, in
-tool output only, documentation examples (fewer than 8 different characters, or written words
-such as `sk-proj-your-key-goes-here`). The chat check stops examples too, as 1.0 did. Bare hex or
-base64 with no prefix and no key-like name is never matched: commit IDs, checksums and UUIDs look
+a value of 20+ characters, with letters and digits (or 32+ hex), written right after a key-like
+name (`api_key`, `client_secret`, `admin_password`, `access_token`, `Authorization: Bearer`, …);
+and, inside a web address only, the value of an access-granting query field: `sig`, `Signature`,
+`X-Amz-Signature`, `X-Goog-Signature`, `X-Amz-Security-Token`, `token`, `jwt`, `access_token`,
+`id_token`, `api_key`, `key`, `auth`, `sas`, URL-encoded or not.
+
+Exclusions, each narrow: pagination names (`next_page_token`, `pageToken`, `continuation_token`),
+matched as whole name parts; already-masked previews containing `...`; and, in tool output only,
+documentation examples: whole values written as placeholder words (`your-api-key-goes-here-1234`,
+`changeme`), runs of x or *, all zeros, very low variety, or vendor-format strings such as
+`sk-proj-your-key-goes-here`. The chat check does not apply the documentation-example exclusions.
+A value that merely begins with a placeholder word is not an example. Bare hex or base64 with no
+prefix, no key-like name and no link field is never matched: commit IDs, checksums and UUIDs look
 the same. Matches are replaced with `[secret:possible <kind> redacted]`.
 
 **Hold and release (1.3).** When layer 3 stops a message, Secret Guard can hold its text for
 release. A hold belongs to one profile, platform, conversation and sender. When Hermes does not
 say who sent the message, nothing is held, except on Desktop and the terminal, where the only
-possible sender is the person at the Mac; cron turns have no sender and are never held. Nothing is
+possible sender is the person at the Mac. Turns on platform `cron` or with no platform are
+never held, whatever sender they carry. Nothing is
 held when the message is too long to deliver intact (see below).
 
 `proceed CODE`, as the whole message and from the same person in the same conversation, sends the
@@ -466,8 +474,8 @@ What Secret Guard does on your machine, so you can decide before installing:
   messages (see *The three layers*). Both fail closed: if a check errors, the call or turn is refused.
 - **Unattended runs.** The dialog gives up after 5 minutes and the tool returns a plain error, so
   cron and gateway runs never hang on it. The secret source never prompts.
-- **No background processes.** Since 1.3, each held message has one short-lived timer thread inside
-  Hermes's own process, which drops the message after five minutes.
+- **No background processes.** Since 1.3, while any message is held, one sweeper thread inside
+  Hermes's own process drops held messages when their five minutes end; it exits when none are held.
 
 ## Honest limits
 
@@ -477,12 +485,14 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   without a key-like name beside it, is not matched. It also redacts things that only look like
   keys: a JWT in debugging output, a long value after `token:`, a run of BIP39 words that happens
   to pass the checksum (1 in 16 random runs of 12 words do, so a word list itself is partly
-  redacted). Signed-link tokens (`?jwt=`, `&token=` on image and download links) are treated as
-  credentials and redacted, so the agent cannot open those links. A false alarm in chat is
+  redacted). Signed links are treated as credentials: the access-granting fields listed above are
+  redacted inside web addresses, so the agent cannot open those links. Other providers' signature
+  field names are not covered. A value with letters only (a passphrase) is not matched in either
+  direction. A false alarm in chat is
   released with `proceed CODE as-is`; one in tool output stays redacted for that call.
 - **Held messages, and what is and is not stored.** Only Secret Guard's own copy of a held message
-  is in memory: it is dropped when the five minutes run out (by a timer, even if nothing else
-  happens), when the conversation is closed or reset, when a newer stop replaces it, or past 16
+  is in memory: it is dropped when the five minutes run out (by one sweeper thread, even if
+  nothing else happens), when the conversation is closed or reset, when a newer stop replaces it, or past 16
   held messages in all; a restart drops it too. Python cannot guarantee that a dropped string is
   erased from memory. Hermes itself writes the incoming message before plugins see it and then
   replaces it with a placeholder, so traces can remain in its database files until they are
@@ -629,7 +639,9 @@ not match, documentation examples, signed links, a false-alarm corpus, output re
 injection, and every release path. It holds a regression for each finding of the independent
 review of PR #8: identity (group chat, missing sender or session, other platform or profile),
 `as-is` against keys added after the stop and against encoded stored keys, the rendered release
-size and a lower configured limit, idle expiry, the global cap and conversation close. It runs in
+size and a lower configured limit, idle expiry, the global cap and conversation close; and from
+the recheck, a bounded sweeper (one thread for any number of holds), assigned values that begin
+with a placeholder word, signature fields in links, and automated turns that carry a sender. It runs in
 CI without Hermes; where Hermes is importable it also drives Hermes's real `pre_llm_call`
 collector with a stub agent, to show the ids reach the hook and the block and context results are
 applied.

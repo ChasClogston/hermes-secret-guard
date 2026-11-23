@@ -11,6 +11,8 @@ What counts as a match, and why each rule is narrow:
   * seed phrases         12-24 BIP39 words that pass the BIP39 checksum (1 in 16 random runs
                          of 12 words pass, 1 in 256 of 24; prose almost never forms such a run)
   * assigned secrets     a value of 20+ characters written right after a key-like name
+  * signed links         inside a web address, the value of an access-granting query field
+                         (sig, Signature, X-Amz-Signature, token, key, ...), URL-encoded or not
                          (api_key=, "client_secret": , Authorization: Bearer ...)
 
 Bare long hex or base64 with no prefix and no key-like name is NOT matched: git commit IDs,
@@ -104,36 +106,62 @@ _BEARER_RE = re.compile(r"(?i)\bbearer\s+([A-Za-z0-9_\-+/=.~]{20,})")
 # max_tokens, token_type) never reach this check: a name must END with a secret word.
 _NOT_SECRET_NAME_RE = re.compile(
     r"(?:^|[_.\-])(?:next[_.\-]?page|page|next|prev|previous|continuation|cursor|sync|resume)[_.\-]?token$")
-# Whole-value placeholder shapes only (R4): a leading placeholder word, a long run of x or *, an
-# ellipsis (Hermes's own masked previews look like "sk-abc...wxyz"), or angle brackets.
-_PLACEHOLDER_RE = re.compile(r"(?i)^(?:your|example|placeholder|changeme|dummy|redacted)|x{6,}|\*{4,}|"
-                             r"\.{3}|<|>|^0+$")
+# Documentation examples, as WHOLE values only, and only in output (review F2): written words
+# starting with a placeholder word ("your-api-key-here", "changeme"), a run of x or *, all zeros,
+# or very low variety. A real-looking value that merely begins with "your" is not an example.
+_PLACEHOLDER_VALUE_RE = re.compile(
+    r"(?:(?:your|my|example|placeholder|changeme|dummy|redacted|insert|replace)(?:[-_](?:[a-z]+|[0-9]+))*"
+    r"|[xX]{6,}|\*{6,}|0+)")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 
-def _plausible_value(v: str) -> bool:
+def _plausible_value(v: str, inbound: bool = False) -> bool:
     v = v.rstrip(".,;")
     if len(v) < 20 or v[0] in "/~." or "/" in v[:2]:
         return False                          # a path, not a value
-    if _PLACEHOLDER_RE.search(v) or len(set(v)) < 6 or _placeholder_key(v):
-        return False
+    if "..." in v:
+        return False                          # an already-masked preview ("sk-abc...wxyz"), in or out
+    if not inbound and (_PLACEHOLDER_VALUE_RE.fullmatch(v) or len(set(v)) < 6 or _placeholder_key(v)):
+        return False                          # documentation example, output only
     if _HEX_RE.match(v):
         return len(v) >= 32                   # hex is fine next to a key name, but only if long
     return bool(re.search(r"[A-Za-z]", v) and re.search(r"[0-9]", v))
 
 
-def _assigned(text: str) -> list[Hit]:
+def _assigned(text: str, inbound: bool = False) -> list[Hit]:
     hits = []
     for m in _ASSIGN_RE.finditer(text):
         name = m.group(1).lower()
         if _NOT_SECRET_NAME_RE.search(name):
             continue
-        if _plausible_value(m.group(2)):
+        if _plausible_value(m.group(2), inbound):
             end = m.start(2) + len(m.group(2).rstrip(".,;"))
             hits.append(Hit(m.start(2), end, "secret assigned to a key name"))
     for m in _BEARER_RE.finditer(text):
-        if _plausible_value(m.group(1)):
+        if _plausible_value(m.group(1), inbound):
             hits.append(Hit(m.start(1), m.start(1) + len(m.group(1).rstrip(".,;")), "bearer token"))
+    hits += _signed_links(text)
+    return hits
+
+
+# Signed links (policy, 2026-11-22: treated as credentials). Inside a web address only, the value
+# of a query field that grants access: signatures (sig, Signature, X-Amz-Signature,
+# X-Goog-Signature), security tokens and generic token/jwt/key fields, URL-encoded or not.
+_URL_RE = re.compile(r"https?://[^\s\"'<>`]+", re.I)
+_URL_GRANT_RE = re.compile(
+    r"[?&;]((?:x-(?:amz|goog)-)?(?:signature|sig|security-token|credential-signature)|"
+    r"token|jwt|access_token|id_token|api_key|apikey|key|auth|sas)=((?:[A-Za-z0-9_\-+/=.~]|%[0-9A-Fa-f]{2}){16,})",
+    re.I)
+
+
+def _signed_links(text: str) -> list[Hit]:
+    hits = []
+    for u in _URL_RE.finditer(text):
+        for m in _URL_GRANT_RE.finditer(u.group(0)):
+            v = m.group(2)
+            if len(set(v)) >= 6:
+                start = u.start() + m.start(2)
+                hits.append(Hit(start, start + len(v), "signed-link credential"))
     return hits
 
 # ---------------------------------------------------------------- BIP39 seed phrases
@@ -245,7 +273,7 @@ def detect(text: str, inbound: bool = False) -> list[Hit]:
                   if inbound or not _placeholder_key(m.group(0))]
     found += [Hit(m.start(), m.end(), "private key block") for m in _PEM_RE.finditer(text)]
     found += [Hit(m.start(), m.end(), "JWT") for m in _JWT_RE.finditer(text) if _is_jwt(m.group(0))]
-    found += _assigned(text)
+    found += _assigned(text, inbound)
     found += _seed_phrases(text)
     found.sort(key=lambda h: (h.start, -(h.end - h.start)))
     merged: list[Hit] = []
