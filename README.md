@@ -332,6 +332,65 @@ The script must never be imported into a running Hermes: closing a file descript
 process that also holds a SQLite connection to the same file can cancel that connection's
 locks.
 
+### One-off comparison with Keychain items you name
+
+```bash
+python3 artifact_compare.py --home ~/.hermes --keychain-service NAME [--keychain-service NAME ...]
+```
+
+**This tool handles live credentials.** macOS only. For each Keychain item you name (at most
+8) it runs the system program `/usr/bin/security` once and holds what that returns in memory
+until the comparison ends. It answers one question: do those bytes occur in `state.db` or
+`state.db-wal` of the home? (Contract `artifact-compare-v2`.)
+
+It prints the item names you typed, and counts, and prints those names only when the whole
+run was allowed to proceed. **Item names must not be secret**: the tool treats what you type
+as safe to show. Whenever it stops early it prints no name at all and refers to items by
+their position on the command line. Per item, how many times its exact bytes
+occur in each file; and, for the provider-key-shaped matches of the artifact scope, how many
+distinct strings equal a supplied value, contain one, lie inside one, or match none (each in
+the first class that fits). It never prints a value, a byte of either file, an offset or a
+digest, and writes no file.
+
+**What the values are.** What this Mac's Keychain returns now, to you, for the names you
+typed. Nothing ties them to the home you named or to what Hermes is using; `--home` only
+chooses which two files are read. The output says "supplied value", never "current secret".
+
+**Controls.**
+- It runs no program you supply. The one program is a fixed path, checked before and after
+  each run: a regular file, not a link, owned by root, not writable by group or others, and
+  the same for every folder above it. If the file changed between the two looks the result is
+  discarded. That is two looks, not a lock. It reads owner and permission bits, not
+  access-control lists, and it does not guard against root or another program running as you.
+- Output is read a piece at a time with a hard 8,192-byte and 10-second limit per item. Past
+  either, the program's process group is killed and the program reaped. Something it started
+  that left that group would not be stopped.
+- A small fixed environment, no input, error output discarded.
+- Core dumps are turned off before any value is fetched, or the tool stops.
+- All or nothing: every named item must be fetched and be 16 to 4,096 bytes, or nothing is
+  read from the home. Names must be plain, unique, and must not overlap anything fetched,
+  including bytes that are about to be dropped as unusable.
+- Hexadecimal-only output is refused. The system program prints a value containing a
+  non-printing byte as hexadecimal digits, unmarked, so an even run of hexadecimal digits is
+  ambiguous. The tool refuses it (`value_format_ambiguous`) and never decodes it. Genuine
+  keys made only of hexadecimal digits cannot be checked with this tool.
+- HOME and USER for the program come from your account record, not the environment. No
+  keychain file is named, so the program searches its default list; a name and account
+  identify the query, not one unique item.
+- Nothing is fetched until the terminal, the SQLite check and the home have passed.
+
+**What it cannot do.** Zero memory, or protect a value from another program running as you.
+Say anything about what `/usr/bin/security` itself reads, writes or contacts. Find a value
+that is split across pages, re-encoded, escaped or since rotated: a count of zero is "these
+exact bytes were not found", not "never there". Clear a match: `no_supplied_value` is not
+"harmless". "Finished" means every named item was compared in full, not that every credential
+of the home was. The output says which named items are in the database, so treat it as
+sensitive. Every limit of the artifact scope applies.
+
+`python -W error -X dev tests/test_artifact_compare.py` covers it with made-up values and a
+throwaway script standing in for the system program. The real program is never run by the
+tests; on macOS one test looks at its path.
+
 `python tests/test_artifact_scan.py` builds synthetic databases and runs every scan in its own
 process. It compares the scanner with an independent hand-written whole-file pass (physical
 bytes, no regular expression shared with the scanner) and with the stored values (logical),
