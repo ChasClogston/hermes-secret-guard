@@ -98,10 +98,15 @@ _ASSIGN_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9])([A-Za-z0-9_.-]{0,40}?" + _NAME + r")(?![A-Za-z0-9])"
     r"[\"']?\s*(?::|=|=>|:=)\s*[\"']?([A-Za-z0-9_\-+/=.~]{20,})")
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+([A-Za-z0-9_\-+/=.~]{20,})")
-# Names that end in "token" but hold no secret: pagination, counters, model settings.
-_NOT_SECRET_NAMES = ("page", "next", "prev", "continuation", "cursor", "count", "type", "usage",
-                     "limit", "max", "min", "sync", "num", "total", "expires", "ttl", "length")
-_PLACEHOLDER_RE = re.compile(r"(?i)x{4,}|\*{4,}|your|example|placeholder|changeme|redacted|dummy|"
+# Names that end in "token" but hold no secret: pagination and sync cursors. Matched as whole name
+# components right before "token" (next_page_token, pageToken, sync-token), never as substrings,
+# so admin_password and account_api_key still count. Counters and settings (token_count,
+# max_tokens, token_type) never reach this check: a name must END with a secret word.
+_NOT_SECRET_NAME_RE = re.compile(
+    r"(?:^|[_.\-])(?:next[_.\-]?page|page|next|prev|previous|continuation|cursor|sync|resume)[_.\-]?token$")
+# Whole-value placeholder shapes only (R4): a leading placeholder word, a long run of x or *, an
+# ellipsis (Hermes's own masked previews look like "sk-abc...wxyz"), or angle brackets.
+_PLACEHOLDER_RE = re.compile(r"(?i)^(?:your|example|placeholder|changeme|dummy|redacted)|x{6,}|\*{4,}|"
                              r"\.{3}|<|>|^0+$")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
@@ -110,35 +115,18 @@ def _plausible_value(v: str) -> bool:
     v = v.rstrip(".,;")
     if len(v) < 20 or v[0] in "/~." or "/" in v[:2]:
         return False                          # a path, not a value
-    if _PLACEHOLDER_RE.search(v) or len(set(v)) < 6:
+    if _PLACEHOLDER_RE.search(v) or len(set(v)) < 6 or _placeholder_key(v):
         return False
     if _HEX_RE.match(v):
         return len(v) >= 32                   # hex is fine next to a key name, but only if long
     return bool(re.search(r"[A-Za-z]", v) and re.search(r"[0-9]", v))
 
 
-# Inside a web address, a bare "token" (or redir_token, jwt) is usually a signed-link or download
-# token the agent needs to open that link: Firebase "?alt=media&token=", CDN "?jwt=". Names that
-# say what the token grants (access_token, api_key, secret, ...) still count in a web address.
-_URL_PARAM_OK = re.compile(r"^(?:token|jwt|sig|signature|[a-z]{1,12}_token)$")
-_URL_PARAM_KEEP = ("access", "auth", "refresh", "id_", "session", "bearer", "api", "private",
-                   "client", "secret", "oauth")
-
-
-def _url_param_name(text: str, start: int, name: str) -> bool:
-    """True if `name` begins right after ? or & (a query parameter) and is a generic token name."""
-    if start == 0 or text[start - 1] not in "?&":
-        return False
-    return bool(_URL_PARAM_OK.match(name)) and not any(k in name for k in _URL_PARAM_KEEP)
-
-
 def _assigned(text: str) -> list[Hit]:
     hits = []
     for m in _ASSIGN_RE.finditer(text):
         name = m.group(1).lower()
-        if any(w in name for w in _NOT_SECRET_NAMES):
-            continue
-        if _url_param_name(text, m.start(1), name):
+        if _NOT_SECRET_NAME_RE.search(name):
             continue
         if _plausible_value(m.group(2)):
             end = m.start(2) + len(m.group(2).rstrip(".,;"))
@@ -224,15 +212,22 @@ def _seed_phrases(text: str) -> list[Hit]:
 
 # ---------------------------------------------------------------- look-alikes left alone
 
-# A documentation example such as "sk-" followed by twenty x's has the vendor prefix but almost no
-# variety. Real keys of every listed format have far more than 8 different characters.
+# Two explicit documentation-example shapes, nothing broader (a random key can contain "your"):
+#   * almost no variety: "sk-" followed by twenty x's (fewer than 8 different characters in all)
+#   * written words: every dash/underscore part lowercase letters or digits, 3+ parts, and at
+#     least two of them placeholder words ("sk-proj-your-key-goes-here")
+# Real keys of every listed format have high variety and mixed case or long random parts.
+_PLACEHOLDER_WORDS = frozenset({"your", "my", "key", "here", "goes", "example", "placeholder",
+                                "changeme", "dummy", "fake", "test", "insert", "replace", "redacted",
+                                "token", "secret", "api"})
+
+
 def _placeholder_key(v: str) -> bool:
-    return len(set(v)) < 8 or bool(re.search(r"(?i)x{4,}|your|example|placeholder|changeme|dummy", v))
-
-
-# A JWT that is a signed-link parameter (?jwt=, &token=) opens that link; it is left alone so the
-# agent can still follow it. A JWT after access_token=, id_token= or a header still counts.
-_URL_JWT_LEAD = re.compile(r"[?&](?:jwt|token)=$")
+    if len(set(v)) < 8:
+        return True
+    parts = [p for p in re.split(r"[-_]", v) if p]
+    return (len(parts) >= 3 and all(re.fullmatch(r"[a-z]+|[0-9]+", p) for p in parts)
+            and sum(p in _PLACEHOLDER_WORDS for p in parts) >= 2)
 
 # ---------------------------------------------------------------- public interface
 
@@ -249,8 +244,7 @@ def detect(text: str, inbound: bool = False) -> list[Hit]:
         found += [Hit(m.start(), m.end(), "API key") for m in rx.finditer(text)
                   if inbound or not _placeholder_key(m.group(0))]
     found += [Hit(m.start(), m.end(), "private key block") for m in _PEM_RE.finditer(text)]
-    found += [Hit(m.start(), m.end(), "JWT") for m in _JWT_RE.finditer(text)
-              if _is_jwt(m.group(0)) and not _URL_JWT_LEAD.search(text, max(0, m.start() - 7), m.start())]
+    found += [Hit(m.start(), m.end(), "JWT") for m in _JWT_RE.finditer(text) if _is_jwt(m.group(0))]
     found += _assigned(text)
     found += _seed_phrases(text)
     found.sort(key=lambda h: (h.start, -(h.end - h.start)))

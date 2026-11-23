@@ -20,10 +20,11 @@ Secret Guard closes both ends:
   built-in, plugin and MCP tools alike.
 - **Exact key values are scrubbed** from tool results, terminal output and replies before the
   model sees them, even from commands no filename rule could predict.
-- **A key pasted into chat is stopped before inference.** The turn ends before any model call, a
-  placeholder is stored instead of the message, and you're told whether to rotate the key. Since
-  1.3 the message is held in memory for five minutes: reply `proceed CODE` to send it with the key
-  replaced, or `proceed CODE as-is` when the match was a false alarm.
+- **A key pasted into chat is stopped before inference.** The turn ends before any model call,
+  Hermes stores a placeholder instead of the message, and you're told whether to rotate the key.
+  Since 1.3, when Secret Guard can tell who sent the message, it is held for five minutes: reply
+  `proceed CODE` to send it with the key replaced, or `proceed CODE as-is` when the match was a
+  false alarm.
 - **Keys nobody registered are caught by shape (1.3).** Vendor-prefixed API keys, private key
   blocks, JWTs, checksum-verified seed phrases and values written after a key-like name
   (`api_key=`, `Authorization: Bearer`) are redacted from tool results, terminal output and
@@ -407,18 +408,34 @@ of overwriting. `hermes secret doctor` lists any variable your old source still 
 a truncated output); JWTs whose header decodes to JSON with `alg`; 12 to 24 BIP39 words that pass
 the BIP39 checksum (the bundled English list is verified against its published SHA-256 on load);
 and a value of 20+ characters written right after a key-like name (`api_key`, `client_secret`,
-`password`, `access_token`, `Authorization: Bearer`, …), skipping pagination and counter names
-(`next_page_token`, `max_tokens`), paths and placeholders. Bare hex or base64 with no prefix and no
-key-like name is never matched: commit IDs, checksums and UUIDs look the same. Matches are
-replaced with `[secret:possible <kind> redacted]`.
+`admin_password`, `access_token`, `Authorization: Bearer`, …). Two narrow exclusions: pagination
+names (`next_page_token`, `pageToken`, `continuation_token`), matched as whole name parts, and, in
+tool output only, documentation examples (fewer than 8 different characters, or written words
+such as `sk-proj-your-key-goes-here`). The chat check stops examples too, as 1.0 did. Bare hex or
+base64 with no prefix and no key-like name is never matched: commit IDs, checksums and UUIDs look
+the same. Matches are replaced with `[secret:possible <kind> redacted]`.
 
-**Hold and release (1.3).** When layer 3 stops a message, the text is held in this process's
-memory for five minutes, one message per conversation and sender. `proceed CODE` (the whole
-message, nothing else) sends it with every flagged value replaced; `proceed CODE as-is` sends it
-unchanged, and is refused when the match was one of your stored keys. The command is only read
-from a message the user sent: `pre_llm_call` never fires for tool output, web pages or email, so a
-document cannot approve its own release. Release is single-use; a wrong code leaves the message
-held; a newer stop replaces an older one.
+**Hold and release (1.3).** When layer 3 stops a message, Secret Guard can hold its text for
+release. A hold belongs to one profile, platform, conversation and sender. When Hermes does not
+say who sent the message, nothing is held, except on Desktop and the terminal, where the only
+possible sender is the person at the Mac; cron turns have no sender and are never held. Nothing is
+held when the message is too long to deliver intact (see below).
+
+`proceed CODE`, as the whole message and from the same person in the same conversation, sends the
+text with every flagged value replaced. `proceed CODE as-is` sends it unchanged; before releasing,
+Secret Guard checks the text again against the keys stored now, verbatim and base64, hex or
+percent-encoded, and refuses `as-is` if any is present. A failed check discards the message. The
+stop message says, at the moment of choice, that `as-is` sends the original to the model provider
+and that Hermes keeps it in the conversation's history.
+
+The command is read only from the text of an incoming turn, inside that identity. That is a
+pipeline boundary, not proof of human intent: Hermes can deliver automated or delegated turns
+through the same path, which is why a turn with no sender cannot hold or release. The released
+text reaches the model framed as the user's own words; approval to send it is not approval of
+anything it asks for. Release is single-use, a wrong code leaves the message held, a newer stop
+replaces an older one, and the released text, wrapper included, is measured against Hermes's
+`hooks.output_spill.max_chars` (10,000 by default) before it is sent: anything that would be
+moved to a file is discarded with a message saying so, never half-delivered.
 
 ## Disclosures
 
@@ -449,7 +466,8 @@ What Secret Guard does on your machine, so you can decide before installing:
   messages (see *The three layers*). Both fail closed: if a check errors, the call or turn is refused.
 - **Unattended runs.** The dialog gives up after 5 minutes and the tool returns a plain error, so
   cron and gateway runs never hang on it. The secret source never prompts.
-- **No background processes.**
+- **No background processes.** Since 1.3, each held message has one short-lived timer thread inside
+  Hermes's own process, which drops the message after five minutes.
 
 ## Honest limits
 
@@ -459,14 +477,18 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   without a key-like name beside it, is not matched. It also redacts things that only look like
   keys: a JWT in debugging output, a long value after `token:`, a run of BIP39 words that happens
   to pass the checksum (1 in 16 random runs of 12 words do, so a word list itself is partly
-  redacted). A false alarm in chat is released with `proceed CODE as-is`; one in tool output stays
-  redacted for that call.
-- **Held messages are memory only, with three consequences.** A gateway or Desktop restart drops
-  them. Only the text of a message is held, so an attachment must be sent again. A held message
-  over 9,000 characters cannot be released, because Hermes moves hook context over 10,000
-  characters to a file and shows the model only a preview; it is discarded with a request to send
-  it again. Once released, the message is part of the session like any other: an `as-is` release
-  stores the original text.
+  redacted). Signed-link tokens (`?jwt=`, `&token=` on image and download links) are treated as
+  credentials and redacted, so the agent cannot open those links. A false alarm in chat is
+  released with `proceed CODE as-is`; one in tool output stays redacted for that call.
+- **Held messages, and what is and is not stored.** Only Secret Guard's own copy of a held message
+  is in memory: it is dropped when the five minutes run out (by a timer, even if nothing else
+  happens), when the conversation is closed or reset, when a newer stop replaces it, or past 16
+  held messages in all; a restart drops it too. Python cannot guarantee that a dropped string is
+  erased from memory. Hermes itself writes the incoming message before plugins see it and then
+  replaces it with a placeholder, so traces can remain in its database files until they are
+  compacted. Once released, the text is part of the session like any other: Hermes stores and
+  replays it with later turns, and an `as-is` release stores the original. Only text is held; an
+  attachment must be sent again.
 - **Exact values and three encodings are scrubbed.** The plugin's transform hooks redact a key
   verbatim and in base64, hex and percent-encoded form. A key that is compressed, encrypted,
   reversed, upper-cased, spaced out, split across two outputs or partly echoed is not recognised.
@@ -602,11 +624,15 @@ the gate must have blocked that command or search filter.
 `python tests/test_patterns.py` covers the 1.3 pattern layer and hold-and-release with synthetic
 values built at run time (no realistic token is committed): every vendor format, private key
 blocks including a truncated one, JWTs, seed phrases of every length with and without numbering,
-the BIP39 checksum against 200 random word runs, assigned values and the names and values that
-must not match, a false-alarm corpus (commit IDs, checksums, UUIDs, integrity hashes, data URLs,
-transaction hashes, prose), output redaction with fault injection, and every release path: both
-options, single use, wrong code, expiry, another conversation or sender, a command inside a
-sentence, replacement by a newer stop, a stored key refused as-is, and the attachment note.
+the BIP39 checksum against 200 random word runs, assigned values and the names that must and must
+not match, documentation examples, signed links, a false-alarm corpus, output redaction with fault
+injection, and every release path. It holds a regression for each finding of the independent
+review of PR #8: identity (group chat, missing sender or session, other platform or profile),
+`as-is` against keys added after the stop and against encoded stored keys, the rendered release
+size and a lower configured limit, idle expiry, the global cap and conversation close. It runs in
+CI without Hermes; where Hermes is importable it also drives Hermes's real `pre_llm_call`
+collector with a stub agent, to show the ids reach the hook and the block and context results are
+applied.
 
 `tests/e2e_canary.sh` runs the same attacks against a real Hermes agent in a throwaway home and
 throwaway keychain, and requires positive evidence for each result. See the script header for setup.

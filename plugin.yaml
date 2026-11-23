@@ -15,3 +15,6 @@ provides_hooks:
   - transform_tool_result
   - transform_terminal_output
   - transform_llm_output
+  - on_session_finalize
+  - on_session_reset
+  - on_session_delete

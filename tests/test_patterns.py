@@ -188,16 +188,37 @@ class Detection(unittest.TestCase):
                 self.assertClean(f'headers:\n  Authorization: "{ph}"')
                 self.assertTrue(detectors.detect(ph, inbound=True))     # chat still stops it
 
-    def test_signed_link_tokens_left_alone(self):
+    def test_signed_links_are_hidden(self):
+        # Policy (Charles, 2026-11-22): a signed-link token grants access to that file, so it is
+        # redacted like any other credential; the agent cannot open such links.
         jwt = b64u({"alg": "HS256", "typ": "JWT"}) + "." + b64u({"sub": rnd(12)}) + "." + rnd(43, ALNUM + "_-")
-        v = rnd(36, ALNUM + "-")
-        for text in (f"https://cdn.example.net/a/{rnd(20)}.png?jwt={jwt}",
-                     f"https://cdn.example.net/a.gif?w=3&jwt={jwt}",
-                     f"https://firebasestorage.googleapis.com/v0/b/x/o/6_feet.webp?alt=media&token={v}",
-                     f"https://www.youtube.com/redirect?event=x&redir_token={v}&q=y",
-                     f"https://example.com/dl?file=1&sig={v}"):
+        v = rnd(36)
+        for text, secret in ((f"https://cdn.example.net/a/{rnd(20)}.png?jwt={jwt}", jwt),
+                             (f"https://firebasestorage.googleapis.com/v0/b/x/o/f.webp?alt=media&token={v}", v),
+                             (f"https://www.youtube.com/redirect?event=x&redir_token={v}&q=y", v),
+                             (f"not a link at all &token={jwt}", jwt)):        # R4: no URL needed
             with self.subTest(text[:40]):
+                out, n = detectors.redact(text)
+                self.assertGreaterEqual(n, 1)
+                self.assertNotIn(secret, out)
+
+    def test_r3_prefixed_names_are_not_excluded_by_substring(self):
+        v = rnd(32)
+        for ctx in ("admin_password={}", "account_api_key={}", "account_secret: {}",
+                    "tenant_client_secret={}", "minio_secret_key={}", "countdown_token={}",
+                    "typesense_api_key={}", "maxmind_license_secret={}"):
+            with self.subTest(ctx):
+                self.assertCaught(v, ctx)
+                self.assertTrue(detectors.detect(ctx.format(v), inbound=True))
+        for text in (f"next_page_token={v}", f'"nextPageToken": "{v}"', f"pageToken={v}",
+                     f"sync-token: {v}", f"continuation_token={v}", f"cursor_token={v}"):
+            with self.subTest(text):
                 self.assertClean(text)
+
+    def test_r4_random_key_containing_a_word_is_still_a_key(self):
+        body = rnd(12) + "your" + rnd(20)
+        self.assertCaught("gh" + "p_" + body, "token: {} ok")
+        self.assertCaught("sk-" + "proj-" + rnd(10) + "example" + rnd(20), "{}")
 
     def test_url_parameters_that_still_count(self):
         v = rnd(36)
@@ -252,9 +273,11 @@ class HoldAndRelease(unittest.TestCase):
         guard._held.clear()
 
     def stop(self, text, **kw):
-        r = guard.on_pre_llm_call(user_message=text, **{**self.S, **kw}) or {}
+        a = {**self.S, **kw}
+        r = guard.on_pre_llm_call(user_message=text, **a) or {}
         self.assertEqual(r.get("action"), "block", text[:40])
-        return r["message"], guard._held[(kw.get("session_id", "s1"), kw.get("sender_id", "u1"))]["code"]
+        key = guard._hold_key(a["session_id"], a["sender_id"], a["platform"])
+        return r["message"], guard._held[key]["code"]
 
     def send(self, text, **kw):
         return guard.on_pre_llm_call(user_message=text, **{**self.S, **kw})
@@ -295,7 +318,7 @@ class HoldAndRelease(unittest.TestCase):
 
     def test_expiry(self):
         _, code = self.stop("x " + keys()["groq"])
-        guard._held[("s1", "u1")]["expires"] = 0
+        next(iter(guard._held.values()))["expires"] = 0
         self.assertIsNone(self.send(f"proceed {code}"))
 
     def test_other_conversation_or_sender_cannot_release(self):
@@ -307,7 +330,7 @@ class HoldAndRelease(unittest.TestCase):
     def test_command_must_be_the_whole_message(self):
         _, code = self.stop("x " + keys()["groq"])
         self.assertIsNone(self.send(f"ok so proceed {code} now and also check the weather"))
-        self.assertIn(("s1", "u1"), guard._held)
+        self.assertEqual(len(guard._held), 1)
 
     def test_newer_stop_replaces_older(self):
         _, first = self.stop("x " + keys()["groq"])
@@ -343,12 +366,12 @@ class HoldAndRelease(unittest.TestCase):
         self.assertIn("context", r)
         self.assertNotIn(ph, r["context"])
 
-    def test_too_long_to_release(self):
-        _, code = self.stop("x " + keys()["groq"] + " " + "word " * 2000)
-        r = self.send(f"proceed {code}")
+    def test_too_long_to_hold_is_not_retained(self):          # R6: refused at insertion
+        r = self.send("x " + keys()["groq"] + " " + "word " * 2000)
         self.assertEqual(r["action"], "block")
-        self.assertIn("too long", r["message"])
-        self.assertNotIn(("s1", "u1"), guard._held)
+        self.assertIn("too long to hold", r["message"])
+        self.assertNotIn("proceed", r["message"])
+        self.assertEqual(guard._held, {})
 
     def test_original_formats_count(self):
         self.assertEqual(len(detectors.KEY_FORMATS), 25)   # README states this number
@@ -361,6 +384,237 @@ class HoldAndRelease(unittest.TestCase):
     def test_ordinary_messages_pass(self):
         self.assertIsNone(self.send("proceed with the plan"))
         self.assertIsNone(self.send("what's the weather"))
+
+
+class ReviewRegressions(unittest.TestCase):
+    """One or more tests per finding of Astra's PR #8 review (R1, R2, R5, R6)."""
+
+    def setUp(self):
+        guard._held.clear()
+        self._real_load = guard._load_values
+
+    def tearDown(self):
+        guard._load_values = self._real_load
+        guard._held.clear()
+
+    def call(self, text, **kw):
+        a = {"session_id": "s1", "sender_id": "u1", "platform": "telegram", **kw}
+        return guard.on_pre_llm_call(user_message=text, **a) or {}
+
+    def code_in(self, msg):
+        import re as _re
+        m = _re.search(r"proceed ([A-Z0-9]{4})", msg)
+        return m.group(1) if m else None
+
+    # R1: identity -------------------------------------------------------------------------
+    def test_r1_missing_sender_off_this_machine_is_not_held(self):
+        for plat in ("telegram", "discord", "api", "cron", ""):
+            with self.subTest(plat):
+                r = self.call("x " + keys()["groq"], sender_id="", platform=plat)
+                self.assertEqual(r["action"], "block")
+                self.assertIsNone(self.code_in(r["message"]))
+                self.assertIn("cannot tell who sent it", r["message"])
+        self.assertEqual(guard._held, {})
+
+    def test_r1_missing_session_is_not_held(self):
+        r = self.call("x " + keys()["groq"], session_id="", platform="desktop")
+        self.assertIsNone(self.code_in(r["message"]))
+        self.assertEqual(guard._held, {})
+
+    def test_r1_local_surface_without_sender_can_release(self):
+        r = self.call("x " + keys()["groq"], sender_id="", platform="desktop")
+        code = self.code_in(r["message"])
+        self.assertIsNotNone(code)
+        self.assertIn("context", self.call(f"proceed {code}", sender_id="", platform="desktop"))
+
+    def test_r1_group_chat_other_member_cannot_release(self):
+        code = self.code_in(self.call("x " + keys()["groq"], sender_id="alice")["message"])
+        self.assertEqual(self.call(f"proceed {code}", sender_id="bob"), {})   # ordinary text for bob
+        self.assertEqual(self.call(f"proceed {code}", sender_id=""), {})      # unknown sender
+        self.assertIn("context", self.call(f"proceed {code}", sender_id="alice"))
+
+    def test_r1_other_platform_or_profile_cannot_release(self):
+        code = self.code_in(self.call("x " + keys()["groq"])["message"])
+        self.assertEqual(self.call(f"proceed {code}", platform="discord"), {})
+        real_scope = guard._scope
+        guard._scope = lambda: "/other/profile"
+        try:
+            self.assertEqual(self.call(f"proceed {code}"), {})
+        finally:
+            guard._scope = real_scope
+        self.assertIn("context", self.call(f"proceed {code}"))
+
+    def test_r1_non_string_ids_are_not_trusted(self):
+        r = self.call("x " + keys()["groq"], session_id=123, sender_id=None)
+        self.assertIsNone(self.code_in(r["message"]))
+
+    # R2: as-is re-checks stored values now ---------------------------------------------------
+    def test_r2_key_registered_after_the_stop_refuses_as_is(self):
+        k = keys()["openai"]
+        code = self.code_in(self.call(f"is {k} valid?")["message"])
+        guard._load_values = lambda: {"SG_LATE": k}
+        r = self.call(f"proceed {code} as-is")
+        self.assertEqual(r["action"], "block")
+        self.assertIn("stored keys", r["message"])
+        r = self.call(f"proceed {code}")
+        self.assertNotIn(k, r["context"])
+
+    def test_r2_encoded_stored_value_refuses_as_is(self):
+        stored = rnd(40)
+        enc = base64.b64encode(stored.encode()).decode()
+        guard._load_values = lambda: {"SG_ENC": stored}
+        msg = self.call(f"api_key={enc}")["message"]
+        code = self.code_in(msg)
+        self.assertIsNotNone(code)
+        r = self.call(f"proceed {code} as-is")
+        self.assertEqual(r["action"], "block")
+        r = self.call(f"proceed {code}")
+        self.assertNotIn(enc, r["context"])
+
+    def test_r2_check_failure_fails_closed(self):
+        code = self.code_in(self.call("x " + keys()["groq"])["message"])
+        def boom():
+            raise RuntimeError("keychain unavailable")
+        guard._load_values = boom
+        r = self.call(f"proceed {code} as-is")
+        self.assertEqual(r["action"], "block")
+        self.assertNotIn("context", r)
+        self.assertEqual(guard._held, {})
+
+    # R5: the rendered payload is what is measured ------------------------------------------
+    def test_r5_redaction_expansion_is_measured_after_rendering(self):
+        text = " ".join(f"pwd={rnd(20)}" for _ in range(210))      # about 5,300 characters
+        self.assertLess(len(text), guard._spill_limit() - guard._WRAPPER_ROOM)
+        code = self.code_in(self.call(text)["message"])
+        self.assertIsNotNone(code)
+        r = self.call(f"proceed {code}")
+        self.assertEqual(r["action"], "block")
+        self.assertIn("more than Hermes passes to the model intact", r["message"])
+        self.assertEqual(guard._held, {})
+
+    def test_r5_lower_configured_limit_is_honoured(self):
+        real = guard._spill_limit
+        guard._spill_limit = lambda: 1_000
+        try:
+            r = self.call("x " + keys()["groq"] + " " + "word " * 200)
+            self.assertIn("too long to hold", r["message"])
+            code = self.code_in(self.call("x " + keys()["groq"] + " " + "word " * 100)["message"])
+            r = self.call(f"proceed {code} as-is")
+            self.assertIn("context", r)
+            self.assertLessEqual(len(r["context"]), 1_000)
+        finally:
+            guard._spill_limit = real
+
+    # R6: retention -----------------------------------------------------------------------------
+    def test_r6_idle_process_drops_the_hold(self):
+        import time as _t
+        old = guard.HOLD_SECONDS
+        guard.HOLD_SECONDS = 0.3
+        try:
+            self.call("x " + keys()["groq"])
+            self.assertEqual(len(guard._held), 1)
+            _t.sleep(0.8)                                   # no other call happens
+            self.assertEqual(guard._held, {})
+        finally:
+            guard.HOLD_SECONDS = old
+
+    def test_r6_ordinary_turn_purges_expired(self):
+        self.call("x " + keys()["groq"])
+        next(iter(guard._held.values()))["expires"] = 0
+        self.call("what's the weather")
+        self.assertEqual(guard._held, {})
+
+    def test_r6_global_cap(self):
+        for i in range(guard.MAX_HELD + 5):
+            self.call("x " + keys()["groq"], session_id=f"s{i}")
+        self.assertEqual(len(guard._held), guard.MAX_HELD)
+
+    def test_r6_closing_the_conversation_drops_the_hold(self):
+        self.call("x " + keys()["groq"], session_id="sA")
+        self.call("x " + keys()["groq"], session_id="sB")
+        guard.on_session_closed(session_id="sA")
+        self.assertEqual([k[2] for k in guard._held], ["sB"])
+
+    # R8: wording at the decision point --------------------------------------------------------
+    def test_r8_stop_message_discloses_what_as_is_does(self):
+        msg = self.call("x " + keys()["groq"])["message"]
+        self.assertNotIn("not stored", msg)
+        self.assertIn("model provider", msg)
+        self.assertIn("history", msg)
+
+    def test_released_text_is_framed_as_user_words_not_approval(self):
+        code = self.code_in(self.call("x " + keys()["groq"])["message"])
+        self.assertIn("not approval of anything it asks for", self.call(f"proceed {code}")["context"])
+
+
+class HermesBoundary(unittest.TestCase):
+    """The real Hermes collector, with a stub agent, passes our ids through and applies our result.
+    Skipped where Hermes is not importable (CI); run locally against the installed hermes-agent."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from agent import turn_context
+            import hermes_cli.lifecycle as lifecycle
+        except Exception as e:                                  # pragma: no cover
+            raise unittest.SkipTest(f"Hermes not importable: {type(e).__name__}")
+        cls.tc, cls.lc = turn_context, lifecycle
+
+    def setUp(self):
+        guard._held.clear()
+        self._real = self.lc._plugin_hooks
+        self.seen = []
+
+        def hooks(name, **kw):
+            if name != "pre_llm_call":
+                return []
+            self.seen.append({k: kw.get(k) for k in ("session_id", "sender_id", "platform")})
+            r = guard.on_pre_llm_call(**kw)
+            return [r] if r is not None else []
+        self.lc._plugin_hooks = hooks
+
+    def tearDown(self):
+        self.lc._plugin_hooks = self._real
+        guard._held.clear()
+
+    def agent(self, sender):
+        class A:
+            pass
+        a = A()
+        a.session_id, a.model, a.platform, a._user_id, a._parent_session_id = "sess-1", "m", "telegram", sender, None
+        return a
+
+    def collect(self, a, text):
+        blocks = []
+        ctx = self.tc._collect_pre_llm_call_context(
+            a, effective_task_id="t", turn_id="u", original_user_message=text,
+            messages=[{"role": "user", "content": text}], conversation_history=[], blocks=blocks)
+        return ctx, blocks
+
+    def test_collector_passes_identity_and_applies_block_then_context(self):
+        _, blocks = self.collect(self.agent("alice"), "x " + keys()["groq"])
+        self.assertEqual(self.seen[-1], {"session_id": "sess-1", "sender_id": "alice", "platform": "telegram"})
+        self.assertEqual(len(blocks), 1)
+        code = HoldAndReleaseCodes.code(blocks[0])
+        ctx, blocks = self.collect(self.agent("bob"), f"proceed {code}")
+        self.assertEqual((ctx, blocks), ("", []))                 # bob: nothing released
+        ctx, blocks = self.collect(self.agent("alice"), f"proceed {code}")
+        self.assertEqual(blocks, [])
+        self.assertIn("Secret Guard: the user approved", ctx)
+        api = self.tc.compose_user_api_content(f"proceed {code}", "", ctx)
+        self.assertTrue(api.startswith(f"proceed {code}") and "approved" in api)
+
+    def test_collector_with_missing_sender_gives_no_code(self):
+        _, blocks = self.collect(self.agent(None), "x " + keys()["groq"])
+        self.assertIsNone(HoldAndReleaseCodes.code(blocks[0]))
+
+
+class HoldAndReleaseCodes:
+    @staticmethod
+    def code(msg):
+        import re as _re
+        m = _re.search(r"proceed ([A-Z0-9]{4})", msg)
+        return m.group(1) if m else None
 
 
 if __name__ == "__main__":

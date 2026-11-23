@@ -30,3 +30,5 @@ def register(ctx) -> None:
     ctx.register_hook("transform_tool_result", guard.on_transform_tool_result)
     ctx.register_hook("transform_terminal_output", guard.on_transform_terminal_output)
     ctx.register_hook("transform_llm_output", guard.on_transform_llm_output)
+    for closing in ("on_session_finalize", "on_session_reset", "on_session_delete"):
+        ctx.register_hook(closing, guard.on_session_closed)   # drop a held message with its conversation

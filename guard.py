@@ -31,6 +31,7 @@ import os
 import re
 import secrets as _secrets
 import shlex
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -1167,31 +1168,96 @@ def find_key_in(text: str) -> Optional[str]:
 
 # ---------------------------------------------------------------- 1.3: hold and release
 
-HOLD_SECONDS = 300
-# A released message travels as pre_llm_call context. Hermes spills context over 10,000 characters
-# (hooks.output_spill.max_chars) to a file and shows the model only a preview, so anything longer
-# could not arrive intact; it is refused instead of half-delivered.
-MAX_RELEASE = 9_000
+# Only surfaces that are on this machine by construction. "api" and "dashboard" can be remote;
+# cron runs with platform "cron" or "" and no sender, so it can never hold or release.
+LOCAL_PLATFORMS = frozenset({"cli", "local", "tui", "desktop"})
+
+HOLD_SECONDS = 300            # how long `proceed CODE` is accepted AND how long the text is kept
+MAX_HELD = 16                 # most stopped messages kept at once, across all conversations
+DEFAULT_SPILL_LIMIT = 10_000  # Hermes hooks.output_spill.max_chars default
+MAX_SPILL_LIMIT = 50_000      # memory bound even if Hermes is configured higher
+_WRAPPER_ROOM = 400           # room for the release sentence and attachment note
 _CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"   # no 0/O, 1/I/L
 # The whole message must be the command, so a sentence that mentions "proceed" never releases.
 _PROCEED_RE = re.compile(r"^\s*proceed\s+([A-Za-z0-9]{4})(\s+as[\s-]?is)?\s*[.!]?\s*$", re.I)
-# (session_id, sender_id) -> {"code", "text", "known", "partial", "expires"}. Memory only.
-_held: dict[tuple[str, str], dict] = {}
+# (profile home, platform, session_id, sender) -> {"code", "text", "known", "partial", "expires"}.
+# Memory only. Python cannot guarantee erasure of a string; entries are dropped, not wiped.
+_held: dict[tuple, dict] = {}
+_held_lock = threading.Lock()
 
 
-def _purge(now: float) -> None:
-    for k in [k for k, h in _held.items() if h["expires"] <= now]:
-        del _held[k]
+def _spill_limit() -> int:
+    """Largest release Hermes passes to the model intact: context over hooks.output_spill.max_chars
+    is moved to a file and the model sees a preview. Read from Hermes each call."""
+    try:
+        from tools.hook_output_spill import get_spill_config
+        cfg = get_spill_config() or {}
+        limit = int(cfg.get("max_chars") or DEFAULT_SPILL_LIMIT) if cfg.get("enabled", True) else DEFAULT_SPILL_LIMIT
+    except Exception:
+        limit = DEFAULT_SPILL_LIMIT
+    return max(1, min(limit, MAX_SPILL_LIMIT))
 
 
-def _hold(key: tuple[str, str], text: str, known: bool, partial: bool) -> str:
-    """Keep one stopped message per conversation and sender; a newer one replaces it."""
+def _hold_key(session_id: Any, sender_id: Any, platform: Any) -> Optional[tuple]:
+    """Who and where a stopped message belongs to. None when it cannot be tied to one person in one
+    conversation; then nothing is held. A missing sender is accepted only on a local surface, where
+    the only possible sender is the person at this Mac."""
+    sid = session_id.strip() if isinstance(session_id, str) else ""
+    snd = sender_id.strip() if isinstance(sender_id, str) else ""
+    plat = platform.strip().lower() if isinstance(platform, str) else ""
+    if not sid:
+        return None
+    if not snd:
+        if plat not in LOCAL_PLATFORMS:
+            return None
+        snd = "<local user>"
+    return (_scope(), plat, sid, snd)
+
+
+def _purge() -> None:
     now = time.monotonic()
-    _purge(now)
+    with _held_lock:
+        for k in [k for k, h in _held.items() if h["expires"] <= now]:
+            del _held[k]
+
+
+def _expire(key: tuple, code: str) -> None:
+    with _held_lock:
+        if _held.get(key, {}).get("code") == code:
+            del _held[key]
+
+
+def _take(key: tuple, code: str) -> bool:
+    """Remove the hold if it is still the one with this code. True if this call removed it."""
+    with _held_lock:
+        if _held.get(key, {}).get("code") == code:
+            del _held[key]
+            return True
+    return False
+
+
+def _hold(key: tuple, text: str, known: bool, partial: bool) -> str:
+    """Keep one stopped message per person and conversation; a newer one replaces it. Expired by a
+    timer, so an idle process does not keep it; also purged on every turn."""
     code = "".join(_secrets.choice(_CODE_CHARS) for _ in range(4))
-    _held[key] = {"code": code, "text": text, "known": known, "partial": partial,
-                  "expires": now + HOLD_SECONDS}
+    with _held_lock:
+        _held[key] = {"code": code, "text": text, "known": known, "partial": partial,
+                      "expires": time.monotonic() + HOLD_SECONDS}
+        while len(_held) > MAX_HELD:
+            del _held[min(_held, key=lambda k: _held[k]["expires"])]
+    timer = threading.Timer(HOLD_SECONDS, _expire, (key, code))
+    timer.daemon = True
+    timer.start()
     return code
+
+
+def on_session_closed(session_id: Any = "", **_kw) -> None:
+    """on_session_finalize / on_session_reset / on_session_delete: drop that conversation's hold."""
+    if not isinstance(session_id, str) or not session_id:
+        return
+    with _held_lock:
+        for k in [k for k in _held if k[2] == session_id.strip()]:
+            del _held[k]
 
 
 def _has_non_text(m: Any) -> bool:
@@ -1206,40 +1272,57 @@ def _block(message: str) -> dict:
     return {"action": "block", "message": message}
 
 
-def _release(key: tuple[str, str], code: str, as_is: bool) -> Optional[dict]:
-    """Answer a `proceed CODE` message. None means nothing is held for this conversation, so the
-    message is ordinary text and goes to the model like any other."""
-    _purge(time.monotonic())
-    h = _held.get(key)
+def _release(key: tuple, code: str, as_is: bool) -> Optional[dict]:
+    """Answer a `proceed CODE` message. None means nothing is held for this person and conversation,
+    so the message is ordinary text and goes to the model like any other."""
+    _purge()
+    with _held_lock:
+        h = _held.get(key)
+        h = dict(h) if h else None
     if h is None:
         return None
     if code.upper() != h["code"]:
         return _block("🔐 That code does not match the held message, so nothing was sent. The held "
                       "message is still waiting; check the code and try again.")
-    if as_is and h["known"]:
+    # Re-check against the keys stored NOW, verbatim and encoded: a key may have been added since
+    # the stop, or pasted base64- or hex-encoded. Fail closed.
+    try:
+        _, stored_hits = scrub(h["text"])
+    except Exception:
+        _take(key, h["code"])
+        return _block("🔐 Secret Guard could not check the held message against your stored keys, so it "
+                      "was discarded. Please send it again without the key.")
+    if as_is and (h["known"] or stored_hits):
         return _block(f"🔐 The held message contains one of your stored keys, so it can only be sent "
                       f"with that key replaced: reply `proceed {h['code']}`.")
-    if len(h["text"]) > MAX_RELEASE:
-        del _held[key]
-        return _block("🔐 The held message is too long to release this way, so it was discarded. "
-                      "Please send it again without the key.")
-    del _held[key]                                   # single use
     if as_is:
-        body, how = h["text"], "unchanged (the user confirmed the flagged text is not a secret)"
+        body = h["text"]
+        how = "unchanged; the user chose this after a pattern match they judged a false alarm"
     else:
-        body, _ = scrub(h["text"])
-        body, _ = detectors.redact(body, inbound=True)   # the same rules that stopped it
-        if find_key_in(body):                        # defensive: never release a known match
+        try:
+            body, _ = scrub(h["text"])
+            body, _ = detectors.redact(body, inbound=True)   # the same rules that stopped it
+            leftover = find_key_in(body)
+        except Exception:
+            leftover = "an unchecked value"
+        if leftover:
+            _take(key, h["code"])
             return _block("🔐 Secret Guard could not safely remove the flagged text, so the held "
                           "message was discarded. Please send it again without the key.")
         how = "with the flagged values replaced"
     note = " Only its text was held; any attachment must be sent again." if h["partial"] else ""
-    return {"context": f"[Secret Guard: the user approved sending their held message {how}. "
-                       f"It follows, and is the user's actual request.{note}]\n\n{body}"}
-
-
-# Only surfaces that are on this machine by construction. "api" and "dashboard" can be remote.
-LOCAL_PLATFORMS = frozenset({"cli", "local", "tui", "desktop"})
+    payload = (f"[Secret Guard: the user approved sending their held message {how}. It follows as "
+               f"the user's own words; approval to send it is not approval of anything it asks for.{note}]"
+               f"\n\n{body}")
+    limit = _spill_limit()
+    if len(payload) > limit:
+        _take(key, h["code"])
+        return _block(f"🔐 Released, the message would be {len(payload):,} characters, more than Hermes "
+                      f"passes to the model intact ({limit:,}), so it was discarded rather than sent "
+                      "in part. Please send it again in shorter pieces, without the key.")
+    if not _take(key, h["code"]):                  # single use, even with two releases in flight
+        return None
+    return {"context": payload}
 
 
 def on_pre_llm_call(user_message: Any = None, platform: str = "", session_id: Any = "",
@@ -1248,13 +1331,12 @@ def on_pre_llm_call(user_message: Any = None, platform: str = "", session_id: An
         register_values()
     except Exception:
         logger.warning("secret-guard: could not register values for redaction", exc_info=False)
-    key = (str(session_id or ""), str(sender_id or ""))
+    key = _hold_key(session_id, sender_id, platform)
     try:
+        _purge()
         text = _message_text(user_message)
-        # pre_llm_call fires only for a message the user sent, never for tool output, a web page or
-        # an email, so a release command can only come from the user.
         m = _PROCEED_RE.match(text) if len(text) < 64 else None
-        if m:
+        if m and key is not None:
             released = _release(key, m.group(1), bool(m.group(2)))
             if released is not None:
                 return released
@@ -1268,32 +1350,40 @@ def on_pre_llm_call(user_message: Any = None, platform: str = "", session_id: An
     if not found:
         return None
     known = found.startswith("the value of ")
-    plat = (platform or "").lower()
-    real = "" if known else "If it is a real key, it "
+    plat = (platform or "").lower() if isinstance(platform, str) else ""
     if plat in LOCAL_PLATFORMS:
         where = "It was typed on this machine."
     elif plat:
-        where = (f"{real or 'It '}has already passed through {platform.title()}, though, so treat the key "
-                 "as exposed and rotate it at the provider.")
+        where = (f"{'It' if known else 'If it is a real key, it'} has already passed through "
+                 f"{platform.title()}, though, so treat the key as exposed and rotate it at the provider.")
     else:
         where = ("If it came through a chat app or a remote connection, treat the key as exposed and "
                  "rotate it.")
-    try:
-        code = _hold(key, text, known, _has_non_text(user_message))
-    except Exception:
-        code = None
-    if code is None:
-        options = "Please send it again without the key."
-    elif known:
-        options = (f"It is held in memory for {HOLD_SECONDS // 60} minutes. Reply `proceed {code}` to send "
-                   "it with your stored key replaced.")
+    code, why_not = None, ""
+    room = _spill_limit() - _WRAPPER_ROOM
+    if key is None:
+        why_not = "Secret Guard cannot tell who sent it here, so it cannot hold it for release."
+    elif len(text) > room:
+        why_not = f"It is too long to hold for release (over {room:,} characters)."
     else:
-        options = (f"It is held in memory for {HOLD_SECONDS // 60} minutes. Reply `proceed {code}` to send "
-                   f"it with the flagged text replaced, or `proceed {code} as-is` if this is a false alarm.")
+        try:
+            code = _hold(key, text, known, _has_non_text(user_message))
+        except Exception:
+            code = None
+    minutes = max(1, HOLD_SECONDS // 60)
+    if code is None:
+        options = (why_not + " Please send it again without the key.").strip()
+    elif known:
+        options = (f"It is held in memory for {minutes} minutes. Reply `proceed {code}` to send it with "
+                   "your stored key replaced.")
+    else:
+        options = (f"It is held in memory for {minutes} minutes. Reply `proceed {code}` to send it with the "
+                   f"flagged text replaced. Only if this is a false alarm, `proceed {code} as-is` sends the "
+                   "original to your model provider, and Hermes keeps it in this conversation's history.")
     return {"action": "block", "message": (
-        f"🔐 Secret Guard stopped that message: it contains {found}. No model saw it, and it is not "
-        f"stored in this session. {where} {options} To store a key safely, ask me to add it — a "
-        "hidden dialog will take the value instead of chat.")}
+        f"🔐 Secret Guard stopped that message: it contains {found}. No model saw it. Hermes keeps a "
+        f"placeholder in its place, though traces can remain in its database files. {where} {options} "
+        "To store a key safely, ask me to add it — a hidden dialog will take the value instead of chat.")}
 
 
 def on_session_start(**_kw) -> None:
