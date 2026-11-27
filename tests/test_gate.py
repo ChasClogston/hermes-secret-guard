@@ -850,43 +850,52 @@ class ScriptRecheck(Fixture):
         self.run_rows([("old python tool", T(f"python3 {tool} gmail search x"), "allowed"),
                        ("old shell script: KNOWN LIMIT", T(f"bash {helper}"), "allowed")])
 
-    def _git(self, repo, *args):
-        subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
-                        "-c", "commit.gpgsign=false", *args], check=True, capture_output=True)
-
-    def test_only_verified_distribution_content_skips_the_date_check(self):
+    def test_no_location_or_git_exemption(self):
+        """Round 2: shipped code with a fresh date is checked like anything else."""
         root = os.path.realpath(os.path.join(self.base, "hermes-home"))
         repo = os.path.join(root, "hermes-agent")
-        os.makedirs(os.path.join(repo, "scripts"))
-        shipped = os.path.join(repo, "scripts", "shipped.py")
         text = 'open("x/prod.env")\n'
-        with open(shipped, "w") as fh:
-            fh.write(text)
-        self._git(repo, "init", "-q")
-        self._git(repo, "add", "-A")
-        self._git(repo, "commit", "-q", "-m", "release")
-        added = os.path.join(repo, "scripts", "added.py")          # in the folder, not in the release
-        skill = os.path.join(root, "skills", "x", "run.py")        # a location an agent can edit
-        loose = os.path.join(root, "plugins", "loose", "run.py")   # under plugins, no checkout
-        for path in (added, skill, loose):
+        paths = [os.path.join(repo, "scripts", "shipped.py"), os.path.join(root, "skills", "x", "run.py"),
+                 os.path.join(root, "plugins", "p", "run.py")]
+        for path in paths:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w") as fh:
                 fh.write(text)
+        git = ["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
+        for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "release"]):
+            subprocess.run(git + args, check=True, capture_output=True)
         with mock.patch.object(guard, "_hermes_roots", return_value=[root]):
-            self.run_rows([("shipped, tracked, unmodified, fresh date", T(f"python3 {shipped}"), "allowed"),
-                           ("untracked file inside the checkout", T(f"python3 {added}"), "blocked"),
-                           ("skill folder: location earns nothing", T(f"python3 {skill}"), "blocked"),
-                           ("plugins folder without a checkout", T(f"python3 {loose}"), "blocked")])
-            with open(shipped, "a") as fh:
-                fh.write("# edited after release\n")
-            self.assertEqual(self.verdict(*T(f"python3 {shipped}")), "blocked")     # modified since release
-            self._git(repo, "checkout", "-q", "--", "scripts/shipped.py")
-            self.assertEqual(self.verdict(*T(f"python3 {shipped}")), "allowed")
-            guard.note_written(shipped)
-            self.assertEqual(self.verdict(*T(f"python3 {shipped}")), "blocked")     # provenance wins
-            guard._written.clear()
-            with mock.patch.object(guard, "_git", return_value=None):               # git missing or slow
-                self.assertEqual(self.verdict(*T(f"python3 {shipped}")), "blocked")
+            self.run_rows([(os.path.relpath(p, root), T(f"python3 {p}"), "blocked") for p in paths])
+            old = os.path.getmtime(paths[0]) - self.OLD
+            os.utime(paths[0], (old, old))
+            self.assertEqual(self.verdict(*T(f"python3 {paths[0]}")), "allowed")    # old and not written here
+        self.assertFalse(hasattr(guard, "_verified_distribution"))
+        self.assertNotIn("subprocess", vars(guard))
+
+    def test_inspection_errors_fail_closed(self):
+        """A script that needs checking and cannot be opened or read is refused, not passed."""
+        tracked = self._write_tool("scratch/harmless.sh", "echo ok\n")
+        fresh = self._file("scratch/fresh_ok.sh", "echo ok\n")
+        stale = self._file("scratch/stale_ok.sh", "echo ok\n", age=self.OLD)
+        self.run_rows([(p, T(f"bash {p}"), "allowed") for p in (tracked, fresh, stale)])      # baseline
+        real_open = os.open
+
+        def deny(path, flags, *a, **k):
+            if str(path).endswith("_ok.sh") or str(path).endswith("harmless.sh"):
+                raise PermissionError(13, "injected")
+            return real_open(path, flags, *a, **k)
+        with mock.patch.object(guard.os, "open", deny):
+            for path, want in ((tracked, "blocked"), (fresh, "blocked"), (stale, "allowed")):
+                self.assertEqual(self.verdict(*T(f"bash {path}")), want, path)
+            msg = guard.on_pre_tool_call("terminal", {"command": f"bash {tracked}"})["message"]
+        self.assertIn("could not be read for checking", msg)
+
+        def broken_read(fd, n):
+            raise OSError(5, "injected")
+        with mock.patch.object(guard.os, "read", broken_read):
+            out = guard.on_pre_tool_call("terminal", {"command": f"bash {tracked}"})
+        self.assertEqual(out["action"], "block")
+        self.assertIn("could not be read for checking", out["message"])
 
     def test_file_changed_during_inspection_is_refused(self):
         path = self._write_tool("scratch/swap.sh", "echo harmless\n")

@@ -393,10 +393,9 @@ of overwriting. `hermes secret doctor` lists any variable your old source still 
    substitutions, up to three levels deep. A blocked folder read tells the agent to name the
    files it needs. A folder that is too large, or cannot be listed, is refused, not passed.
    Since 1.4 a script file is read and checked as if its text had been typed, when the agent runs
-   a file that a write tool created or changed in this Hermes process. As a supplement, a file
-   that changed in the last ten minutes is checked too, unless git reports it tracked and
-   unmodified in a checkout under Hermes's `hermes-agent` or `plugins` folder. A blocked call also
-   tells the agent not to reach the same content another way.
+   a file that a write tool created or changed in this Hermes process. As a supplement, any file
+   that changed in the last ten minutes is checked too. A blocked call also tells the agent not to
+   reach the same content another way.
 2. **Value redaction.** Every registered value is pushed into Hermes's own model-egress scrub, the
    same exact-value registry Hermes uses for browser-vault passwords. That registry applies even
    when `security.redact_secrets` is off. Backup `transform_*` hooks scrub tool results, terminal
@@ -570,23 +569,27 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
     A renamed file loses its record.
   - *Supplement: the file changed in the last ten minutes.* A file date can be forged, so this
     narrows the gap for files made without a write tool; it is not the control.
-  - *One exemption, from the supplement only:* a file that git reports tracked and unmodified in a
-    checkout under Hermes's `hermes-agent` or `plugins` folder, because an update gives shipped
-    code fresh dates. Folder location alone earns nothing: skills are checked. If git is missing,
-    slow or unsure, the file is checked. The comparison is against the local checkout, which is
-    not proof against an agent that rewrites the checkout itself.
+  - *No exemptions.* Folder location earns nothing, and neither does local git state: an agent
+    with a shell can rewrite both. Trusting shipped code would need an operator-approved release
+    digest kept where the agent cannot write. None exists, so Hermes's own code, plugins and
+    skills are checked like any other file.
   - *How it is read:* the file is opened once; its type, size and date come from that open file;
     the 1 MB limit applies to the bytes actually read; a file that changes while being read is
-    refused. The file can still change between this check and the moment the shell runs it.
+    refused. A script that needs checking and cannot be opened or read is refused.
+  - *Limit: the gap between check and run.* The file can change between this check and the
+    moment the shell runs it. This check cannot close that gap.
   - *What the refusal says:* that a script written or changed in this session would be blocked.
     It does not name the script or what was found in it.
-  - *Side effect:* for ten minutes after an update or edit, a skill script that names a
-    credential file is refused. Run it again later, or run it yourself.
-  - *Not seen:* an older script nobody here wrote (project tools use credential files without
-    printing them, and blocking those would stop ordinary work); a script fed through a pipe
-    (`cat x.sh | bash`) or a named pipe; a file name assembled inside the script; a script written
-    before a restart and run more than ten minutes later; a script reached by a command name on
-    `PATH`.
+  - *Side effects:* for ten minutes after an update or edit, a script that names a credential
+    file is refused when run directly (`python x.py`, `bash x.sh`), wherever it lives. A skill
+    script the agent edits with a write tool, and that names a credential file, is refused until
+    Hermes restarts. Run it yourself, or restart Hermes after reviewing the edit.
+  - *Unsupported inputs, not read:* a script fed through a pipe (`cat x.sh | bash`), a named
+    pipe, a device or standard input; a script reached by a command name on `PATH`; a module
+    imported by another program.
+  - *Also not seen:* an older script nobody here wrote (project tools use credential files
+    without printing them, and blocking those would stop ordinary work); a file name assembled
+    inside the script; a script written before a restart and run more than ten minutes later.
 - **Some ordinary commands are now refused.** `cat $(...)`, `find . -exec grep ...`,
   `sh -c "$CMD"` and `grep -r` in a project that keeps a `.env` file are blocked; name the files
   or a subfolder instead. `rg` skips dotfiles by default, so a hidden `.env` does not block it

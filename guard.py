@@ -32,7 +32,6 @@ import re
 import secrets as _secrets
 import shlex
 import stat
-import subprocess
 import threading
 import time
 import urllib.parse
@@ -307,16 +306,15 @@ _KEYCHAIN_PRINT_RE = re.compile(r"find-(?:generic|internet)-password[^\n]*?(?:^|
 #     MAX_TRACKED paths, oldest dropped first. It is keyed by resolved path, so a rename loses it.
 #   Supplement: the file changed in the last RECENT_SCRIPT_SECONDS. A date can be forged (touch), so
 #     this only narrows the gap for files made without a write tool; it is not the control.
-#   Exempt from the supplement only: files that git reports tracked and unmodified inside a checkout
-#     under Hermes's own `hermes-agent` or `plugins` folder (an update gives those fresh dates).
-#     Location alone earns nothing: skills and other files an agent can edit are checked.
+#   No exemptions. Folder location earns nothing, and neither does local git state: an agent with a
+#     shell can rewrite both. A trust exemption would need an operator-approved release digest kept
+#     where the agent cannot write; none exists, so shipped code with a fresh date is checked too.
+#   A script that needs checking and cannot be opened or read is refused.
 # Older scripts nobody here wrote (project tooling) are not re-read: many use credential files
 # without printing them, and blocking those would break ordinary work.
 SCRIPT_MAX_BYTES = 1_000_000
 RECENT_SCRIPT_SECONDS = 600
 MAX_TRACKED = 4096
-DISTRIBUTION_DIRS = ("hermes-agent", "plugins")
-GIT_SECONDS = 3
 WRITE_TOOLS = frozenset({"write_file", "patch", "create_file", "edit_file"})
 SCRIPT_RUNNERS = SHELLS | {"source", ".", "perl", "ruby", "node", "php", "osascript"}
 _PYTHON_RE = re.compile(r"python(?:3(?:\.\d+)?)?$")
@@ -350,42 +348,6 @@ def _note_writes(tool_name: str, args: Any) -> None:
     if isinstance(patch, str) and len(patch) <= 2_000_000:
         for m in _PATCH_TARGET_RE.finditer(patch):
             note_written((m.group(1) or m.group(2) or "").strip())
-
-
-def _git(folder: str, *args: str) -> Optional[str]:
-    """Output of a read-only git query, or None when git is missing, slow or reports an error."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    try:
-        done = subprocess.run(["git", "--no-optional-locks", "-C", folder, "-c", "core.fsmonitor=false",
-                               "-c", "core.hooksPath=/dev/null", *args], capture_output=True, text=True,
-                              timeout=GIT_SECONDS, env=env, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
-    return done.stdout if done.returncode == 0 else None
-
-
-def _verified_distribution(full: str) -> bool:
-    """Shipped code as shipped: inside a git checkout under Hermes's `hermes-agent` or `plugins`
-    folder, tracked, and unmodified. Anything git cannot vouch for is not exempt. This compares
-    against the local checkout, which an agent with a shell could also rewrite; it is why the
-    exemption applies to the date supplement only and never to a file a write tool named."""
-    for root in _hermes_roots():
-        for sub in DISTRIBUTION_DIRS:
-            base = os.path.join(root, sub)
-            if not full.startswith(base + os.sep):
-                continue
-            folder, name = os.path.split(full)
-            top = _git(folder, "rev-parse", "--show-toplevel")
-            if not top:
-                return False
-            top = os.path.realpath(top.strip())
-            if top != base and not top.startswith(base + os.sep):
-                return False                     # the checkout is some outer folder, not Hermes's
-            if _git(folder, "ls-files", "--error-unmatch", "--", name) is None:
-                return False                     # not a tracked file
-            state = _git(folder, "status", "--porcelain=v1", "--ignored", "--untracked-files=all", "--", name)
-            return state is not None and not state.strip()
-    return False
 
 
 def _script_candidates(toks: list, i: int) -> list:
@@ -429,19 +391,24 @@ def _script_reason(toks: list, i: int, cwd: Optional[str], _depth: int) -> Optio
             continue
         try:
             full = _abs(cand, cwd)
-            if not stat.S_ISREG(os.stat(full).st_mode):
-                continue                         # a folder, pipe or device: nothing to read as a script
-            fd = os.open(full, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+            seen = os.stat(full)
         except (OSError, ValueError):
+            continue                             # not a file that exists: not the script
+        if not stat.S_ISREG(seen.st_mode):
+            continue                             # a folder, pipe or device: nothing to read as a script
+        with _written_lock:
+            tracked = full in _written
+        try:
+            fd = os.open(full, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            if tracked or (time.time() - seen.st_mtime) < RECENT_SCRIPT_SECONDS:
+                return f"{what} that could not be read for checking"      # needs checking: fail closed
             continue
         try:
             before = os.fstat(fd)
             if not stat.S_ISREG(before.st_mode):
                 return f"{what} that changed while it was being checked"
-            with _written_lock:
-                tracked = full in _written
-            recent = (time.time() - before.st_mtime) < RECENT_SCRIPT_SECONDS
-            if not tracked and not (recent and not _verified_distribution(full)):
+            if not tracked and (time.time() - before.st_mtime) >= RECENT_SCRIPT_SECONDS:
                 return None                      # the script is this file, and nobody here wrote it
             if _depth >= SHELL_MAX_DEPTH:
                 return f"{what} that is nested too deeply to check"
