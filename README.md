@@ -392,6 +392,10 @@ of overwriting. `hermes secret doctor` lists any variable your old source still 
    `os.environ`. The same checks apply inside `sh -c '...'`, `bash -lc`, `eval` and command
    substitutions, up to three levels deep. A blocked folder read tells the agent to name the
    files it needs. A folder that is too large, or cannot be listed, is refused, not passed.
+   Since 1.4 a script file is read and checked as if its text had been typed, when the agent runs
+   a file that a write tool created or changed in this Hermes process, or that changed in the last
+   ten minutes outside Hermes's own installed code. A blocked call also tells the agent not to
+   reach the same content another way.
 2. **Value redaction.** Every registered value is pushed into Hermes's own model-egress scrub, the
    same exact-value registry Hermes uses for browser-vault passwords. That registry applies even
    when `security.redact_secrets` is off. Backup `transform_*` hooks scrub tool results, terminal
@@ -551,11 +555,22 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   a `cd` redefined outside the line, and a folder change made in an earlier call cannot be
   followed.
 - **Command parsing is a small grammar, not a shell.** Quotes, `;`, `|`, `&&`, `$(...)`,
-  backticks, `sh -c` and `eval` are handled. Here-documents, aliases, functions, variables holding
-  command names and scripts on disk are not. Whether a `grep` call is recursive, and
+  backticks, `sh -c` and `eval` are handled. Here-documents, aliases, functions and variables holding
+  command names are not. Scripts on disk are read only in the case described next. Whether a `grep` call is recursive, and
   which folders it names, are read from the raw arguments, so a misread option can only add
   scanning. An option the tables do not know, or one whose value is optional in some `grep`
   builds, makes the call "not understood": the working folder is then scanned as well.
+- **Scripts are re-read only when written or changed here (1.4).** In a field test an agent that
+  was blocked on a command wrote the same command into a script with its file tool and ran the
+  script. Now `bash x.sh`, `sh x.sh`, `source x.sh`, `./x.sh`, `python x.py`, `node x.js` and the
+  like are checked against the script's text when a write tool named that file in this process, or
+  when the file changed in the last ten minutes and is not under Hermes's `hermes-agent`, `skills`,
+  `plugins`, `tools` or `installs` folders. A script over 1 MB in that state is refused. Not seen:
+  an older script nobody here wrote (skills and project tools use credential files without
+  printing them, and blocking those would stop ordinary work); a script fed through a pipe
+  (`cat x.sh | bash`); a file name assembled inside the script; a script written before a restart
+  and run more than ten minutes later; a script reached by a command name on `PATH`. The tracking
+  list is in memory, holds 512 paths and is lost on restart.
 - **Some ordinary commands are now refused.** `cat $(...)`, `find . -exec grep ...`,
   `sh -c "$CMD"` and `grep -r` in a project that keeps a `.env` file are blocked; name the files
   or a subfolder instead. `rg` skips dotfiles by default, so a hidden `.env` does not block it

@@ -781,5 +781,114 @@ class EncodedForms(unittest.TestCase):
         self.assertTrue(out and "redacted (encoded)" in out)
 
 
+class ScriptRecheck(Fixture):
+    """1.4: a blocked command put into a script file, then run. Field case of 2026-11-27: an agent was
+    blocked on `f=app; rev "$f.env"`, wrote that line to a script with its file tool and ran the script."""
+    OLD = 86400 * 3
+
+    def setUp(self):
+        guard._written.clear()
+
+    def _file(self, rel, text, age=0):
+        path = os.path.join(self.w, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(text)
+        if age:
+            past = os.path.getmtime(path) - age
+            os.utime(path, (past, past))
+        return path
+
+    def _write_tool(self, rel, text, age=OLD):
+        """What Hermes does: the hook sees the write call, then the tool writes the file."""
+        path = os.path.join(self.w, rel)
+        self.assertIsNone(guard.on_pre_tool_call("write_file", {"path": path, "content": text}))
+        return self._file(rel, text, age)
+
+    def test_field_case_script_written_then_run(self):
+        line = 'f=sub/prod; rev "$f.env"\n'
+        self.assertEqual(self.verdict(*T(line.strip())), "blocked")          # typed: already blocked in 1.3
+        path = self._write_tool("scratch/run_exact.sh", "#!/usr/bin/env bash\n" + line)
+        rel = os.path.relpath(path, self.w)
+        self.run_rows([(c, T(c), "blocked") for c in (
+            f"bash {path}", f"bash {rel}", f"sh {rel}", f"zsh -x {rel}", f"source {rel}", f". {rel}",
+            f"env bash {rel}", f"nohup bash {rel}", f"chmod +x {rel} && ./{rel}", f"bash -- {rel}",
+            f"bash < {rel}", f"bash <{rel}", f"cd scratch && bash run_exact.sh", f"bash -o pipefail {rel}")])
+        msg = guard.on_pre_tool_call("terminal", {"command": f"bash {rel}"})["message"]
+        self.assertIn("run_exact.sh", msg); self.assertIn("written or changed in this session", msg)
+
+    def test_tracked_scripts_in_other_languages(self):
+        bad = self._write_tool("scratch/read.py", 'print(open("sub/prod.env").read()[::-1])\n')
+        ok = self._write_tool("scratch/ok.py", "print(sum(range(10)))\n")
+        node = self._write_tool("scratch/read.js", 'console.log(require("fs").readFileSync(".env","utf8"))\n')
+        keyc = self._write_tool("scratch/kc.py", 'import subprocess\nsubprocess.run(["security","find-generic-password","-s","x","-w"])\n')
+        self.run_rows([("python reads a secret file", T(f"python3 {bad}"), "blocked"),
+                       ("python3.12 too", T(f"python3.12 {bad}"), "blocked"),
+                       ("python with options", T(f"python3 -u -W ignore {bad}"), "blocked"),
+                       ("node reads .env", T(f"node {node}"), "blocked"),
+                       ("keychain print inside a script", T(f"python3 {keyc}"), "blocked"),
+                       ("harmless tracked script runs", T(f"python3 {ok}"), "allowed"),
+                       ("module run is not a file", T("python3 -m http.server --help"), "allowed")])
+
+    def test_patch_tool_is_tracked(self):
+        path = self._file("scratch/patched.sh", "cat sub/prod.env\n", age=self.OLD)
+        self.assertEqual(self.verdict(*T(f"bash {path}")), "allowed")        # KNOWN LIMIT: old, not written here
+        guard.on_pre_tool_call("patch", {"mode": "patch", "patch": f"*** Begin Patch\n*** Update File: {path}\n@@\n+x\n*** End Patch"})
+        self.assertEqual(self.verdict(*T(f"bash {path}")), "blocked")
+
+    def test_recent_file_without_a_write_tool(self):
+        fresh = self._file("scratch/fresh.sh", "cat sub/prod.env\n")           # e.g. made with a here-document
+        self.assertEqual(self.verdict(*T(f"bash {fresh}")), "blocked")
+        self.assertEqual(self.verdict(*T(f"chmod +x {fresh}; {fresh}")), "blocked")
+
+    def test_older_scripts_nobody_here_wrote_still_run(self):
+        """Skills and project tooling use credential files without printing them."""
+        tool = self._file("tooling/google_api.py", 'TOKEN = open("google_token.json").read()\n', age=self.OLD)
+        helper = self._file("tooling/deploy.sh", "cat sub/prod.env\n", age=self.OLD)
+        self.run_rows([("old python tool", T(f"python3 {tool} gmail search x"), "allowed"),
+                       ("old shell script: KNOWN LIMIT", T(f"bash {helper}"), "allowed")])
+
+    def test_installed_tree_ignores_fresh_dates_but_not_tracked_writes(self):
+        root = os.path.join(self.base, "hermes-home")
+        skill = os.path.join(root, "skills", "x", "run.py")
+        os.makedirs(os.path.dirname(skill))
+        with open(skill, "w") as fh:
+            fh.write('open("x/prod.env")\n')
+        with mock.patch.object(guard, "_hermes_roots", return_value=[root]):
+            self.assertEqual(self.verdict(*T(f"python3 {skill}")), "allowed")   # fresh from an update
+            guard.note_written(skill)
+            self.assertEqual(self.verdict(*T(f"python3 {skill}")), "blocked")   # the agent rewrote it
+
+    def test_data_arguments_are_not_scripts(self):
+        self._file("scratch/data.txt", "see sub/prod.env for details\n")
+        script = self._file("scratch/count.py", "import sys\nprint(len(open(sys.argv[1]).read()))\n")
+        self.assertEqual(self.verdict(*T(f"python3 {script} scratch/data.txt")), "allowed")
+
+    def test_too_large_or_unreadable_is_refused(self):
+        big = self._write_tool("scratch/big.sh", "echo ok\n" + "# pad\n" * 200000)
+        self.assertGreater(os.path.getsize(big), guard.SCRIPT_MAX_BYTES)
+        self.assertEqual(self.verdict(*T(f"bash {big}")), "blocked")
+
+    def test_tracking_is_bounded(self):
+        for n in range(guard.MAX_TRACKED + 50):
+            guard.note_written(os.path.join(self.w, f"scratch/f{n}.sh"))
+        self.assertEqual(len(guard._written), guard.MAX_TRACKED)
+        for bad in (None, 3, "", "x" * 5000):
+            guard.note_written(bad)
+
+    def test_block_message_tells_the_agent_not_to_reroute(self):
+        msg = guard.on_pre_tool_call("terminal", {"command": "cat .env"})["message"]
+        self.assertIn("Do not reach the same content another way", msg)
+        self.assertIn("hermes secret verify", msg)
+        self.assertNotIn(VALUE, msg)
+
+    def test_known_limits(self):
+        """What this still cannot see. Layer 2 (value redaction) is the control."""
+        piped = self._write_tool("scratch/piped.sh", "cat sub/prod.env\n")
+        built = self._write_tool("scratch/built.py", 'print(open("sub/prod" + "." + "env").read())\n')
+        self.run_rows([("script fed through a pipe", T(f"cat {piped} | bash"), "allowed"),
+                       ("file name assembled inside the script", T(f"python3 {built}"), "allowed")])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

@@ -297,6 +297,123 @@ SEARCH_GLOB_KEYS = ("file_glob", "glob", "include")
 NAME_ONLY_TARGETS = frozenset({"files", "filenames", "names"})
 _KEYCHAIN_PRINT_RE = re.compile(r"find-(?:generic|internet)-password[^\n]*?(?:^|\s|['\",])-[a-zA-Z]*[wg]\b|dump-keychain")
 
+# ---------------------------------------------------------------- scripts written, then run (1.4)
+# A blocked command can be put in a file and the file run instead. So a script is read and checked
+# as if its text had been typed, when (a) a write tool was asked to create or change it in this
+# process, or (b) it changed in the last RECENT_SCRIPT_SECONDS and is not part of Hermes's own
+# installed code. Older scripts nobody here wrote (skills, project tooling) are not re-read: many of
+# them use credential files without printing them, and blocking those would break ordinary work.
+SCRIPT_MAX_BYTES = 1_000_000
+RECENT_SCRIPT_SECONDS = 600
+MAX_TRACKED = 512
+WRITE_TOOLS = frozenset({"write_file", "patch", "create_file", "edit_file"})
+SCRIPT_RUNNERS = SHELLS | {"source", ".", "perl", "ruby", "node", "php", "osascript"}
+_PYTHON_RE = re.compile(r"python(?:3(?:\.\d+)?)?$")
+_SCRIPT_SHEBANG_RE = re.compile(r"^#!.*\b(?:sh|bash|zsh|dash|ksh)\b")
+_PATCH_TARGET_RE = re.compile(r"^\*\*\*\s*(?:Update|Add)\s+File:\s*(.+)$|^\*\*\*\s*Move\s+File:\s*.+?->\s*(.+)$", re.M)
+_written: dict = {}                              # real path -> when a write tool named it
+_written_lock = threading.Lock()
+
+
+def note_written(path: Any, cwd: Optional[str] = None) -> None:
+    """Remember a file a write tool was asked to create or change, so that running it is checked."""
+    if not isinstance(path, str) or not path or len(path) > 4096:
+        return
+    try:
+        full = _abs(path, cwd)
+    except (OSError, ValueError):
+        return
+    with _written_lock:
+        _written[full] = time.time()
+        if len(_written) > MAX_TRACKED:
+            for old in sorted(_written, key=_written.get)[:len(_written) - MAX_TRACKED]:
+                del _written[old]
+
+
+def _note_writes(tool_name: str, args: Any) -> None:
+    if tool_name not in WRITE_TOOLS or not isinstance(args, dict):
+        return
+    for key in ("path", "file_path", "filepath", "filename", "file"):
+        note_written(args.get(key))
+    patch = args.get("patch")
+    if isinstance(patch, str) and len(patch) <= 2_000_000:
+        for m in _PATCH_TARGET_RE.finditer(patch):
+            note_written((m.group(1) or m.group(2) or "").strip())
+
+
+def _installed_tree(full: str) -> bool:
+    """Hermes's own code, skills and plugins: updates change these, so a fresh date proves nothing."""
+    for root in _hermes_roots():
+        for sub in ("hermes-agent", "skills", "plugins", "tools", "installs"):
+            base = os.path.join(root, sub)
+            if full == base or full.startswith(base + os.sep):
+                return True
+    return False
+
+
+def _script_candidates(toks: list, i: int) -> list:
+    """Arguments that may be the script file this command runs, in the order to try them."""
+    prog, args, out = os.path.basename(toks[i]), toks[i + 1:], []
+    if prog in ("source", "."):
+        out += args[:1]
+    elif prog in SCRIPT_RUNNERS or _PYTHON_RE.fullmatch(prog):
+        for j, a in enumerate(args):
+            if a in ("-c", "-e", "-m", "--command", "--eval") or (prog in SHELLS and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", a)):
+                break                            # inline code or a module, not a file: checked elsewhere
+            if a == "--":
+                out += args[j + 1:j + 2]
+                break
+            if a == "<":
+                out += args[j + 1:j + 2]
+            elif a.startswith("<") and len(a) > 1 and not a.startswith("<<"):
+                out.append(a[1:])
+            elif not a.startswith("-") and len(out) < 4:
+                out.append(a)
+    if "/" in toks[i]:
+        out.append(toks[i])
+    return out
+
+
+def _script_reason(toks: list, i: int, cwd: Optional[str], _depth: int) -> Optional[str]:
+    """Refusal reason when this command runs a script whose text would itself be refused."""
+    for cand in _script_candidates(toks, i):
+        if not cand or "$" in cand or "`" in cand:
+            continue
+        try:
+            full = _abs(cand, cwd)
+            info = os.stat(full)
+        except (OSError, ValueError):
+            continue
+        if not os.path.isfile(full):
+            continue
+        with _written_lock:
+            tracked = full in _written
+        recent = (time.time() - info.st_mtime) < RECENT_SCRIPT_SECONDS and not _installed_tree(full)
+        if not (tracked or recent):
+            return None                          # the script is this file, and nobody here wrote it
+        name = os.path.basename(full)
+        what = f"runs a script ({name}) written or changed in this session"
+        if _depth >= SHELL_MAX_DEPTH:
+            return f"{what} that is nested too deeply to check"
+        if info.st_size > SCRIPT_MAX_BYTES:
+            return f"{what} that is too large to check"
+        try:
+            with open(full, "rb") as fh:
+                text = fh.read(SCRIPT_MAX_BYTES + 1).decode("utf-8", "replace")
+        except OSError:
+            return f"{what} that could not be read for checking"
+        prog = os.path.basename(toks[i])
+        shell = (prog in SHELLS or prog in ("source", ".") or name.endswith((".sh", ".zsh", ".bash", ".command"))
+                 or bool(_SCRIPT_SHEBANG_RE.match(text)))
+        inner = (check_command(text, cwd, _depth + 1) if shell else None) or check_code(text)
+        if not inner:
+            for tok in sorted(set(re.findall(r"[\w./~-]+", text))):
+                if names_secret_file(tok, cwd):
+                    inner = f"names a secret-shaped file ({os.path.basename(tok)})"
+                    break
+        return f"{what} whose contents would be blocked: it {inner}" if inner else None
+    return None
+
 
 def _hermes_roots() -> list[str]:
     roots = [os.path.realpath(os.path.expanduser("~/.hermes"))]
@@ -887,6 +1004,10 @@ def _check_tokens(toks: list, cwd: Optional[str], guarded: frozenset, _depth: in
         reason = check_command(payload, cwd, _depth + 1) or check_code(payload)
         if reason:
             return reason
+    # 0b. a script file written or changed in this session, now being run: check its text too
+    reason = _script_reason(toks, i, cwd, _depth)
+    if reason:
+        return reason
     # 1. the keychain printing a value
     if prog == "security":
         joined = " ".join(args)
@@ -961,6 +1082,11 @@ def _check_tokens(toks: list, cwd: Optional[str], guarded: frozenset, _depth: in
 
 BLOCK_HINT = ("To check a secret, use `hermes secret list` or `hermes secret verify <ENV_VAR>` "
               "(fingerprints only). To add or change one, use the secret_request tool.")
+# Field finding, 2026-11-27: an agent that was blocked called the block a false positive, put the same
+# command in a script and ran the script. The message now says so in terms.
+NO_REROUTE = ("Do not reach the same content another way (a script file, another tool, a copy or an "
+              "encoding): that is the same disclosure. Tell the user what was blocked; they can run it "
+              "themselves.")
 
 
 def check_code(code: str) -> Optional[str]:
@@ -1092,16 +1218,20 @@ def check_tool_args(tool_name: str, args: dict) -> Optional[str]:
 
 def on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_kw) -> Optional[dict]:
     try:
+        _note_writes(tool_name, args)
+    except Exception:                            # tracking is best effort; the check below still runs
+        pass
+    try:
         reason = check_tool_args(tool_name, args if isinstance(args, dict) else {})
     except Exception:
         # Fail closed explicitly (Hermes would also block on a raise, but with a less useful message).
         # Never echo the arguments: they may hold the very value being protected.
         logger.warning("secret-guard: tool check failed; blocking %s", tool_name)
         return {"action": "block", "message": f"Secret Guard could not check this {tool_name} call, so it "
-                                              f"was blocked. {BLOCK_HINT}"}
+                                              f"was blocked. {BLOCK_HINT} {NO_REROUTE}"}
     if reason:
         logger.info("secret-guard blocked %s: %s", tool_name, reason)
-        return {"action": "block", "message": f"Secret Guard blocked this {tool_name} call: it {reason}. {BLOCK_HINT}"}
+        return {"action": "block", "message": f"Secret Guard blocked this {tool_name} call: it {reason}. {BLOCK_HINT} {NO_REROUTE}"}
     return None
 
 # ---------------------------------------------------------------- layer 2: backup transforms
