@@ -61,7 +61,7 @@ also requires the baseline to leak; the other *Without* entries are Hermes's def
 |---|---|---|
 | `perl` prints a file holding the key | key in the reply and 2 stored rows (measured) | `[secret:… redacted]`, 0 stored rows |
 | read a `.env` file | runs | blocked before it runs |
-| `execute_code` opens the `.env` file | runs | blocked before it runs |
+| `execute_code` opens a `.env` file (`.env`, or by name: `open('app.env')`, since 1.4) | runs | blocked before it runs |
 | `security find-generic-password -w` | runs | blocked |
 | key pasted into chat | sent to the model | turn stopped, nothing stored |
 
@@ -587,6 +587,13 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   - *Unsupported inputs, not read:* a script fed through a pipe (`cat x.sh | bash`), a named
     pipe, a device or standard input; a script reached by a command name on `PATH`; a module
     imported by another program.
+  - *Inline code and bare file names (1.4).* In a field test an agent used `execute_code` with
+    `open('app.env')` and was not stopped: inline code was only tested for names with a slash or a
+    leading dot. A quoted name with no spaces that has a file extension (or is a standard
+    private-key name such as `id_rsa`) is now tested like a command argument. Words without that
+    shape are left alone, because `'access_token'` and `'client_secret'` are field names in
+    ordinary API code. Not seen in inline code: a bare name with no extension (`'credentials'`),
+    a name assembled at run time, a name inside a longer string, a name read from input.
   - *Also not seen:* an older script nobody here wrote (project tools use credential files
     without printing them, and blocking those would stop ordinary work); a file name assembled
     inside the script; a script written before a restart and run more than ten minutes later.

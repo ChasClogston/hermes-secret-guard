@@ -1114,6 +1114,14 @@ NO_REROUTE = ("Do not try to reach the same content another way. Tell the user w
               "they can run it themselves.")
 
 
+# A quoted word with no spaces that looks like a file name (it has an extension, or is a standard
+# private-key name) is tested as one. Without that shape it is not: 'access_token', 'client_secret'
+# and 'max_tokens' are dictionary keys in ordinary API code. Unquoted tokens are not tested without
+# a slash or leading dot: `settings.env` in code is an attribute, not a file.
+_CODE_STRING_RE = re.compile(r"""(['"`])([^\s'"`\\]{1,512})\1""")
+_BARE_FILE_RE = re.compile(r"[^/]*\.[A-Za-z0-9_]{1,12}|id_(?:rsa|dsa|ecdsa|ed25519)")
+
+
 def check_code(code: str) -> Optional[str]:
     """Inline code (execute_code, browser JS, CDP expressions): refuse if it names a secret-shaped
     file or asks the keychain to print a value. Pattern-based, like the rest of layer 1."""
@@ -1130,6 +1138,11 @@ def check_code(code: str) -> Optional[str]:
     for tok in re.findall(r"[\w./~-]+", code):
         if ("/" in tok or tok.startswith(".")) and is_secret_path(tok):
             return f"code references a secret-shaped file ({os.path.basename(tok)})"
+    # Field finding, 2026-11-27: `open('app.env')` passed, because a bare name has no slash or dot
+    # in front. A quoted name is a string the code can open, so it gets the same test.
+    for m in _CODE_STRING_RE.finditer(code):
+        if _BARE_FILE_RE.fullmatch(m.group(2)) and is_secret_path(m.group(2), literal=True):
+            return f"code references a secret-shaped file ({os.path.basename(m.group(2))})"
         if tok.endswith("/secret_guard/emit-secrets.sh") or "/secrets-provider/" in tok:
             return "code runs a secrets helper script"
     return None
