@@ -31,6 +31,8 @@ import os
 import re
 import secrets as _secrets
 import shlex
+import stat
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -299,13 +301,22 @@ _KEYCHAIN_PRINT_RE = re.compile(r"find-(?:generic|internet)-password[^\n]*?(?:^|
 
 # ---------------------------------------------------------------- scripts written, then run (1.4)
 # A blocked command can be put in a file and the file run instead. So a script is read and checked
-# as if its text had been typed, when (a) a write tool was asked to create or change it in this
-# process, or (b) it changed in the last RECENT_SCRIPT_SECONDS and is not part of Hermes's own
-# installed code. Older scripts nobody here wrote (skills, project tooling) are not re-read: many of
-# them use credential files without printing them, and blocking those would break ordinary work.
+# as if its text had been typed.
+#   Primary signal: provenance. A write tool was asked to create or change the file. The record is
+#     held in memory for the life of this Hermes process (a restart clears it) and is bounded at
+#     MAX_TRACKED paths, oldest dropped first. It is keyed by resolved path, so a rename loses it.
+#   Supplement: the file changed in the last RECENT_SCRIPT_SECONDS. A date can be forged (touch), so
+#     this only narrows the gap for files made without a write tool; it is not the control.
+#   Exempt from the supplement only: files that git reports tracked and unmodified inside a checkout
+#     under Hermes's own `hermes-agent` or `plugins` folder (an update gives those fresh dates).
+#     Location alone earns nothing: skills and other files an agent can edit are checked.
+# Older scripts nobody here wrote (project tooling) are not re-read: many use credential files
+# without printing them, and blocking those would break ordinary work.
 SCRIPT_MAX_BYTES = 1_000_000
 RECENT_SCRIPT_SECONDS = 600
-MAX_TRACKED = 512
+MAX_TRACKED = 4096
+DISTRIBUTION_DIRS = ("hermes-agent", "plugins")
+GIT_SECONDS = 3
 WRITE_TOOLS = frozenset({"write_file", "patch", "create_file", "edit_file"})
 SCRIPT_RUNNERS = SHELLS | {"source", ".", "perl", "ruby", "node", "php", "osascript"}
 _PYTHON_RE = re.compile(r"python(?:3(?:\.\d+)?)?$")
@@ -341,13 +352,39 @@ def _note_writes(tool_name: str, args: Any) -> None:
             note_written((m.group(1) or m.group(2) or "").strip())
 
 
-def _installed_tree(full: str) -> bool:
-    """Hermes's own code, skills and plugins: updates change these, so a fresh date proves nothing."""
+def _git(folder: str, *args: str) -> Optional[str]:
+    """Output of a read-only git query, or None when git is missing, slow or reports an error."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    try:
+        done = subprocess.run(["git", "--no-optional-locks", "-C", folder, "-c", "core.fsmonitor=false",
+                               "-c", "core.hooksPath=/dev/null", *args], capture_output=True, text=True,
+                              timeout=GIT_SECONDS, env=env, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def _verified_distribution(full: str) -> bool:
+    """Shipped code as shipped: inside a git checkout under Hermes's `hermes-agent` or `plugins`
+    folder, tracked, and unmodified. Anything git cannot vouch for is not exempt. This compares
+    against the local checkout, which an agent with a shell could also rewrite; it is why the
+    exemption applies to the date supplement only and never to a file a write tool named."""
     for root in _hermes_roots():
-        for sub in ("hermes-agent", "skills", "plugins", "tools", "installs"):
+        for sub in DISTRIBUTION_DIRS:
             base = os.path.join(root, sub)
-            if full == base or full.startswith(base + os.sep):
-                return True
+            if not full.startswith(base + os.sep):
+                continue
+            folder, name = os.path.split(full)
+            top = _git(folder, "rev-parse", "--show-toplevel")
+            if not top:
+                return False
+            top = os.path.realpath(top.strip())
+            if top != base and not top.startswith(base + os.sep):
+                return False                     # the checkout is some outer folder, not Hermes's
+            if _git(folder, "ls-files", "--error-unmatch", "--", name) is None:
+                return False                     # not a tracked file
+            state = _git(folder, "status", "--porcelain=v1", "--ignored", "--untracked-files=all", "--", name)
+            return state is not None and not state.strip()
     return False
 
 
@@ -374,44 +411,66 @@ def _script_candidates(toks: list, i: int) -> list:
     return out
 
 
+def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
+    return (a.st_dev, a.st_ino, a.st_size, a.st_mtime_ns) == (b.st_dev, b.st_ino, b.st_size, b.st_mtime_ns)
+
+
 def _script_reason(toks: list, i: int, cwd: Optional[str], _depth: int) -> Optional[str]:
-    """Refusal reason when this command runs a script whose text would itself be refused."""
+    """Refusal reason when this command runs a script whose text would itself be refused.
+
+    The file is opened once. Its type, size and date are taken from that descriptor, the text is
+    read from it, and the size limit is applied to the bytes actually read. A file that changes
+    while it is being read is refused. The reason never names the script or what was found in it:
+    this text reaches the model and the log.
+    """
+    what = "runs a script written or changed in this session"
     for cand in _script_candidates(toks, i):
         if not cand or "$" in cand or "`" in cand:
             continue
         try:
             full = _abs(cand, cwd)
-            info = os.stat(full)
+            if not stat.S_ISREG(os.stat(full).st_mode):
+                continue                         # a folder, pipe or device: nothing to read as a script
+            fd = os.open(full, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
         except (OSError, ValueError):
             continue
-        if not os.path.isfile(full):
-            continue
-        with _written_lock:
-            tracked = full in _written
-        recent = (time.time() - info.st_mtime) < RECENT_SCRIPT_SECONDS and not _installed_tree(full)
-        if not (tracked or recent):
-            return None                          # the script is this file, and nobody here wrote it
-        name = os.path.basename(full)
-        what = f"runs a script ({name}) written or changed in this session"
-        if _depth >= SHELL_MAX_DEPTH:
-            return f"{what} that is nested too deeply to check"
-        if info.st_size > SCRIPT_MAX_BYTES:
-            return f"{what} that is too large to check"
         try:
-            with open(full, "rb") as fh:
-                text = fh.read(SCRIPT_MAX_BYTES + 1).decode("utf-8", "replace")
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):
+                return f"{what} that changed while it was being checked"
+            with _written_lock:
+                tracked = full in _written
+            recent = (time.time() - before.st_mtime) < RECENT_SCRIPT_SECONDS
+            if not tracked and not (recent and not _verified_distribution(full)):
+                return None                      # the script is this file, and nobody here wrote it
+            if _depth >= SHELL_MAX_DEPTH:
+                return f"{what} that is nested too deeply to check"
+            if before.st_size > SCRIPT_MAX_BYTES:
+                return f"{what} that is too large to check"
+            parts, total = [], 0
+            while total <= SCRIPT_MAX_BYTES:
+                chunk = os.read(fd, min(65536, SCRIPT_MAX_BYTES + 1 - total))
+                if not chunk:
+                    break
+                parts.append(chunk)
+                total += len(chunk)
+            after = os.fstat(fd)
         except OSError:
             return f"{what} that could not be read for checking"
-        prog = os.path.basename(toks[i])
+        finally:
+            os.close(fd)
+        if total > SCRIPT_MAX_BYTES:
+            return f"{what} that is too large to check"
+        if total != before.st_size or not _same_file(before, after):
+            return f"{what} that changed while it was being checked"
+        text = b"".join(parts).decode("utf-8", "replace")
+        prog, name = os.path.basename(toks[i]), os.path.basename(full)
         shell = (prog in SHELLS or prog in ("source", ".") or name.endswith((".sh", ".zsh", ".bash", ".command"))
                  or bool(_SCRIPT_SHEBANG_RE.match(text)))
         inner = (check_command(text, cwd, _depth + 1) if shell else None) or check_code(text)
         if not inner:
-            for tok in sorted(set(re.findall(r"[\w./~-]+", text))):
-                if names_secret_file(tok, cwd):
-                    inner = f"names a secret-shaped file ({os.path.basename(tok)})"
-                    break
-        return f"{what} whose contents would be blocked: it {inner}" if inner else None
+            inner = any(names_secret_file(tok, cwd) for tok in set(re.findall(r"[\w./~-]+", text)))
+        return f"{what} whose contents would be blocked" if inner else None
     return None
 
 
@@ -1084,9 +1143,8 @@ BLOCK_HINT = ("To check a secret, use `hermes secret list` or `hermes secret ver
               "(fingerprints only). To add or change one, use the secret_request tool.")
 # Field finding, 2026-11-27: an agent that was blocked called the block a false positive, put the same
 # command in a script and ran the script. The message now says so in terms.
-NO_REROUTE = ("Do not reach the same content another way (a script file, another tool, a copy or an "
-              "encoding): that is the same disclosure. Tell the user what was blocked; they can run it "
-              "themselves.")
+NO_REROUTE = ("Do not try to reach the same content another way. Tell the user what was blocked; "
+              "they can run it themselves.")
 
 
 def check_code(code: str) -> Optional[str]:

@@ -815,7 +815,9 @@ class ScriptRecheck(Fixture):
             f"env bash {rel}", f"nohup bash {rel}", f"chmod +x {rel} && ./{rel}", f"bash -- {rel}",
             f"bash < {rel}", f"bash <{rel}", f"cd scratch && bash run_exact.sh", f"bash -o pipefail {rel}")])
         msg = guard.on_pre_tool_call("terminal", {"command": f"bash {rel}"})["message"]
-        self.assertIn("run_exact.sh", msg); self.assertIn("written or changed in this session", msg)
+        self.assertIn("written or changed in this session", msg)
+        for leak in ("run_exact", "prod", ".env", "scratch", "rev"):     # no script name, no finding
+            self.assertNotIn(leak, msg.split("To check a secret")[0])
 
     def test_tracked_scripts_in_other_languages(self):
         bad = self._write_tool("scratch/read.py", 'print(open("sub/prod.env").read()[::-1])\n')
@@ -848,16 +850,79 @@ class ScriptRecheck(Fixture):
         self.run_rows([("old python tool", T(f"python3 {tool} gmail search x"), "allowed"),
                        ("old shell script: KNOWN LIMIT", T(f"bash {helper}"), "allowed")])
 
-    def test_installed_tree_ignores_fresh_dates_but_not_tracked_writes(self):
-        root = os.path.join(self.base, "hermes-home")
-        skill = os.path.join(root, "skills", "x", "run.py")
-        os.makedirs(os.path.dirname(skill))
-        with open(skill, "w") as fh:
-            fh.write('open("x/prod.env")\n')
+    def _git(self, repo, *args):
+        subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                        "-c", "commit.gpgsign=false", *args], check=True, capture_output=True)
+
+    def test_only_verified_distribution_content_skips_the_date_check(self):
+        root = os.path.realpath(os.path.join(self.base, "hermes-home"))
+        repo = os.path.join(root, "hermes-agent")
+        os.makedirs(os.path.join(repo, "scripts"))
+        shipped = os.path.join(repo, "scripts", "shipped.py")
+        text = 'open("x/prod.env")\n'
+        with open(shipped, "w") as fh:
+            fh.write(text)
+        self._git(repo, "init", "-q")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-q", "-m", "release")
+        added = os.path.join(repo, "scripts", "added.py")          # in the folder, not in the release
+        skill = os.path.join(root, "skills", "x", "run.py")        # a location an agent can edit
+        loose = os.path.join(root, "plugins", "loose", "run.py")   # under plugins, no checkout
+        for path in (added, skill, loose):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(text)
         with mock.patch.object(guard, "_hermes_roots", return_value=[root]):
-            self.assertEqual(self.verdict(*T(f"python3 {skill}")), "allowed")   # fresh from an update
-            guard.note_written(skill)
-            self.assertEqual(self.verdict(*T(f"python3 {skill}")), "blocked")   # the agent rewrote it
+            self.run_rows([("shipped, tracked, unmodified, fresh date", T(f"python3 {shipped}"), "allowed"),
+                           ("untracked file inside the checkout", T(f"python3 {added}"), "blocked"),
+                           ("skill folder: location earns nothing", T(f"python3 {skill}"), "blocked"),
+                           ("plugins folder without a checkout", T(f"python3 {loose}"), "blocked")])
+            with open(shipped, "a") as fh:
+                fh.write("# edited after release\n")
+            self.assertEqual(self.verdict(*T(f"python3 {shipped}")), "blocked")     # modified since release
+            self._git(repo, "checkout", "-q", "--", "scripts/shipped.py")
+            self.assertEqual(self.verdict(*T(f"python3 {shipped}")), "allowed")
+            guard.note_written(shipped)
+            self.assertEqual(self.verdict(*T(f"python3 {shipped}")), "blocked")     # provenance wins
+            guard._written.clear()
+            with mock.patch.object(guard, "_git", return_value=None):               # git missing or slow
+                self.assertEqual(self.verdict(*T(f"python3 {shipped}")), "blocked")
+
+    def test_file_changed_during_inspection_is_refused(self):
+        path = self._write_tool("scratch/swap.sh", "echo harmless\n")
+        real, state = os.read, {"done": False}
+
+        def read_then_rewrite(fd, n):
+            data = real(fd, n)
+            if not state["done"]:
+                state["done"] = True
+                with open(path, "a") as fh:                        # the file grows after the first read
+                    fh.write("cat sub/prod.env\n")
+            return data
+        with mock.patch.object(guard.os, "read", read_then_rewrite):
+            out = guard.on_pre_tool_call("terminal", {"command": f"bash {path}"})
+        self.assertTrue(state["done"])
+        self.assertEqual(out["action"], "block")
+        self.assertIn("changed while it was being checked", out["message"])
+
+    def test_limit_applies_to_bytes_read_not_reported_size(self):
+        path = self._write_tool("scratch/grow.sh", "echo ok\n")
+        fake = lambda fd, n: b"#" * n                              # the descriptor yields more than its size says
+        with mock.patch.object(guard.os, "read", fake):
+            out = guard.on_pre_tool_call("terminal", {"command": f"bash {path}"})
+        self.assertEqual(out["action"], "block")
+        self.assertIn("too large to check", out["message"])
+
+    def test_not_a_regular_file(self):
+        fifo = os.path.join(self.w, "scratch", "pipe.sh")
+        os.makedirs(os.path.dirname(fifo), exist_ok=True)
+        os.mkfifo(fifo)
+        guard.note_written(fifo)
+        self.assertEqual(self.verdict(*T(f"bash {fifo}")), "allowed")       # KNOWN LIMIT; must not hang
+        target = self._write_tool("scratch/real.sh", "cat sub/prod.env\n")
+        link = os.path.join(self.w, "scratch", "link.sh")
+        os.symlink(target, link)
+        self.assertEqual(self.verdict(*T(f"bash {link}")), "blocked")       # resolved to the tracked file
 
     def test_data_arguments_are_not_scripts(self):
         self._file("scratch/data.txt", "see sub/prod.env for details\n")
@@ -878,7 +943,9 @@ class ScriptRecheck(Fixture):
 
     def test_block_message_tells_the_agent_not_to_reroute(self):
         msg = guard.on_pre_tool_call("terminal", {"command": "cat .env"})["message"]
-        self.assertIn("Do not reach the same content another way", msg)
+        self.assertIn("Do not try to reach the same content another way", msg)
+        for idea in ("script", "encoding", "another tool", "copy"):          # no list of routes to try
+            self.assertNotIn(idea, msg.split("Do not try")[1])
         self.assertIn("hermes secret verify", msg)
         self.assertNotIn(VALUE, msg)
 

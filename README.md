@@ -393,9 +393,10 @@ of overwriting. `hermes secret doctor` lists any variable your old source still 
    substitutions, up to three levels deep. A blocked folder read tells the agent to name the
    files it needs. A folder that is too large, or cannot be listed, is refused, not passed.
    Since 1.4 a script file is read and checked as if its text had been typed, when the agent runs
-   a file that a write tool created or changed in this Hermes process, or that changed in the last
-   ten minutes outside Hermes's own installed code. A blocked call also tells the agent not to
-   reach the same content another way.
+   a file that a write tool created or changed in this Hermes process. As a supplement, a file
+   that changed in the last ten minutes is checked too, unless git reports it tracked and
+   unmodified in a checkout under Hermes's `hermes-agent` or `plugins` folder. A blocked call also
+   tells the agent not to reach the same content another way.
 2. **Value redaction.** Every registered value is pushed into Hermes's own model-egress scrub, the
    same exact-value registry Hermes uses for browser-vault passwords. That registry applies even
    when `security.redact_secrets` is off. Backup `transform_*` hooks scrub tool results, terminal
@@ -563,14 +564,29 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
 - **Scripts are re-read only when written or changed here (1.4).** In a field test an agent that
   was blocked on a command wrote the same command into a script with its file tool and ran the
   script. Now `bash x.sh`, `sh x.sh`, `source x.sh`, `./x.sh`, `python x.py`, `node x.js` and the
-  like are checked against the script's text when a write tool named that file in this process, or
-  when the file changed in the last ten minutes and is not under Hermes's `hermes-agent`, `skills`,
-  `plugins`, `tools` or `installs` folders. A script over 1 MB in that state is refused. Not seen:
-  an older script nobody here wrote (skills and project tools use credential files without
-  printing them, and blocking those would stop ordinary work); a script fed through a pipe
-  (`cat x.sh | bash`); a file name assembled inside the script; a script written before a restart
-  and run more than ten minutes later; a script reached by a command name on `PATH`. The tracking
-  list is in memory, holds 512 paths and is lost on restart.
+  like are checked against the script's text.
+  - *Primary signal: a write tool named the file.* The record lives in memory for the life of the
+    Hermes process. A restart clears it. It holds 4,096 resolved paths and drops the oldest first.
+    A renamed file loses its record.
+  - *Supplement: the file changed in the last ten minutes.* A file date can be forged, so this
+    narrows the gap for files made without a write tool; it is not the control.
+  - *One exemption, from the supplement only:* a file that git reports tracked and unmodified in a
+    checkout under Hermes's `hermes-agent` or `plugins` folder, because an update gives shipped
+    code fresh dates. Folder location alone earns nothing: skills are checked. If git is missing,
+    slow or unsure, the file is checked. The comparison is against the local checkout, which is
+    not proof against an agent that rewrites the checkout itself.
+  - *How it is read:* the file is opened once; its type, size and date come from that open file;
+    the 1 MB limit applies to the bytes actually read; a file that changes while being read is
+    refused. The file can still change between this check and the moment the shell runs it.
+  - *What the refusal says:* that a script written or changed in this session would be blocked.
+    It does not name the script or what was found in it.
+  - *Side effect:* for ten minutes after an update or edit, a skill script that names a
+    credential file is refused. Run it again later, or run it yourself.
+  - *Not seen:* an older script nobody here wrote (project tools use credential files without
+    printing them, and blocking those would stop ordinary work); a script fed through a pipe
+    (`cat x.sh | bash`) or a named pipe; a file name assembled inside the script; a script written
+    before a restart and run more than ten minutes later; a script reached by a command name on
+    `PATH`.
 - **Some ordinary commands are now refused.** `cat $(...)`, `find . -exec grep ...`,
   `sh -c "$CMD"` and `grep -r` in a project that keeps a `.env` file are blocked; name the files
   or a subfolder instead. `rg` skips dotfiles by default, so a hidden `.env` does not block it
