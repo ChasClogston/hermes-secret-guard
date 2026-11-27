@@ -976,6 +976,12 @@ class InlineCodeBareNames(Fixture):
                'with open(dst, "wb") as f:\n    f.write(data)\n')
         self.run_rows([("A09 bare name, single quotes", ("execute_code", {"code": a09}), "blocked"),
                        ("A14 bare name in a variable", ("execute_code", {"code": a14}), "blocked")])
+        for code in (a09, a14, "print(open('server.pem').read())", "print(open('id_rsa').read())"):
+            out = guard.on_pre_tool_call("execute_code", {"code": code})
+            self.assertEqual(out["action"], "block")
+            self.assertIn("code references a secret-shaped file by name", out["message"])
+            for leak in ("app.env", "app", "server", "pem", "id_rsa", "copy.txt"):       # nothing taken from the code
+                self.assertNotIn(leak, out["message"].split("To check a secret")[0])
 
     def test_bare_names_in_other_forms(self):
         E = lambda code: ("execute_code", {"code": code})
