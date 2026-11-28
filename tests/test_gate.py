@@ -6,7 +6,7 @@ keychain, no network. Synthetic files and one synthetic value in a temporary fol
 Each row states the expected result. Rows marked KNOWN LIMIT document what layer 1 cannot see;
 layer 2 (value redaction) is the control there.
 """
-import base64, importlib.util, json, os, shutil, subprocess, sys, tempfile, unittest, urllib.parse
+import base64, importlib.util, json, os, shutil, subprocess, sys, tempfile, types, unittest, urllib.parse
 from unittest import mock
 
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1036,6 +1036,179 @@ class InlineCodeBareNames(Fixture):
             ("name read from input", E("import sys\nprint(open(sys.argv[1]).read())"), "allowed"),
             ("bare name with no extension", E("print(open('credentials').read())"), "allowed"),
         ])
+
+
+class GatewayFolder(Fixture):
+    """1.4: the gate runs in the gateway's process; the agent works somewhere else. Field case A05
+    of run 20261127-165118-full: the agent wrote show.sh by a relative name and ran `sh show.sh`;
+    the gate looked for it in the gateway's folder, did not find it, and let the command run.
+    Every test here runs with the process in a different folder from the agent's."""
+    OLD = 86400 * 3
+    LINE = "tr 'a-f0-9' 'A-F)!@#$%^&*(' < sub/prod.env\n"
+
+    def setUp(self):
+        guard._written.clear()
+        self.gateway = os.path.realpath(tempfile.mkdtemp(prefix="sg-gateway-"))
+        with open(os.path.join(self.gateway, ".env"), "w") as fh:        # a decoy in the wrong folder
+            fh.write("DECOY=1\n")
+        os.makedirs(os.path.join(self.w, "scratch"), exist_ok=True)
+        os.chdir(self.gateway)
+
+    def tearDown(self):
+        os.chdir(self.w)
+        shutil.rmtree(self.gateway, ignore_errors=True)
+        for rel in ("show.sh", "fresh.sh", "ok.sh", "scratch/run_exact.sh", "scratch/ok.sh"):
+            try: os.remove(os.path.join(self.w, rel))
+            except OSError: pass
+
+    def hook(self, tool, args, folder="session"):
+        """One hook call as Hermes makes it. folder: 'session' (known), None (cannot be established)."""
+        known = self.w if folder == "session" else folder
+        with mock.patch.object(guard, "_session_cwd", return_value=known) as m:
+            out = guard.on_pre_tool_call(tool, args, task_id="task-1", session_id="s", tool_call_id="c")
+        m.assert_called_once_with("task-1")
+        return out
+
+    def place(self, rel, text, age=OLD):
+        path = os.path.join(self.w, rel)
+        with open(path, "w") as fh:
+            fh.write(text)
+        if age:
+            past = os.path.getmtime(path) - age
+            os.utime(path, (past, past))
+        return path
+
+    def write_tool(self, rel, text, **kw):
+        self.assertIsNone(self.hook("write_file", {"path": rel, "content": text}, **kw))
+        return self.place(rel, text)
+
+    def assertBlocked(self, out, words):
+        self.assertIsNotNone(out, "expected a block")
+        self.assertEqual(out["action"], "block")
+        self.assertIn(words, out["message"])
+
+    def test_field_case_relative_script_written_then_run(self):
+        self.assertFalse(os.path.exists(os.path.join(self.gateway, "show.sh")))
+        self.write_tool("show.sh", self.LINE)
+        self.assertBlocked(self.hook("terminal", {"command": "sh show.sh"}), "written or changed in this session")
+        for cmd in ("bash show.sh", "sh ./show.sh", "source show.sh", "chmod +x show.sh && ./show.sh", "cd . && sh show.sh"):
+            self.assertBlocked(self.hook("terminal", {"command": cmd}), "written or changed in this session")
+        ok = self.write_tool("ok.sh", "echo ok\n")
+        self.assertIsNone(self.hook("terminal", {"command": "sh ok.sh"}))
+
+    def test_relative_script_in_a_subfolder(self):
+        self.write_tool("scratch/run_exact.sh", 'f=sub/prod; rev "$f.env"\n')
+        for cmd in ("bash scratch/run_exact.sh", "cd scratch && bash run_exact.sh"):
+            self.assertBlocked(self.hook("terminal", {"command": cmd}), "written or changed in this session")
+        self.assertBlocked(self.hook("terminal", {"command": "bash run_exact.sh", "workdir": "scratch"}),
+                           "written or changed in this session")
+        self.assertBlocked(self.hook("terminal", {"command": "bash run_exact.sh", "workdir": os.path.join(self.w, "scratch")}),
+                           "written or changed in this session")
+
+    def test_recent_relative_script_without_a_write_tool(self):
+        self.place("fresh.sh", self.LINE, age=0)
+        self.assertBlocked(self.hook("terminal", {"command": "sh fresh.sh"}), "written or changed in this session")
+
+    def test_gateway_folder_is_never_the_agents_folder(self):
+        """A content search of `.` is judged on the agent's folder, not on the gateway's."""
+        clean = os.path.join(self.w, "clean")
+        with mock.patch.object(guard, "_session_cwd", return_value=clean):
+            self.assertIsNone(guard.on_pre_tool_call("search_files", {"pattern": "x", "path": "."}, task_id="t"))
+        empty = os.path.realpath(tempfile.mkdtemp(prefix="sg-empty-gw-"))
+        os.chdir(empty)
+        try:
+            self.assertBlocked(self.hook("search_files", {"pattern": "x", "path": "."}), "Secret Guard blocked")
+        finally:
+            os.chdir(self.gateway); shutil.rmtree(empty, ignore_errors=True)
+
+    def test_folder_cannot_be_established(self):
+        """Refuse what cannot be checked; leave alone what needs no folder."""
+        self.assertIsNone(self.hook("write_file", {"path": "show.sh", "content": self.LINE}, folder=None))
+        self.assertEqual(guard._written, {})                     # nothing true to record
+        self.place("show.sh", self.LINE)
+        why = "working folder could not be established"
+        for cmd in ("sh show.sh", "bash ./show.sh", "cd . && sh show.sh", "cd scratch && bash run_exact.sh",
+                    "python3 tool.py --flag", "source env.sh"):
+            self.assertBlocked(self.hook("terminal", {"command": cmd}, folder=None), why)
+        self.assertBlocked(self.hook("terminal", {"command": "sh show.sh", "workdir": "scratch"}, folder=None), why)
+        self.assertBlocked(self.hook("search_files", {"pattern": "x", "path": "."}, folder=None), why)
+        bad = self.place("scratch/run_exact.sh", self.LINE, age=0)
+        good = self.place("scratch/ok.sh", "echo ok\n", age=0)
+        self.assertBlocked(self.hook("terminal", {"command": f"sh {bad}"}, folder=None), "written or changed in this session")
+        self.assertIsNone(self.hook("terminal", {"command": f"sh {good}"}, folder=None))
+        self.assertIsNone(self.hook("terminal", {"command": "sh ok.sh", "workdir": os.path.join(self.w, "scratch")}, folder=None))
+        for cmd in ("echo hi", "ls -la", "git status", "python3 -c 'print(1)'", "python3 -m http.server --help", "date"):
+            self.assertIsNone(self.hook("terminal", {"command": cmd}, folder=None), cmd)
+        self.assertIsNone(self.hook("search_files", {"pattern": "x", "path": os.path.join(self.w, "clean")}, folder=None))
+        self.assertBlocked(self.hook("terminal", {"command": "cat sub/prod.env"}, folder=None), "Secret Guard blocked")
+
+    def test_refusal_names_nothing(self):
+        self.write_tool("show.sh", self.LINE)
+        for out in (self.hook("terminal", {"command": "sh show.sh"}), self.hook("terminal", {"command": "sh show.sh"}, folder=None)):
+            head = out["message"].split("To check a secret")[0]
+            for leak in ("show", "prod", ".env", self.w, self.gateway, "sg-gate", "sg-gateway"):
+                self.assertNotIn(leak, head)
+
+
+class SessionFolderLookup(unittest.TestCase):
+    """_session_cwd: where the agent's folder comes from, in order, and when it is unknown."""
+
+    def setUp(self):
+        self.real = os.path.realpath(tempfile.mkdtemp(prefix="sg-sess-"))
+        self.other = os.path.realpath(tempfile.mkdtemp(prefix="sg-sess2-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.real, ignore_errors=True); shutil.rmtree(self.other, ignore_errors=True)
+
+    def hermes(self, terminal=None, plugin="", runner=object(), terminal_raises=False, seen=None):
+        def pkg(name):
+            m = types.ModuleType(name); m.__path__ = []; return m
+        tt = types.ModuleType("tools.terminal_tool")
+        def get_session_cwd(key):
+            if seen is not None: seen.append(key)
+            if terminal_raises: raise RuntimeError("injected")
+            return terminal
+        tt.get_session_cwd = get_session_cwd
+        ps = types.ModuleType("hermes_cli.plugin_session"); ps.session_cwd = lambda: plugin
+        gr = types.ModuleType("gateway.run"); gr._gateway_runner_ref = lambda: runner
+        return mock.patch.dict(sys.modules, {"tools": pkg("tools"), "tools.terminal_tool": tt, "hermes_cli": pkg("hermes_cli"),
+                                             "hermes_cli.plugin_session": ps, "gateway": pkg("gateway"), "gateway.run": gr})
+
+    def test_outside_hermes_the_process_folder_is_the_agents(self):
+        for name in guard._HERMES_MARKERS:
+            self.assertNotIn(name, sys.modules)
+        self.assertEqual(guard._session_cwd("t"), os.getcwd())
+
+    def test_terminal_record_first_then_session_workspace(self):
+        seen = []
+        with self.hermes(terminal=self.real, plugin=self.other, seen=seen):
+            self.assertEqual(guard._session_cwd("task-9"), self.real)
+        self.assertEqual(seen, ["task-9"])
+        with self.hermes(terminal=None, plugin=self.other):
+            self.assertEqual(guard._session_cwd("task-9"), self.other)
+        with self.hermes(terminal_raises=True, plugin=self.other):
+            self.assertEqual(guard._session_cwd("task-9"), self.other)
+        seen = []
+        with self.hermes(terminal=self.real, seen=seen):
+            guard._session_cwd("")
+        self.assertEqual(seen, [None])
+
+    def test_unknown_in_a_gateway(self):
+        with self.hermes(terminal=None, plugin=""):
+            self.assertIsNone(guard._session_cwd("t"))
+        with self.hermes(terminal="/workspace-in-a-container-not-on-this-host", plugin="relative/folder"):
+            self.assertIsNone(guard._session_cwd("t"))               # not a local directory: not established
+
+    def test_classic_cli_has_no_gateway(self):
+        with self.hermes(terminal=None, plugin="", runner=None):
+            self.assertEqual(guard._session_cwd("t"), os.getcwd())
+
+    def test_hook_uses_the_marker_when_unknown(self):
+        with self.hermes(terminal=None, plugin=""), mock.patch.object(guard.registry, "load", return_value=GUARDED):
+            out = guard.on_pre_tool_call("terminal", {"command": "sh anything.sh"}, task_id="t")
+        self.assertEqual(out["action"], "block")
+        self.assertIn("working folder could not be established", out["message"])
+        self.assertFalse(os.path.exists(guard.UNKNOWN_FOLDER))
 
 
 if __name__ == "__main__":

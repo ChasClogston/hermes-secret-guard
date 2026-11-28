@@ -573,6 +573,13 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
     with a shell can rewrite both. Trusting shipped code would need an operator-approved release
     digest kept where the agent cannot write. None exists, so Hermes's own code, plugins and
     skills are checked like any other file.
+  - *Whose folder:* a hook is not told which folder the agent is working in, and a gateway's own
+    process folder is not it. Relative names are resolved from the folder Hermes records for the
+    session (the terminal's live folder, then the session's workspace); the same folder is used
+    for recording writes, for finding the script and for folder searches. If Hermes has no
+    usable folder for the session (none recorded, or a container or remote folder that is not a
+    local directory), a script or folder search named by a relative path is refused, because it
+    cannot be checked. Give the full path, or run it yourself.
   - *How it is read:* the file is opened once; its type, size and date come from that open file;
     the 1 MB limit applies to the bytes actually read; a file that changes while being read is
     refused. A script that needs checking and cannot be opened or read is refused.

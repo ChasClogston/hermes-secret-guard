@@ -32,6 +32,7 @@ import re
 import secrets as _secrets
 import shlex
 import stat
+import sys
 import threading
 import time
 import urllib.parse
@@ -332,6 +333,8 @@ def note_written(path: Any, cwd: Optional[str] = None) -> None:
         full = _abs(path, cwd)
     except (OSError, ValueError):
         return
+    if _under_unknown(full):
+        return                                   # no known folder: nothing true to record
     with _written_lock:
         _written[full] = time.time()
         if len(_written) > MAX_TRACKED:
@@ -339,15 +342,85 @@ def note_written(path: Any, cwd: Optional[str] = None) -> None:
                 del _written[old]
 
 
-def _note_writes(tool_name: str, args: Any) -> None:
+def _note_writes(tool_name: str, args: Any, cwd: Optional[str] = None) -> None:
     if tool_name not in WRITE_TOOLS or not isinstance(args, dict):
         return
-    for key in ("path", "file_path", "filepath", "filename", "file"):
-        note_written(args.get(key))
+    cwd = _local_folder(args, cwd)
+    names = [args.get(key) for key in ("path", "file_path", "filepath", "filename", "file")]
     patch = args.get("patch")
     if isinstance(patch, str) and len(patch) <= 2_000_000:
-        for m in _PATCH_TARGET_RE.finditer(patch):
-            note_written((m.group(1) or m.group(2) or "").strip())
+        names += [(m.group(1) or m.group(2) or "").strip() for m in _PATCH_TARGET_RE.finditer(patch)]
+    for name in names:
+        note_written(name, cwd)                  # a name that lands under UNKNOWN_FOLDER is not recorded
+
+
+# ---------------------------------------------------------------- whose folder (1.4)
+# Hermes does not tell a hook which folder the agent is working in, and a gateway's own process
+# folder is not it. Field finding, 2026-11-27: `sh show.sh` passed because the gate looked for the
+# script in the gateway's folder. Relative paths are now resolved from the folder Hermes records
+# for the session. When that folder cannot be established, relative paths are resolved under
+# UNKNOWN_FOLDER, which does not exist: a relative script or folder search that lands there is
+# refused, and a `cd` to a relative folder stays there, so the unknown state cannot be shaken off.
+UNKNOWN_FOLDER = os.sep + ".secret-guard-working-folder-unknown"
+_HERMES_MARKERS = ("hermes_cli.plugins", "gateway.run", "run_agent", "tools.terminal_tool")
+
+
+def _is_absolute(path: str) -> bool:
+    return os.path.isabs(os.path.expanduser(path.strip("\"'")))
+
+
+def _under_unknown(full: str) -> bool:
+    return full == UNKNOWN_FOLDER or full.startswith(UNKNOWN_FOLDER + os.sep)
+
+
+def _usable_folder(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip() and os.path.isabs(value.strip()) and os.path.isdir(value.strip()):
+        return os.path.realpath(value.strip())
+    return None
+
+
+def _session_cwd(task_id: Any = "") -> Optional[str]:
+    """The agent's working folder, or None when it cannot be established.
+
+    Inside Hermes: the terminal's live folder for this task (it follows `cd`), then the session's
+    recorded workspace. Never the process folder of a gateway. Outside Hermes (tests, the scripts
+    run on their own) and in the classic CLI, which has no gateway, the process folder is the
+    agent's folder. A folder that is not a local directory (a container or remote backend) counts
+    as not established.
+    """
+    if not any(name in sys.modules for name in _HERMES_MARKERS):
+        return os.getcwd()
+    try:
+        from tools.terminal_tool import get_session_cwd
+        found = _usable_folder(get_session_cwd(str(task_id) if task_id else None))
+        if found:
+            return found
+    except Exception:
+        pass
+    try:
+        from hermes_cli.plugin_session import session_cwd
+        found = _usable_folder(session_cwd())
+        if found:
+            return found
+    except Exception:
+        pass
+    try:
+        from gateway.run import _gateway_runner_ref
+        if _gateway_runner_ref() is None:
+            return os.getcwd()                   # classic CLI: the launch folder is the agent's folder
+    except Exception:
+        pass
+    return None
+
+
+def _local_folder(obj: Any, cwd: Optional[str]) -> Optional[str]:
+    """A tool call's own workdir/cwd argument, resolved against the session folder when relative."""
+    local = (obj.get("workdir") or obj.get("cwd")) if isinstance(obj, dict) else None
+    if not isinstance(local, str) or not local.strip():
+        return cwd
+    if _is_absolute(local):
+        return os.path.expanduser(local.strip())
+    return os.path.join(cwd, local.strip()) if cwd else local.strip()
 
 
 def _script_candidates(toks: list, i: int) -> list:
@@ -391,8 +464,13 @@ def _script_reason(toks: list, i: int, cwd: Optional[str], _depth: int) -> Optio
             continue
         try:
             full = _abs(cand, cwd)
-            seen = os.stat(full)
         except (OSError, ValueError):
+            continue
+        if _under_unknown(full):
+            return "runs a script by a relative path, and the working folder could not be established to check it"
+        try:
+            seen = os.stat(full)
+        except OSError:
             continue                             # not a file that exists: not the script
         if not stat.S_ISREG(seen.st_mode):
             continue                             # a folder, pipe or device: nothing to read as a script
@@ -1183,8 +1261,7 @@ def _walk(obj: Any, key: str, cwd: Optional[str], depth: int, budget: dict) -> O
                 raise _TooBig
         return _check_string(key, obj, cwd)
     if isinstance(obj, dict):
-        local = obj.get("workdir") or obj.get("cwd")
-        cwd = local if isinstance(local, str) else cwd   # a nested workdir/cwd applies to its own object
+        cwd = _local_folder(obj, cwd)            # a nested workdir/cwd applies to its own object
         for k, v in obj.items():
             r = _walk(v, str(k).lower(), cwd, depth + 1, budget)
             if r:
@@ -1217,7 +1294,7 @@ def _search_dicts(obj: Any, depth: int = 0, seen: Optional[list] = None) -> list
     return seen
 
 
-def _check_folder_search(tool_name: str, args: dict) -> Optional[str]:
+def _check_folder_search(tool_name: str, args: dict, base: Optional[str] = None) -> Optional[str]:
     """A content search over a folder returns file contents without naming a file. Applies to
     search_files and to any tool named like a search that takes a path, at any nesting depth."""
     name = (tool_name or "").lower()
@@ -1234,9 +1311,11 @@ def _check_folder_search(tool_name: str, args: dict) -> Optional[str]:
         if str(d.get("target", args.get("target", ""))).lower() in NAME_ONLY_TARGETS:
             continue                             # file names only: no contents returned
         path_key = next((k for k in SEARCH_PATH_KEYS if isinstance(d.get(k), str)), None)
-        local = d.get("workdir") or d.get("cwd") or args.get("workdir") or args.get("cwd")
-        cwd = local if isinstance(local, str) else None
-        folder = _abs(d[path_key] if path_key else ".", cwd)
+        cwd = _local_folder(d, _local_folder(args, base))
+        target = d[path_key] if path_key else "."
+        folder = _abs(target, cwd)
+        if _under_unknown(folder):
+            return "searches a folder by a relative path, and the working folder could not be established to check it"
         if not os.path.isdir(folder):
             continue                             # a single file: the path rule already checked it
         name_glob = next((d[k] for k in SEARCH_GLOB_KEYS if isinstance(d.get(k), str) and d[k]), None)
@@ -1246,21 +1325,27 @@ def _check_folder_search(tool_name: str, args: dict) -> Optional[str]:
     return None
 
 
-def check_tool_args(tool_name: str, args: dict) -> Optional[str]:
+def check_tool_args(tool_name: str, args: dict, cwd: Optional[str] = None) -> Optional[str]:
+    """`cwd` is the agent's working folder: None means the process folder (direct callers and
+    tests); the hook passes the session's folder, or UNKNOWN_FOLDER when it has none."""
     _budget_var.set(_Budget())                   # one work budget for this whole tool call
     try:
-        return _walk(args, "", None, 0, {"nodes": 0, "text": 0}) or _check_folder_search(tool_name, args)
+        return _walk(args, "", cwd, 0, {"nodes": 0, "text": 0}) or _check_folder_search(tool_name, args, cwd)
     except (_TooBig, RecursionError):
         return "has arguments too large or too deeply nested to inspect"
 
 
-def on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_kw) -> Optional[dict]:
+def on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, task_id: Any = "", **_kw) -> Optional[dict]:
     try:
-        _note_writes(tool_name, args)
+        cwd = _session_cwd(task_id) or UNKNOWN_FOLDER
+    except Exception:
+        cwd = UNKNOWN_FOLDER
+    try:
+        _note_writes(tool_name, args, cwd)
     except Exception:                            # tracking is best effort; the check below still runs
         pass
     try:
-        reason = check_tool_args(tool_name, args if isinstance(args, dict) else {})
+        reason = check_tool_args(tool_name, args if isinstance(args, dict) else {}, cwd)
     except Exception:
         # Fail closed explicitly (Hermes would also block on a raise, but with a less useful message).
         # Never echo the arguments: they may hold the very value being protected.
