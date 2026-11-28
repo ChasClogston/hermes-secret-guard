@@ -61,7 +61,7 @@ also requires the baseline to leak; the other *Without* entries are Hermes's def
 |---|---|---|
 | `perl` prints a file holding the key | key in the reply and 2 stored rows (measured) | `[secret:… redacted]`, 0 stored rows |
 | read a `.env` file | runs | blocked before it runs |
-| `execute_code` opens the `.env` file | runs | blocked before it runs |
+| `execute_code` opens a `.env` file (`.env`, or by name: `open('app.env')`, since 1.4) | runs | blocked before it runs |
 | `security find-generic-password -w` | runs | blocked |
 | key pasted into chat | sent to the model | turn stopped, nothing stored |
 
@@ -392,6 +392,10 @@ of overwriting. `hermes secret doctor` lists any variable your old source still 
    `os.environ`. The same checks apply inside `sh -c '...'`, `bash -lc`, `eval` and command
    substitutions, up to three levels deep. A blocked folder read tells the agent to name the
    files it needs. A folder that is too large, or cannot be listed, is refused, not passed.
+   Since 1.4 a script file is read and checked as if its text had been typed, when the agent runs
+   a file that a write tool created or changed in this Hermes process. As a supplement, any file
+   that changed in the last ten minutes is checked too. A blocked call also tells the agent not to
+   reach the same content another way.
 2. **Value redaction.** Every registered value is pushed into Hermes's own model-egress scrub, the
    same exact-value registry Hermes uses for browser-vault passwords. That registry applies even
    when `security.redact_secrets` is off. Backup `transform_*` hooks scrub tool results, terminal
@@ -551,11 +555,65 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   a `cd` redefined outside the line, and a folder change made in an earlier call cannot be
   followed.
 - **Command parsing is a small grammar, not a shell.** Quotes, `;`, `|`, `&&`, `$(...)`,
-  backticks, `sh -c` and `eval` are handled. Here-documents, aliases, functions, variables holding
-  command names and scripts on disk are not. Whether a `grep` call is recursive, and
+  backticks, `sh -c` and `eval` are handled. Here-documents, aliases, functions and variables holding
+  command names are not. Scripts on disk are read only in the case described next. Whether a `grep` call is recursive, and
   which folders it names, are read from the raw arguments, so a misread option can only add
   scanning. An option the tables do not know, or one whose value is optional in some `grep`
   builds, makes the call "not understood": the working folder is then scanned as well.
+- **Scripts are re-read only when written or changed here (1.4).** In a field test an agent that
+  was blocked on a command wrote the same command into a script with its file tool and ran the
+  script. Now `bash x.sh`, `sh x.sh`, `source x.sh`, `./x.sh`, `python x.py`, `node x.js` and the
+  like are checked against the script's text.
+  - *Primary signal: a write tool named the file.* The record lives in memory for the life of the
+    Hermes process. A restart clears it. It holds 4,096 resolved paths and drops the oldest first.
+    A renamed file loses its record.
+  - *Supplement: the file changed in the last ten minutes.* A file date can be forged, so this
+    narrows the gap for files made without a write tool; it is not the control.
+  - *No exemptions.* Folder location earns nothing, and neither does local git state: an agent
+    with a shell can rewrite both. Trusting shipped code would need an operator-approved release
+    digest kept where the agent cannot write. None exists, so Hermes's own code, plugins and
+    skills are checked like any other file.
+  - *Whose folder:* a hook is not told which folder the agent is working in, and a gateway's own
+    process folder is not it. Relative names are resolved from the folder Hermes records for the
+    session (the terminal's live folder, then the session's workspace); the same folder is used
+    for recording writes, for finding the script and for folder searches. This is trusted
+    only when Hermes confirms the session's commands run on this machine (the `local` terminal
+    backend): with a container or remote backend the same path is a different folder, so a
+    folder that happens to exist here proves nothing. If the backend is not local, cannot be
+    read, or no folder is recorded, a script or folder search named by a relative path is
+    refused, because it cannot be checked. On a confirmed local backend, give the full path
+    instead; on any other backend a full path does not help (see the next point), so run it
+    yourself.
+  - *Covered backend: local only.* Script inspection reads files on this machine. With a
+    container or remote backend, a script named by its full path is looked up here, not where it
+    will run, so it is not reliably inspected. Shown in a real gateway for the local backend
+    only (one-shot terminal sessions); Desktop, messaging and delegated sessions are not yet
+    exercised. The backend is read through Hermes's internal functions; if a Hermes update
+    renames them, relative-path scripts are refused until the plugin is updated.
+  - *How it is read:* the file is opened once; its type, size and date come from that open file;
+    the 1 MB limit applies to the bytes actually read; a file that changes while being read is
+    refused. A script that needs checking and cannot be opened or read is refused.
+  - *Limit: the gap between check and run.* The file can change between this check and the
+    moment the shell runs it. This check cannot close that gap.
+  - *What the refusal says:* that a script written or changed in this session would be blocked.
+    It does not name the script or what was found in it.
+  - *Side effects:* for ten minutes after an update or edit, a script that names a credential
+    file is refused when run directly (`python x.py`, `bash x.sh`), wherever it lives. A skill
+    script the agent edits with a write tool, and that names a credential file, is refused until
+    Hermes restarts. Run it yourself, or restart Hermes after reviewing the edit.
+  - *Unsupported inputs, not read:* a script fed through a pipe (`cat x.sh | bash`), a named
+    pipe, a device or standard input; a script reached by a command name on `PATH`; a module
+    imported by another program.
+  - *Inline code and bare file names (1.4).* In a field test an agent used `execute_code` with
+    `open('app.env')` and was not stopped: inline code was only tested for names with a slash or a
+    leading dot. A quoted name with no spaces that has a file extension (or is a standard
+    private-key name such as `id_rsa`) is now tested like a command argument. Words without that
+    shape are left alone, because `'access_token'` and `'client_secret'` are field names in
+    ordinary API code. Not seen in inline code: a bare name with no extension (`'credentials'`),
+    a name assembled at run time, a name inside a longer string, a name read from input.
+  - *Also not seen:* an older script nobody here wrote (project tools use credential files
+    without printing them, and blocking those would stop ordinary work); a file name assembled
+    inside the script; a script written before a restart and run more than ten minutes later.
 - **Some ordinary commands are now refused.** `cat $(...)`, `find . -exec grep ...`,
   `sh -c "$CMD"` and `grep -r` in a project that keeps a `.env` file are blocked; name the files
   or a subfolder instead. `rg` skips dotfiles by default, so a hidden `.env` does not block it

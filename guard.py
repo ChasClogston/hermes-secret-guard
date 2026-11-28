@@ -31,6 +31,8 @@ import os
 import re
 import secrets as _secrets
 import shlex
+import stat
+import sys
 import threading
 import time
 import urllib.parse
@@ -296,6 +298,248 @@ _FILE_URL_RE = re.compile(r"file://[^\s\"'<>)]+")
 SEARCH_GLOB_KEYS = ("file_glob", "glob", "include")
 NAME_ONLY_TARGETS = frozenset({"files", "filenames", "names"})
 _KEYCHAIN_PRINT_RE = re.compile(r"find-(?:generic|internet)-password[^\n]*?(?:^|\s|['\",])-[a-zA-Z]*[wg]\b|dump-keychain")
+
+# ---------------------------------------------------------------- scripts written, then run (1.4)
+# A blocked command can be put in a file and the file run instead. So a script is read and checked
+# as if its text had been typed.
+#   Primary signal: provenance. A write tool was asked to create or change the file. The record is
+#     held in memory for the life of this Hermes process (a restart clears it) and is bounded at
+#     MAX_TRACKED paths, oldest dropped first. It is keyed by resolved path, so a rename loses it.
+#   Supplement: the file changed in the last RECENT_SCRIPT_SECONDS. A date can be forged (touch), so
+#     this only narrows the gap for files made without a write tool; it is not the control.
+#   No exemptions. Folder location earns nothing, and neither does local git state: an agent with a
+#     shell can rewrite both. A trust exemption would need an operator-approved release digest kept
+#     where the agent cannot write; none exists, so shipped code with a fresh date is checked too.
+#   A script that needs checking and cannot be opened or read is refused.
+# Older scripts nobody here wrote (project tooling) are not re-read: many use credential files
+# without printing them, and blocking those would break ordinary work.
+SCRIPT_MAX_BYTES = 1_000_000
+RECENT_SCRIPT_SECONDS = 600
+MAX_TRACKED = 4096
+WRITE_TOOLS = frozenset({"write_file", "patch", "create_file", "edit_file"})
+SCRIPT_RUNNERS = SHELLS | {"source", ".", "perl", "ruby", "node", "php", "osascript"}
+_PYTHON_RE = re.compile(r"python(?:3(?:\.\d+)?)?$")
+_SCRIPT_SHEBANG_RE = re.compile(r"^#!.*\b(?:sh|bash|zsh|dash|ksh)\b")
+_PATCH_TARGET_RE = re.compile(r"^\*\*\*\s*(?:Update|Add)\s+File:\s*(.+)$|^\*\*\*\s*Move\s+File:\s*.+?->\s*(.+)$", re.M)
+_written: dict = {}                              # real path -> when a write tool named it
+_written_lock = threading.Lock()
+
+
+def note_written(path: Any, cwd: Optional[str] = None) -> None:
+    """Remember a file a write tool was asked to create or change, so that running it is checked."""
+    if not isinstance(path, str) or not path or len(path) > 4096:
+        return
+    try:
+        full = _abs(path, cwd)
+    except (OSError, ValueError):
+        return
+    if _under_unknown(full):
+        return                                   # no known folder: nothing true to record
+    with _written_lock:
+        _written[full] = time.time()
+        if len(_written) > MAX_TRACKED:
+            for old in sorted(_written, key=_written.get)[:len(_written) - MAX_TRACKED]:
+                del _written[old]
+
+
+def _note_writes(tool_name: str, args: Any, cwd: Optional[str] = None) -> None:
+    if tool_name not in WRITE_TOOLS or not isinstance(args, dict):
+        return
+    cwd = _local_folder(args, cwd)
+    names = [args.get(key) for key in ("path", "file_path", "filepath", "filename", "file")]
+    patch = args.get("patch")
+    if isinstance(patch, str) and len(patch) <= 2_000_000:
+        names += [(m.group(1) or m.group(2) or "").strip() for m in _PATCH_TARGET_RE.finditer(patch)]
+    for name in names:
+        note_written(name, cwd)                  # a name that lands under UNKNOWN_FOLDER is not recorded
+
+
+# ---------------------------------------------------------------- whose folder (1.4)
+# Hermes does not tell a hook which folder the agent is working in, and a gateway's own process
+# folder is not it. Field finding, 2026-11-27: `sh show.sh` passed because the gate looked for the
+# script in the gateway's folder. Relative paths are now resolved from the folder Hermes records
+# for the session, and only when Hermes confirms that commands run on this machine. When that
+# folder cannot be established, relative paths are resolved under
+# UNKNOWN_FOLDER, which does not exist: a relative script or folder search that lands there is
+# refused, and a `cd` to a relative folder stays there, so the unknown state cannot be shaken off.
+UNKNOWN_FOLDER = os.sep + ".secret-guard-working-folder-unknown"
+_HERMES_MARKERS = ("hermes_cli.plugins", "gateway.run", "run_agent", "tools.terminal_tool")
+
+
+def _is_absolute(path: str) -> bool:
+    return os.path.isabs(os.path.expanduser(path.strip("\"'")))
+
+
+def _under_unknown(full: str) -> bool:
+    return full == UNKNOWN_FOLDER or full.startswith(UNKNOWN_FOLDER + os.sep)
+
+
+def _usable_folder(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip() and os.path.isabs(value.strip()) and os.path.isdir(value.strip()):
+        return os.path.realpath(value.strip())
+    return None
+
+
+def _backend_is_local(task_id: Any = "") -> bool:
+    """True only when Hermes says this task's commands run on this machine.
+
+    A folder that exists here proves nothing when commands run in a container or on a remote
+    host: the same path there is a different folder. The backend is read from Hermes (a per-task
+    override first, then the configured backend). Anything other than a clear "local" is not
+    local, and that includes failing to read it.
+    """
+    try:
+        from tools.terminal_tool import _get_env_config, resolve_task_overrides
+        over = resolve_task_overrides(str(task_id) if task_id else None) or {}
+        if any(str(k).endswith("_image") and v for k, v in over.items()):
+            return False                         # an image override means a sandbox, whatever else is set
+        kind = over.get("env_type") or (_get_env_config() or {}).get("env_type")
+        return isinstance(kind, str) and kind.strip().lower() == "local"
+    except Exception:
+        return False
+
+
+def _session_cwd(task_id: Any = "") -> Optional[str]:
+    """The agent's working folder, or None when it cannot be established.
+
+    Inside Hermes, and only when the execution backend is confirmed local: the terminal's live
+    folder for this task (it follows `cd`), then the session's recorded workspace. Never the
+    process folder of a gateway. Outside Hermes (tests, the scripts run on their own) the process
+    folder is the agent's folder; so it is in the classic CLI, which has no gateway. With a
+    container or remote backend, or when the backend cannot be read, the folder is not
+    established.
+    """
+    if not any(name in sys.modules for name in _HERMES_MARKERS):
+        return os.getcwd()
+    if not _backend_is_local(task_id):
+        return None
+    try:
+        from tools.terminal_tool import get_session_cwd
+        found = _usable_folder(get_session_cwd(str(task_id) if task_id else None))
+        if found:
+            return found
+    except Exception:
+        pass
+    try:
+        from hermes_cli.plugin_session import session_cwd
+        found = _usable_folder(session_cwd())
+        if found:
+            return found
+    except Exception:
+        pass
+    try:
+        from gateway.run import _gateway_runner_ref
+        if _gateway_runner_ref() is None:
+            return os.getcwd()                   # classic CLI: the launch folder is the agent's folder
+    except Exception:
+        pass
+    return None
+
+
+def _local_folder(obj: Any, cwd: Optional[str]) -> Optional[str]:
+    """A tool call's own workdir/cwd argument, resolved against the session folder when relative."""
+    local = (obj.get("workdir") or obj.get("cwd")) if isinstance(obj, dict) else None
+    if not isinstance(local, str) or not local.strip():
+        return cwd
+    if _is_absolute(local):
+        return os.path.expanduser(local.strip())
+    return os.path.join(cwd, local.strip()) if cwd else local.strip()
+
+
+def _script_candidates(toks: list, i: int) -> list:
+    """Arguments that may be the script file this command runs, in the order to try them."""
+    prog, args, out = os.path.basename(toks[i]), toks[i + 1:], []
+    if prog in ("source", "."):
+        out += args[:1]
+    elif prog in SCRIPT_RUNNERS or _PYTHON_RE.fullmatch(prog):
+        for j, a in enumerate(args):
+            if a in ("-c", "-e", "-m", "--command", "--eval") or (prog in SHELLS and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", a)):
+                break                            # inline code or a module, not a file: checked elsewhere
+            if a == "--":
+                out += args[j + 1:j + 2]
+                break
+            if a == "<":
+                out += args[j + 1:j + 2]
+            elif a.startswith("<") and len(a) > 1 and not a.startswith("<<"):
+                out.append(a[1:])
+            elif not a.startswith("-") and len(out) < 4:
+                out.append(a)
+    if "/" in toks[i]:
+        out.append(toks[i])
+    return out
+
+
+def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
+    return (a.st_dev, a.st_ino, a.st_size, a.st_mtime_ns) == (b.st_dev, b.st_ino, b.st_size, b.st_mtime_ns)
+
+
+def _script_reason(toks: list, i: int, cwd: Optional[str], _depth: int) -> Optional[str]:
+    """Refusal reason when this command runs a script whose text would itself be refused.
+
+    The file is opened once. Its type, size and date are taken from that descriptor, the text is
+    read from it, and the size limit is applied to the bytes actually read. A file that changes
+    while it is being read is refused. The reason never names the script or what was found in it:
+    this text reaches the model and the log.
+    """
+    what = "runs a script written or changed in this session"
+    for cand in _script_candidates(toks, i):
+        if not cand or "$" in cand or "`" in cand:
+            continue
+        try:
+            full = _abs(cand, cwd)
+        except (OSError, ValueError):
+            continue
+        if _under_unknown(full):
+            return "runs a script by a relative path, and the working folder could not be established to check it"
+        try:
+            seen = os.stat(full)
+        except OSError:
+            continue                             # not a file that exists: not the script
+        if not stat.S_ISREG(seen.st_mode):
+            continue                             # a folder, pipe or device: nothing to read as a script
+        with _written_lock:
+            tracked = full in _written
+        try:
+            fd = os.open(full, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            if tracked or (time.time() - seen.st_mtime) < RECENT_SCRIPT_SECONDS:
+                return f"{what} that could not be read for checking"      # needs checking: fail closed
+            continue
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):
+                return f"{what} that changed while it was being checked"
+            if not tracked and (time.time() - before.st_mtime) >= RECENT_SCRIPT_SECONDS:
+                return None                      # the script is this file, and nobody here wrote it
+            if _depth >= SHELL_MAX_DEPTH:
+                return f"{what} that is nested too deeply to check"
+            if before.st_size > SCRIPT_MAX_BYTES:
+                return f"{what} that is too large to check"
+            parts, total = [], 0
+            while total <= SCRIPT_MAX_BYTES:
+                chunk = os.read(fd, min(65536, SCRIPT_MAX_BYTES + 1 - total))
+                if not chunk:
+                    break
+                parts.append(chunk)
+                total += len(chunk)
+            after = os.fstat(fd)
+        except OSError:
+            return f"{what} that could not be read for checking"
+        finally:
+            os.close(fd)
+        if total > SCRIPT_MAX_BYTES:
+            return f"{what} that is too large to check"
+        if total != before.st_size or not _same_file(before, after):
+            return f"{what} that changed while it was being checked"
+        text = b"".join(parts).decode("utf-8", "replace")
+        prog, name = os.path.basename(toks[i]), os.path.basename(full)
+        shell = (prog in SHELLS or prog in ("source", ".") or name.endswith((".sh", ".zsh", ".bash", ".command"))
+                 or bool(_SCRIPT_SHEBANG_RE.match(text)))
+        inner = (check_command(text, cwd, _depth + 1) if shell else None) or check_code(text)
+        if not inner:
+            inner = any(names_secret_file(tok, cwd) for tok in set(re.findall(r"[\w./~-]+", text)))
+        return f"{what} whose contents would be blocked" if inner else None
+    return None
 
 
 def _hermes_roots() -> list[str]:
@@ -887,6 +1131,10 @@ def _check_tokens(toks: list, cwd: Optional[str], guarded: frozenset, _depth: in
         reason = check_command(payload, cwd, _depth + 1) or check_code(payload)
         if reason:
             return reason
+    # 0b. a script file written or changed in this session, now being run: check its text too
+    reason = _script_reason(toks, i, cwd, _depth)
+    if reason:
+        return reason
     # 1. the keychain printing a value
     if prog == "security":
         joined = " ".join(args)
@@ -961,6 +1209,18 @@ def _check_tokens(toks: list, cwd: Optional[str], guarded: frozenset, _depth: in
 
 BLOCK_HINT = ("To check a secret, use `hermes secret list` or `hermes secret verify <ENV_VAR>` "
               "(fingerprints only). To add or change one, use the secret_request tool.")
+# Field finding, 2026-11-27: an agent that was blocked called the block a false positive, put the same
+# command in a script and ran the script. The message now says so in terms.
+NO_REROUTE = ("Do not try to reach the same content another way. Tell the user what was blocked; "
+              "they can run it themselves.")
+
+
+# A quoted word with no spaces that looks like a file name (it has an extension, or is a standard
+# private-key name) is tested as one. Without that shape it is not: 'access_token', 'client_secret'
+# and 'max_tokens' are dictionary keys in ordinary API code. Unquoted tokens are not tested without
+# a slash or leading dot: `settings.env` in code is an attribute, not a file.
+_CODE_STRING_RE = re.compile(r"""(['"`])([^\s'"`\\]{1,512})\1""")
+_BARE_FILE_RE = re.compile(r"[^/]*\.[A-Za-z0-9_]{1,12}|id_(?:rsa|dsa|ecdsa|ed25519)")
 
 
 def check_code(code: str) -> Optional[str]:
@@ -981,6 +1241,11 @@ def check_code(code: str) -> Optional[str]:
             return f"code references a secret-shaped file ({os.path.basename(tok)})"
         if tok.endswith("/secret_guard/emit-secrets.sh") or "/secrets-provider/" in tok:
             return "code runs a secrets helper script"
+    # Field finding, 2026-11-27: `open('app.env')` passed, because a bare name has no slash or dot
+    # in front. A quoted name is a string the code can open, so it gets the same test.
+    for m in _CODE_STRING_RE.finditer(code):
+        if _BARE_FILE_RE.fullmatch(m.group(2)) and is_secret_path(m.group(2), literal=True):
+            return "code references a secret-shaped file by name"       # no name: this text reaches the model and the log
     return None
 
 
@@ -1019,8 +1284,7 @@ def _walk(obj: Any, key: str, cwd: Optional[str], depth: int, budget: dict) -> O
                 raise _TooBig
         return _check_string(key, obj, cwd)
     if isinstance(obj, dict):
-        local = obj.get("workdir") or obj.get("cwd")
-        cwd = local if isinstance(local, str) else cwd   # a nested workdir/cwd applies to its own object
+        cwd = _local_folder(obj, cwd)            # a nested workdir/cwd applies to its own object
         for k, v in obj.items():
             r = _walk(v, str(k).lower(), cwd, depth + 1, budget)
             if r:
@@ -1053,7 +1317,7 @@ def _search_dicts(obj: Any, depth: int = 0, seen: Optional[list] = None) -> list
     return seen
 
 
-def _check_folder_search(tool_name: str, args: dict) -> Optional[str]:
+def _check_folder_search(tool_name: str, args: dict, base: Optional[str] = None) -> Optional[str]:
     """A content search over a folder returns file contents without naming a file. Applies to
     search_files and to any tool named like a search that takes a path, at any nesting depth."""
     name = (tool_name or "").lower()
@@ -1070,9 +1334,11 @@ def _check_folder_search(tool_name: str, args: dict) -> Optional[str]:
         if str(d.get("target", args.get("target", ""))).lower() in NAME_ONLY_TARGETS:
             continue                             # file names only: no contents returned
         path_key = next((k for k in SEARCH_PATH_KEYS if isinstance(d.get(k), str)), None)
-        local = d.get("workdir") or d.get("cwd") or args.get("workdir") or args.get("cwd")
-        cwd = local if isinstance(local, str) else None
-        folder = _abs(d[path_key] if path_key else ".", cwd)
+        cwd = _local_folder(d, _local_folder(args, base))
+        target = d[path_key] if path_key else "."
+        folder = _abs(target, cwd)
+        if _under_unknown(folder):
+            return "searches a folder by a relative path, and the working folder could not be established to check it"
         if not os.path.isdir(folder):
             continue                             # a single file: the path rule already checked it
         name_glob = next((d[k] for k in SEARCH_GLOB_KEYS if isinstance(d.get(k), str) and d[k]), None)
@@ -1082,26 +1348,36 @@ def _check_folder_search(tool_name: str, args: dict) -> Optional[str]:
     return None
 
 
-def check_tool_args(tool_name: str, args: dict) -> Optional[str]:
+def check_tool_args(tool_name: str, args: dict, cwd: Optional[str] = None) -> Optional[str]:
+    """`cwd` is the agent's working folder: None means the process folder (direct callers and
+    tests); the hook passes the session's folder, or UNKNOWN_FOLDER when it has none."""
     _budget_var.set(_Budget())                   # one work budget for this whole tool call
     try:
-        return _walk(args, "", None, 0, {"nodes": 0, "text": 0}) or _check_folder_search(tool_name, args)
+        return _walk(args, "", cwd, 0, {"nodes": 0, "text": 0}) or _check_folder_search(tool_name, args, cwd)
     except (_TooBig, RecursionError):
         return "has arguments too large or too deeply nested to inspect"
 
 
-def on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_kw) -> Optional[dict]:
+def on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, task_id: Any = "", **_kw) -> Optional[dict]:
     try:
-        reason = check_tool_args(tool_name, args if isinstance(args, dict) else {})
+        cwd = _session_cwd(task_id) or UNKNOWN_FOLDER
+    except Exception:
+        cwd = UNKNOWN_FOLDER
+    try:
+        _note_writes(tool_name, args, cwd)
+    except Exception:                            # tracking is best effort; the check below still runs
+        pass
+    try:
+        reason = check_tool_args(tool_name, args if isinstance(args, dict) else {}, cwd)
     except Exception:
         # Fail closed explicitly (Hermes would also block on a raise, but with a less useful message).
         # Never echo the arguments: they may hold the very value being protected.
         logger.warning("secret-guard: tool check failed; blocking %s", tool_name)
         return {"action": "block", "message": f"Secret Guard could not check this {tool_name} call, so it "
-                                              f"was blocked. {BLOCK_HINT}"}
+                                              f"was blocked. {BLOCK_HINT} {NO_REROUTE}"}
     if reason:
         logger.info("secret-guard blocked %s: %s", tool_name, reason)
-        return {"action": "block", "message": f"Secret Guard blocked this {tool_name} call: it {reason}. {BLOCK_HINT}"}
+        return {"action": "block", "message": f"Secret Guard blocked this {tool_name} call: it {reason}. {BLOCK_HINT} {NO_REROUTE}"}
     return None
 
 # ---------------------------------------------------------------- layer 2: backup transforms
