@@ -983,6 +983,24 @@ class InlineCodeBareNames(Fixture):
             for leak in ("app.env", "app", "server", "pem", "id_rsa", "copy.txt"):       # nothing taken from the code
                 self.assertNotIn(leak, out["message"].split("To check a secret")[0])
 
+    def test_helper_script_guard_still_fires(self):
+        """Regression: in d688a77 this test of each token was left inside the quoted-name loop and
+        stopped firing. It must hold with and without a quoted word in the code, and wherever the
+        helper appears among the tokens."""
+        E = lambda code: ("execute_code", {"code": code})
+        helper, provider = "/x/secret_guard/emit-secrets.sh", "/x/secrets-provider/emit.sh"
+        self.run_rows([
+            ("helper, quoted, not the last token", E(f"import subprocess\nsubprocess.run(['{helper}'])\nprint(1)"), "blocked"),
+            ("helper, double quotes", E(f'import os\nos.system("{helper}")\nprint(done)'), "blocked"),
+            ("helper, no quoted word anywhere", E(f"run({helper})\nx = 1"), "blocked"),
+            ("provider folder, no quoted word", E(f"run({provider})\nx = 1"), "blocked"),
+            ("provider folder, last token", E(f"x = 1\nrun({provider})"), "blocked"),
+            ("provider folder, first token", E(f"{provider} --all\nprint('ok', 2)"), "blocked"),
+            ("browser js", ("browser_evaluate", {"js": f"fetch('file://{provider}')"}), "blocked"),
+        ])
+        for code in (f"run({helper})\nx = 1", f"run({provider})\nx = 1"):
+            self.assertEqual(guard.check_code(code), "code runs a secrets helper script")
+
     def test_bare_names_in_other_forms(self):
         E = lambda code: ("execute_code", {"code": code})
         self.run_rows([

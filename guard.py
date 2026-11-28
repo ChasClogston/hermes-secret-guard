@@ -1138,13 +1138,13 @@ def check_code(code: str) -> Optional[str]:
     for tok in re.findall(r"[\w./~-]+", code):
         if ("/" in tok or tok.startswith(".")) and is_secret_path(tok):
             return f"code references a secret-shaped file ({os.path.basename(tok)})"
+        if tok.endswith("/secret_guard/emit-secrets.sh") or "/secrets-provider/" in tok:
+            return "code runs a secrets helper script"
     # Field finding, 2026-11-27: `open('app.env')` passed, because a bare name has no slash or dot
     # in front. A quoted name is a string the code can open, so it gets the same test.
     for m in _CODE_STRING_RE.finditer(code):
         if _BARE_FILE_RE.fullmatch(m.group(2)) and is_secret_path(m.group(2), literal=True):
             return "code references a secret-shaped file by name"       # no name: this text reaches the model and the log
-        if tok.endswith("/secret_guard/emit-secrets.sh") or "/secrets-provider/" in tok:
-            return "code runs a secrets helper script"
     return None
 
 
