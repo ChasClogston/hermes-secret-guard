@@ -581,7 +581,9 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
     backend): with a container or remote backend the same path is a different folder, so a
     folder that happens to exist here proves nothing. If the backend is not local, cannot be
     read, or no folder is recorded, a script or folder search named by a relative path is
-    refused, because it cannot be checked. Give the full path, or run it yourself.
+    refused, because it cannot be checked. On a confirmed local backend, give the full path
+    instead; on any other backend a full path does not help (see the next point), so run it
+    yourself.
   - *Covered backend: local only.* Script inspection reads files on this machine. With a
     container or remote backend, a script named by its full path is looked up here, not where it
     will run, so it is not reliably inspected. Shown in a real gateway for the local backend
