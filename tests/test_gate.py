@@ -1160,7 +1160,8 @@ class SessionFolderLookup(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.real, ignore_errors=True); shutil.rmtree(self.other, ignore_errors=True)
 
-    def hermes(self, terminal=None, plugin="", runner=object(), terminal_raises=False, seen=None):
+    def hermes(self, terminal=None, plugin="", runner=object(), terminal_raises=False, seen=None,
+               backend="local", overrides=None, backend_api=True, asked=None):
         def pkg(name):
             m = types.ModuleType(name); m.__path__ = []; return m
         tt = types.ModuleType("tools.terminal_tool")
@@ -1169,6 +1170,14 @@ class SessionFolderLookup(unittest.TestCase):
             if terminal_raises: raise RuntimeError("injected")
             return terminal
         tt.get_session_cwd = get_session_cwd
+        if backend_api:
+            def resolve_task_overrides(key):
+                if asked is not None: asked.append(key)
+                return dict(overrides or {})
+            def _get_env_config():
+                if backend == "raise": raise RuntimeError("injected")
+                return {"env_type": backend, "cwd": "/"}
+            tt.resolve_task_overrides = resolve_task_overrides; tt._get_env_config = _get_env_config
         ps = types.ModuleType("hermes_cli.plugin_session"); ps.session_cwd = lambda: plugin
         gr = types.ModuleType("gateway.run"); gr._gateway_runner_ref = lambda: runner
         return mock.patch.dict(sys.modules, {"tools": pkg("tools"), "tools.terminal_tool": tt, "hermes_cli": pkg("hermes_cli"),
@@ -1198,6 +1207,30 @@ class SessionFolderLookup(unittest.TestCase):
             self.assertIsNone(guard._session_cwd("t"))
         with self.hermes(terminal="/workspace-in-a-container-not-on-this-host", plugin="relative/folder"):
             self.assertIsNone(guard._session_cwd("t"))               # not a local directory: not established
+
+    def test_backend_must_be_confirmed_local(self):
+        """A folder that exists on this machine is not the backend's folder unless the backend is local."""
+        asked = []
+        with self.hermes(terminal=self.real, plugin=self.other, asked=asked):
+            self.assertEqual(guard._session_cwd("task-9"), self.real)
+        self.assertEqual(asked, ["task-9"])
+        not_local = [dict(backend="docker"), dict(backend="ssh"), dict(backend="modal"), dict(backend=""),
+                     dict(backend=None), dict(backend="raise"), dict(backend_api=False),
+                     dict(overrides={"env_type": "docker"}), dict(overrides={"docker_image": "x:1"}),
+                     dict(overrides={"modal_image": "y"}), dict(backend="LOCAL-ish")]
+        for kw in not_local:
+            for runner in (object(), None):                          # gateway, and classic CLI
+                with self.hermes(terminal=self.real, plugin=self.other, runner=runner, **kw):
+                    self.assertIsNone(guard._session_cwd("task-9"), (kw, runner))
+        with self.hermes(terminal=self.real, backend="docker", overrides={"env_type": "local"}):
+            self.assertEqual(guard._session_cwd("task-9"), self.real)   # a per-task override wins
+        with self.hermes(terminal=self.real, backend=" Local "):
+            self.assertEqual(guard._session_cwd("task-9"), self.real)
+        with self.hermes(terminal=self.real, backend="docker"), mock.patch.object(guard.registry, "load", return_value=GUARDED):
+            out = guard.on_pre_tool_call("terminal", {"command": "sh run.sh"}, task_id="task-9")
+            ok = guard.on_pre_tool_call("terminal", {"command": "echo hi"}, task_id="task-9")
+        self.assertIn("working folder could not be established", out["message"])
+        self.assertIsNone(ok)
 
     def test_classic_cli_has_no_gateway(self):
         with self.hermes(terminal=None, plugin="", runner=None):

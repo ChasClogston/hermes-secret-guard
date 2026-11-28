@@ -576,10 +576,18 @@ Secret Guard reduces exposure. It is not a sandbox and it does not certify anyth
   - *Whose folder:* a hook is not told which folder the agent is working in, and a gateway's own
     process folder is not it. Relative names are resolved from the folder Hermes records for the
     session (the terminal's live folder, then the session's workspace); the same folder is used
-    for recording writes, for finding the script and for folder searches. If Hermes has no
-    usable folder for the session (none recorded, or a container or remote folder that is not a
-    local directory), a script or folder search named by a relative path is refused, because it
-    cannot be checked. Give the full path, or run it yourself.
+    for recording writes, for finding the script and for folder searches. This is trusted
+    only when Hermes confirms the session's commands run on this machine (the `local` terminal
+    backend): with a container or remote backend the same path is a different folder, so a
+    folder that happens to exist here proves nothing. If the backend is not local, cannot be
+    read, or no folder is recorded, a script or folder search named by a relative path is
+    refused, because it cannot be checked. Give the full path, or run it yourself.
+  - *Covered backend: local only.* Script inspection reads files on this machine. With a
+    container or remote backend, a script named by its full path is looked up here, not where it
+    will run, so it is not reliably inspected. Shown in a real gateway for the local backend
+    only (one-shot terminal sessions); Desktop, messaging and delegated sessions are not yet
+    exercised. The backend is read through Hermes's internal functions; if a Hermes update
+    renames them, relative-path scripts are refused until the plugin is updated.
   - *How it is read:* the file is opened once; its type, size and date come from that open file;
     the 1 MB limit applies to the bytes actually read; a file that changes while being read is
     refused. A script that needs checking and cannot be opened or read is refused.

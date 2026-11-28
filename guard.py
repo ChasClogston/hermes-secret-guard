@@ -358,7 +358,8 @@ def _note_writes(tool_name: str, args: Any, cwd: Optional[str] = None) -> None:
 # Hermes does not tell a hook which folder the agent is working in, and a gateway's own process
 # folder is not it. Field finding, 2026-11-27: `sh show.sh` passed because the gate looked for the
 # script in the gateway's folder. Relative paths are now resolved from the folder Hermes records
-# for the session. When that folder cannot be established, relative paths are resolved under
+# for the session, and only when Hermes confirms that commands run on this machine. When that
+# folder cannot be established, relative paths are resolved under
 # UNKNOWN_FOLDER, which does not exist: a relative script or folder search that lands there is
 # refused, and a `cd` to a relative folder stays there, so the unknown state cannot be shaken off.
 UNKNOWN_FOLDER = os.sep + ".secret-guard-working-folder-unknown"
@@ -379,17 +380,39 @@ def _usable_folder(value: Any) -> Optional[str]:
     return None
 
 
+def _backend_is_local(task_id: Any = "") -> bool:
+    """True only when Hermes says this task's commands run on this machine.
+
+    A folder that exists here proves nothing when commands run in a container or on a remote
+    host: the same path there is a different folder. The backend is read from Hermes (a per-task
+    override first, then the configured backend). Anything other than a clear "local" is not
+    local, and that includes failing to read it.
+    """
+    try:
+        from tools.terminal_tool import _get_env_config, resolve_task_overrides
+        over = resolve_task_overrides(str(task_id) if task_id else None) or {}
+        if any(str(k).endswith("_image") and v for k, v in over.items()):
+            return False                         # an image override means a sandbox, whatever else is set
+        kind = over.get("env_type") or (_get_env_config() or {}).get("env_type")
+        return isinstance(kind, str) and kind.strip().lower() == "local"
+    except Exception:
+        return False
+
+
 def _session_cwd(task_id: Any = "") -> Optional[str]:
     """The agent's working folder, or None when it cannot be established.
 
-    Inside Hermes: the terminal's live folder for this task (it follows `cd`), then the session's
-    recorded workspace. Never the process folder of a gateway. Outside Hermes (tests, the scripts
-    run on their own) and in the classic CLI, which has no gateway, the process folder is the
-    agent's folder. A folder that is not a local directory (a container or remote backend) counts
-    as not established.
+    Inside Hermes, and only when the execution backend is confirmed local: the terminal's live
+    folder for this task (it follows `cd`), then the session's recorded workspace. Never the
+    process folder of a gateway. Outside Hermes (tests, the scripts run on their own) the process
+    folder is the agent's folder; so it is in the classic CLI, which has no gateway. With a
+    container or remote backend, or when the backend cannot be read, the folder is not
+    established.
     """
     if not any(name in sys.modules for name in _HERMES_MARKERS):
         return os.getcwd()
+    if not _backend_is_local(task_id):
+        return None
     try:
         from tools.terminal_tool import get_session_cwd
         found = _usable_folder(get_session_cwd(str(task_id) if task_id else None))
